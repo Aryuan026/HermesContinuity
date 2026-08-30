@@ -818,6 +818,31 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
         ).read_source("session-1")
         self.candidate = checkpoint(self.source)
 
+    def receipts(self, session_id: str) -> list[dict]:
+        with sqlite3.connect(self.db_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT receipt_id, session_id, receipt_kind, status,
+                       source_ids_json, hashes_json, counts_json, recorded_at
+                FROM continuity_receipts
+                WHERE session_id = ? ORDER BY recorded_at, receipt_id
+                """,
+                (session_id,),
+            ).fetchall()
+        return [
+            {
+                "receipt_id": row[0],
+                "session_id": row[1],
+                "kind": row[2],
+                "status": row[3],
+                "source_ids": json.loads(row[4]),
+                "hashes": json.loads(row[5]),
+                "counts": json.loads(row[6]),
+                "recorded_at": row[7],
+            }
+            for row in rows
+        ]
+
     def tearDown(self) -> None:
         self.temp.cleanup()
 
@@ -929,19 +954,15 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
             "counts": {"represented_source_group_count": 1},
         }
 
-    def test_snapshot_and_revision_cas_survive_restart(self) -> None:
-        applied = self.store.compare_and_swap_checkpoint(
+    def test_snapshot_and_revision_settlement_survive_restart(self) -> None:
+        applied = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("restart-applied"),
             source_reread=lambda _session_id: self.source,
         )
-        conflict = self.store.compare_and_swap_checkpoint(
+        conflict = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("restart-conflict"),
             source_reread=lambda _session_id: self.source,
         )
         restarted = ContinuityMetadataStore(self.db_path)
@@ -959,11 +980,9 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
                 + dialogue_rows(3, 200.0, "tail")
             )
         ).read_source("session-1")
-        applied = self.store.compare_and_swap_checkpoint(
+        applied = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("tail-growth"),
             source_reread=lambda _session_id: grown,
         )
 
@@ -984,11 +1003,9 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
                 + dialogue_rows(3, 200.0, "uncompiled tail")
             )
         ).read_source("session-1")
-        applied = self.store.compare_and_swap_checkpoint(
+        applied = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("tail-undo"),
             source_reread=lambda _session_id: grown,
         )
 
@@ -1005,18 +1022,14 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
         rewritten = HermesSessionAdapter(
             FakeSessionDB(dialogue_rows(1, 100.0, "rewritten"))
         ).read_source("session-1")
-        rewrite = self.store.compare_and_swap_checkpoint(
+        rewrite = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("rewrite-conflict"),
             source_reread=lambda _session_id: rewritten,
         )
-        ambiguous = self.store.compare_and_swap_checkpoint(
+        ambiguous = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("ambiguous-conflict"),
             source_reread=lambda _session_id: {"status": "ambiguous"},
         )
 
@@ -1027,21 +1040,19 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
             "absent",
         )
 
-    def test_concurrent_compare_and_swap_has_one_winner(self) -> None:
+    def test_concurrent_settlement_has_one_checkpoint_winner(self) -> None:
         barrier = threading.Barrier(2)
 
-        def publish() -> dict:
+        def publish(index: int) -> dict:
             barrier.wait()
-            return self.store.compare_and_swap_checkpoint(
+            return self.store.settle_checkpoint_delivery(
                 "session-1",
-                expected_revision=0,
-                expected_source_snapshot=self.source["source_snapshot"],
-                checkpoint_candidate=self.candidate,
+                **self.settlement_kwargs(f"concurrent-{index}"),
                 source_reread=lambda _session_id: self.source,
             )
 
         with ThreadPoolExecutor(max_workers=2) as executor:
-            results = list(executor.map(lambda _index: publish(), range(2)))
+            results = list(executor.map(publish, range(2)))
 
         self.assertEqual(sum(result.get("ok") is True for result in results), 1)
         self.assertEqual(
@@ -1063,7 +1074,7 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
         )
 
         readback = self.store.read_continuity("session-1", self.source)
-        receipts = self.store.list_receipts("session-1")
+        receipts = self.receipts("session-1")
         self.assertEqual(result["status"], "applied")
         self.assertTrue(result["receipt_recorded"])
         self.assertEqual(readback["state"]["checkpoint"], self.candidate)
@@ -1088,16 +1099,14 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
             "absent",
         )
         self.assertEqual(
-            self.store.list_receipts("session-1")[0]["status"],
+            self.receipts("session-1")[0]["status"],
             "delivered_checkpoint_unchanged",
         )
 
     def test_atomic_settlement_records_conflict_without_changing_checkpoint(self) -> None:
-        self.store.compare_and_swap_checkpoint(
+        self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("settlement-seed"),
             source_reread=lambda _session_id: self.source,
         )
 
@@ -1112,7 +1121,7 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
         self.assertEqual(result["error"], "thread_continuity_revision_conflict")
         self.assertEqual(readback["state"]["checkpoint"], self.candidate)
         self.assertEqual(
-            self.store.list_receipts("session-1")[0]["status"],
+            self.receipts("session-1")[-1]["status"],
             "delivered_checkpoint_conflict",
         )
 
@@ -1140,7 +1149,7 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
             self.store.read_continuity("session-1", self.source)["status"],
             "absent",
         )
-        self.assertEqual(self.store.list_receipts("session-1"), [])
+        self.assertEqual(self.receipts("session-1"), [])
 
     def test_slow_source_reread_does_not_block_unrelated_receipt_writer(self) -> None:
         reread_started = threading.Event()
@@ -1197,7 +1206,7 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
         self.assertEqual(
             sorted(result["idempotent"] for result in results), [False, True]
         )
-        self.assertEqual(len(self.store.list_receipts("session-1")), 1)
+        self.assertEqual(len(self.receipts("session-1")), 1)
         self.assertEqual(
             self.store.read_continuity("session-1", self.source)["state"]["revision"],
             1,
@@ -1240,7 +1249,7 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
             stored = repr(
                 connection.execute("SELECT * FROM continuity_receipts").fetchall()
             )
-        receipts = ContinuityMetadataStore(self.db_path).list_receipts("session-1")
+        receipts = self.receipts("session-1")
 
         self.assertNotIn("body", schema.lower())
         self.assertNotIn(sentinel, stored)

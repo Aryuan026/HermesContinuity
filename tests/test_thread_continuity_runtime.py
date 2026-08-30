@@ -8,7 +8,6 @@ import re
 import sys
 import types
 import unittest
-from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,48 +21,14 @@ context_compactor = importlib.import_module(f"{PACKAGE}.context_compactor")
 thread_continuity_runtime = importlib.import_module(
     f"{PACKAGE}.thread_continuity_runtime"
 )
-bind_thread_continuity_fixed_prompt_selection = (
-    context_compactor.bind_thread_continuity_fixed_prompt_selection
-)
 build_thread_continuity_checkpoint = context_compactor.build_thread_continuity_checkpoint
 build_thread_continuity_checkpoint_v2 = (
     context_compactor.build_thread_continuity_checkpoint_v2
 )
 plan_thread_continuity_fold = context_compactor.plan_thread_continuity_fold
-read_thread_continuity_prompt_plan_carriers = (
-    context_compactor.read_thread_continuity_prompt_plan_carriers
-)
 compile_thread_continuity_turn = (
     thread_continuity_runtime.compile_thread_continuity_turn
 )
-resolve_thread_continuity_context_epoch_plan = (
-    thread_continuity_runtime.resolve_thread_continuity_context_epoch_plan
-)
-resolve_thread_continuity_fixed_prompt_plan = (
-    thread_continuity_runtime.resolve_thread_continuity_fixed_prompt_plan
-)
-
-
-@dataclass(frozen=True)
-class PromptSegment:
-    segment_id: str
-    version: str
-    text: str
-    cacheable: bool
-    layer: str
-
-
-@dataclass(frozen=True)
-class PromptAssembly:
-    segments: tuple[PromptSegment, ...]
-
-    @classmethod
-    def from_segments(cls, segments: list[PromptSegment]) -> "PromptAssembly":
-        return cls(tuple(segments))
-
-    @property
-    def text(self) -> str:
-        return "\n\n".join(segment.text.strip() for segment in self.segments).strip()
 
 
 _ASCII_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_./:@+-]+")
@@ -206,7 +171,6 @@ async def compile_turn(
     raw_bundle: dict | None = None, projector=project_cache,
     post_current_messages: object = None,
     minimum_fold_source_group_ids: list[str] | None = None,
-    fixed_prompt_finalizer=None,
     bridge_reference_at=None,
     bridge_recent_horizon_hours: int = 72,
     bridge_source_token_limit: int = 24_000,
@@ -226,7 +190,6 @@ async def compile_turn(
         physical_owner_generation=object(),
         post_current_messages=post_current_messages,
         minimum_fold_source_group_ids=minimum_fold_source_group_ids,
-        fixed_prompt_finalizer=fixed_prompt_finalizer,
         bridge_reference_at=bridge_reference_at,
         bridge_recent_horizon_hours=bridge_recent_horizon_hours,
         bridge_source_token_limit=bridge_source_token_limit,
@@ -279,106 +242,70 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    def test_token_watermark_epoch_is_append_only_then_targets_soft_low(self) -> None:
-        rows = [
-            group(f"g-{index}", "u" * 70, "a" * 70)
-            for index in range(5)
-        ]
-        current = {"role": "user", "message_id": "u-current", "content": "current"}
-
-        def exact_chars(messages: list[dict]) -> int:
-            return sum(len(str(message.get("content") or "")) for message in messages)
-
-        healthy = resolve_thread_continuity_context_epoch_plan(
-            rows,
-            current_ephemeral=current,
-            context_window_tokens=1_200,
-            reserved_output_tokens=100,
-            soft_high_input_tokens=900,
-            soft_low_input_tokens=420,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[{"role": "system", "content": "fixed"}],
-            estimate_messages=exact_chars,
+    async def test_compilation_result_keeps_only_live_runtime_and_validation_fields(
+        self,
+    ) -> None:
+        result, provider = await compile_turn(
+            [group("g-1", "历史用户", "历史回答")],
+            {"role": "user", "message_id": "u-current", "content": "当前"},
+            window=10_000,
         )
-        self.assertEqual(healthy["status"], "append_only")
-        self.assertEqual(healthy["rollover_reason"], "below_soft_high")
-        self.assertEqual(healthy["minimum_fold_source_group_ids"], [])
 
-        rollover = resolve_thread_continuity_context_epoch_plan(
-            rows,
-            current_ephemeral=current,
-            context_window_tokens=1_200,
-            reserved_output_tokens=100,
-            soft_high_input_tokens=600,
-            soft_low_input_tokens=420,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[{"role": "system", "content": "fixed"}],
-            estimate_messages=exact_chars,
+        self.assertEqual(
+            set(result),
+            {
+                "schema",
+                "status",
+                "mode",
+                "physical_provider_messages",
+                "private_physical_owner_sidecar",
+                "checkpoint_candidate",
+                "expected_revision",
+                "expected_pre_turn_source_snapshot",
+                "trace",
+            },
         )
-        self.assertEqual(rollover["status"], "rollover_required")
-        self.assertEqual(rollover["rollover_reason"], "soft_high_exceeded")
-        self.assertGreater(len(rollover["minimum_fold_source_group_ids"]), 0)
-        self.assertGreater(rollover["estimated_pre_input_tokens"], 600)
-        self.assertLessEqual(rollover["estimated_target_input_tokens"], 420)
-        self.assertEqual(rollover["maintenance_call_count"], 0)
-        self.assertFalse(rollover["body_included"])
+        self.assertEqual((result["status"], result["mode"]), ("ready", "raw"))
+        self.assertEqual(provider.calls, [])
+        self.assertIsNone(result["checkpoint_candidate"])
+        self.assertEqual(result["expected_revision"], 0)
+        self.assertEqual(
+            result["expected_pre_turn_source_snapshot"], "snapshot-pre-turn"
+        )
+        self.assertNotIn("fixed_prompt_finalizer_status", result["trace"])
+        self.assertNotIn("fixed_prompt_finalizer_pass_count", result["trace"])
 
-    async def test_large_current_above_soft_low_remains_hard_safe_and_exact(self) -> None:
+    async def test_large_current_within_hard_window_stays_exact(self) -> None:
         def exact_chars(messages: list[dict]) -> int:
-            return sum(len(str(message.get("content") or "")) for message in messages)
+            return sum(
+                len(str(message.get("content") or "")) for message in messages
+            )
 
         current = {
             "role": "user",
             "message_id": "u-current",
             "content": "C" * 240,
         }
-        result = resolve_thread_continuity_context_epoch_plan(
-            [],
-            current_ephemeral=current,
-            context_window_tokens=500,
-            reserved_output_tokens=50,
-            soft_high_input_tokens=180,
-            soft_low_input_tokens=100,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[{"role": "system", "content": "fixed"}],
-            estimate_messages=exact_chars,
-        )
-
-        self.assertEqual(result["status"], "append_only")
-        self.assertEqual(result["rollover_reason"], "hard_safe_above_soft_low")
-        self.assertFalse(result["soft_low_reached"])
-        self.assertEqual(result["irreducible_input_tokens"], 245)
-        self.assertEqual(result["eligible_retired_count"], 0)
-        self.assertEqual(result["minimum_fold_source_group_ids"], [])
-
         compiled, provider = await compile_turn(
-            [],
-            current,
-            window=500,
-            reserve=50,
-            estimator=exact_chars,
+            [], current, window=500, reserve=50, estimator=exact_chars
         )
+
         self.assertEqual((compiled["status"], compiled["mode"]), ("ready", "raw"))
         self.assertEqual(provider.calls, [])
-        self.assertEqual(compiled["physical_provider_messages"][-1], {
-            "role": "user",
-            "content": current["content"],
-        })
+        self.assertEqual(
+            compiled["physical_provider_messages"][-1],
+            {"role": "user", "content": current["content"]},
+        )
 
-    async def test_old_completed_chatter_retires_without_summary_call_or_visible_bridge(self) -> None:
+    async def test_old_completed_chatter_retires_without_provider_or_bridge(
+        self,
+    ) -> None:
         rows = [group("g-old", "已经完成的旧话题", "旧话题已完成")]
-        current = {
-            "role": "user",
-            "message_id": "u-current",
-            "content": "现在聊新的事",
-        }
-
         compiled, provider = await compile_turn(
             rows,
-            current,
-            window=128000,
-            reserve=4096,
-            minimum_fold_source_group_ids=["g-old"],
+            {"role": "user", "message_id": "u-current", "content": "现在聊新的事"},
+            window=128_000,
+            reserve=4_096,
             bridge_reference_at="2026-08-16T16:00:00Z",
             bridge_recent_horizon_hours=72,
         )
@@ -387,20 +314,12 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.calls, [])
         checkpoint = compiled["checkpoint_candidate"]
         self.assertEqual(
-            checkpoint["retirement_cursor"]["source_prefix_ids"],
-            ["g-old"],
+            checkpoint["retirement_cursor"]["source_prefix_ids"], ["g-old"]
         )
         self.assertEqual(checkpoint["recent_bridge"]["status"], "empty")
-        self.assertEqual(
-            checkpoint["recent_bridge"]["relation"],
-            "no_visible_representation",
-        )
-        self.assertNotIn(
-            "已经完成的旧话题",
-            repr(compiled["physical_provider_messages"]),
-        )
+        self.assertNotIn("已经完成的旧话题", repr(compiled["physical_provider_messages"]))
 
-    async def test_expired_v2_bridge_rolls_below_soft_high_and_disappears_physically(self) -> None:
+    async def test_expired_v2_bridge_disappears_through_live_compiler(self) -> None:
         rows = [
             group(
                 "g-day-0",
@@ -409,47 +328,30 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 event_at="2026-08-10T00:00:00Z",
             )
         ]
-        checkpoint = self._v2_checkpoint(
+        previous = self._v2_checkpoint(
             rows,
             bridge_ids=["g-day-0"],
             reference_at="2026-08-10T01:00:00Z",
         )
-        current = {"role": "user", "message_id": "u-current", "content": "tiny"}
-        epoch = resolve_thread_continuity_context_epoch_plan(
+        compiled, provider = await compile_turn(
             rows,
-            current_ephemeral=current,
-            context_window_tokens=128000,
-            reserved_output_tokens=4096,
-            soft_high_input_tokens=48000,
-            soft_low_input_tokens=24000,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[{"role": "system", "content": "fixed"}],
-            estimate_messages=estimate_messages,
-            previous_state=checkpoint,
-            minimum_fold_source_group_ids=["g-day-0"],
+            {"role": "user", "message_id": "u-current", "content": "tiny"},
+            checkpoint=previous,
+            window=128_000,
+            reserve=4_096,
             bridge_reference_at="2026-08-15T01:00:00Z",
             bridge_recent_horizon_hours=72,
         )
 
-        self.assertEqual(epoch["status"], "rollover_required")
-        self.assertEqual(epoch["rollover_reason"], "currentness_expiry")
-        compiled, provider = await compile_turn(
-            rows,
-            current,
-            checkpoint=checkpoint,
-            window=128000,
-            reserve=4096,
-            minimum_fold_source_group_ids=epoch["minimum_fold_source_group_ids"],
-            bridge_reference_at="2026-08-15T01:00:00Z",
-            bridge_recent_horizon_hours=72,
-        )
         self.assertEqual(provider.calls, [])
-        self.assertEqual(compiled["checkpoint_candidate"]["recent_bridge"]["status"], "empty")
+        self.assertEqual(
+            compiled["checkpoint_candidate"]["recent_bridge"]["status"], "empty"
+        )
         physical = repr(compiled["physical_provider_messages"])
         self.assertNotIn("day-0 recent bridge body", physical)
         self.assertNotIn("day-0 user body", physical)
 
-    async def test_v1_legacy_bridge_migrates_on_currentness_without_new_raw_expiry(self) -> None:
+    async def test_v1_bridge_migrates_through_live_compiler(self) -> None:
         rows = [
             group(
                 "g-day-0",
@@ -458,41 +360,22 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 event_at="2026-08-10T00:00:00Z",
             )
         ]
-        legacy = build_thread_continuity_checkpoint(
+        previous = build_thread_continuity_checkpoint(
             previous_state=None,
             source_groups=rows,
             covered_source_group_ids=["g-day-0"],
             summary_text="legacy lifetime body must never become canonical evidence",
         )
-        current = {"role": "user", "message_id": "u-current", "content": "tiny"}
-        epoch = resolve_thread_continuity_context_epoch_plan(
+        compiled, provider = await compile_turn(
             rows,
-            current_ephemeral=current,
-            context_window_tokens=128000,
-            reserved_output_tokens=4096,
-            soft_high_input_tokens=48000,
-            soft_low_input_tokens=24000,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[{"role": "system", "content": "fixed"}],
-            estimate_messages=estimate_messages,
-            previous_state=legacy,
-            minimum_fold_source_group_ids=["g-day-0"],
+            {"role": "user", "message_id": "u-current", "content": "tiny"},
+            checkpoint=previous,
+            window=128_000,
+            reserve=4_096,
             bridge_reference_at="2026-08-15T01:00:00Z",
             bridge_recent_horizon_hours=72,
         )
 
-        self.assertEqual(
-            (epoch["status"], epoch["rollover_reason"]),
-            ("rollover_required", "currentness_expiry"),
-        )
-        compiled, provider = await compile_turn(
-            rows,
-            current,
-            checkpoint=legacy,
-            minimum_fold_source_group_ids=epoch["minimum_fold_source_group_ids"],
-            bridge_reference_at="2026-08-15T01:00:00Z",
-            bridge_recent_horizon_hours=72,
-        )
         self.assertEqual(provider.calls, [])
         checkpoint = compiled["checkpoint_candidate"]
         self.assertEqual(checkpoint["schema"], "thread_continuity_checkpoint.v2")
@@ -501,31 +384,7 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("legacy lifetime body", physical)
         self.assertNotIn("day-0 canonical user", physical)
 
-        next_epoch = resolve_thread_continuity_context_epoch_plan(
-            rows,
-            current_ephemeral={
-                "role": "user",
-                "message_id": "u-current-next",
-                "content": "still tiny",
-            },
-            context_window_tokens=128000,
-            reserved_output_tokens=4096,
-            soft_high_input_tokens=48000,
-            soft_low_input_tokens=24000,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[{"role": "system", "content": "fixed"}],
-            estimate_messages=estimate_messages,
-            previous_state=checkpoint,
-            minimum_fold_source_group_ids=["g-day-0"],
-            bridge_reference_at="2026-08-15T02:00:00Z",
-            bridge_recent_horizon_hours=72,
-        )
-        self.assertEqual(
-            (next_epoch["status"], next_epoch["rollover_reason"]),
-            ("append_only", "below_soft_high"),
-        )
-
-    async def test_expired_unretired_raw_prefix_rolls_below_soft_high(self) -> None:
+    async def test_expired_raw_prefix_retires_through_live_compiler(self) -> None:
         rows = [
             group(
                 "g-old-raw",
@@ -534,32 +393,18 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 event_at="2026-08-10T00:00:00Z",
             )
         ]
-        current = {"role": "user", "message_id": "u-current", "content": "tiny"}
-        epoch = resolve_thread_continuity_context_epoch_plan(
+        compiled, provider = await compile_turn(
             rows,
-            current_ephemeral=current,
-            context_window_tokens=128000,
-            reserved_output_tokens=4096,
-            soft_high_input_tokens=48000,
-            soft_low_input_tokens=24000,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[{"role": "system", "content": "fixed"}],
-            estimate_messages=estimate_messages,
+            {"role": "user", "message_id": "u-current", "content": "tiny"},
             bridge_reference_at="2026-08-15T01:00:00Z",
             bridge_recent_horizon_hours=72,
         )
 
-        self.assertEqual(epoch["status"], "rollover_required")
-        self.assertEqual(epoch["minimum_fold_source_group_ids"], ["g-old-raw"])
-        compiled, _provider = await compile_turn(
-            rows,
-            current,
-            minimum_fold_source_group_ids=epoch["minimum_fold_source_group_ids"],
-            bridge_reference_at="2026-08-15T01:00:00Z",
-            bridge_recent_horizon_hours=72,
-        )
+        self.assertEqual(provider.calls, [])
         self.assertEqual(
-            compiled["checkpoint_candidate"]["retirement_cursor"]["source_prefix_ids"],
+            compiled["checkpoint_candidate"]["retirement_cursor"][
+                "source_prefix_ids"
+            ],
             ["g-old-raw"],
         )
         self.assertNotIn("old raw user", repr(compiled["physical_provider_messages"]))
@@ -574,11 +419,9 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
         ]
         before = copy.deepcopy(rows)
-        current = {"role": "user", "message_id": "u-current", "content": "tiny"}
         compiled, _provider = await compile_turn(
             rows,
-            current,
-            minimum_fold_source_group_ids=["g-canonical"],
+            {"role": "user", "message_id": "u-current", "content": "tiny"},
             bridge_reference_at="2026-08-15T01:00:00Z",
             bridge_recent_horizon_hours=72,
         )
@@ -587,29 +430,7 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows, before)
         self.assertEqual(bundle(rows)["source"]["source_prefix_ids"], ["g-canonical"])
 
-    async def test_empty_currentness_expiry_uses_zero_summary_calls(self) -> None:
-        rows = [
-            group(
-                "g-expired",
-                "expired user",
-                "expired assistant",
-                event_at="2026-08-10T00:00:00Z",
-            )
-        ]
-        provider = Provider()
-        compiled, _provider = await compile_turn(
-            rows,
-            {"role": "user", "message_id": "u-current", "content": "tiny"},
-            provider=provider,
-            bridge_reference_at="2026-08-15T01:00:00Z",
-            bridge_recent_horizon_hours=72,
-        )
-
-        self.assertEqual(provider.calls, [])
-        self.assertEqual(compiled["trace"]["summary_call_count"], 0)
-        self.assertEqual(compiled["checkpoint_candidate"]["recent_bridge"]["status"], "empty")
-
-    async def test_nonexpired_bridge_stays_append_only_with_zero_maintenance(self) -> None:
+    async def test_nonexpired_bridge_stays_raw_without_provider_work(self) -> None:
         rows = [
             group(
                 "g-recent",
@@ -618,40 +439,24 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 event_at="2026-08-14T12:00:00Z",
             )
         ]
-        checkpoint = self._v2_checkpoint(
+        previous = self._v2_checkpoint(
             rows,
             bridge_ids=["g-recent"],
             reference_at="2026-08-14T13:00:00Z",
         )
-        current = {"role": "user", "message_id": "u-current", "content": "tiny"}
-        epoch = resolve_thread_continuity_context_epoch_plan(
-            rows,
-            current_ephemeral=current,
-            context_window_tokens=128000,
-            reserved_output_tokens=4096,
-            soft_high_input_tokens=48000,
-            soft_low_input_tokens=24000,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[{"role": "system", "content": "fixed"}],
-            estimate_messages=estimate_messages,
-            previous_state=checkpoint,
-            minimum_fold_source_group_ids=["g-recent"],
-            bridge_reference_at="2026-08-15T12:00:00Z",
-            bridge_recent_horizon_hours=72,
-        )
-        self.assertEqual((epoch["status"], epoch["rollover_reason"]), ("append_only", "below_soft_high"))
         compiled, provider = await compile_turn(
             rows,
-            current,
-            checkpoint=checkpoint,
+            {"role": "user", "message_id": "u-current", "content": "tiny"},
+            checkpoint=previous,
             bridge_reference_at="2026-08-15T12:00:00Z",
             bridge_recent_horizon_hours=72,
         )
+
         self.assertEqual((compiled["status"], compiled["mode"]), ("ready", "raw"))
         self.assertEqual(provider.calls, [])
         self.assertIsNone(compiled["checkpoint_candidate"])
 
-    async def test_partial_bridge_rebuild_uses_only_bounded_exact_canonical_slice(self) -> None:
+    async def test_partial_bridge_rebuild_uses_only_current_exact_slice(self) -> None:
         rows = [
             group(
                 "g-expired",
@@ -666,7 +471,7 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 event_at="2026-08-14T12:00:00Z",
             ),
         ]
-        checkpoint = self._v2_checkpoint(
+        previous = self._v2_checkpoint(
             rows,
             bridge_ids=["g-expired", "g-survives"],
             reference_at="2026-08-14T13:00:00Z",
@@ -677,543 +482,21 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         compiled, _provider = await compile_turn(
             rows,
             {"role": "user", "message_id": "u-current", "content": "tiny"},
-            checkpoint=checkpoint,
+            checkpoint=previous,
             provider=provider,
             bridge_reference_at="2026-08-15T12:00:00Z",
             bridge_recent_horizon_hours=72,
-            bridge_source_token_limit=1000,
+            bridge_source_token_limit=1_000,
         )
 
         self.assertEqual(len(provider.calls), 1)
         summary_input = repr(provider.calls[0])
         self.assertIn("surviving exact user", summary_input)
-        self.assertIn("surviving exact assistant", summary_input)
         self.assertNotIn("expired canonical user", summary_input)
         self.assertNotIn("previous lifetime-like bridge body", summary_input)
-        self.assertLessEqual(estimate_messages(provider.calls[0]), 1000)
         bridge = compiled["checkpoint_candidate"]["recent_bridge"]
         self.assertEqual(bridge["source_group_ids"], ["g-survives"])
         self.assertEqual(bridge["body"], "只代表仍然近期的 exact slice")
-
-    def test_fixed_prompt_above_soft_low_retires_all_eligible_old_raw(self) -> None:
-        def exact_chars(messages: list[dict]) -> int:
-            return sum(len(str(message.get("content") or "")) for message in messages)
-
-        result = resolve_thread_continuity_context_epoch_plan(
-            [group("g-old", "U" * 80, "A" * 80)],
-            current_ephemeral={
-                "role": "user",
-                "message_id": "u-current",
-                "content": "current",
-            },
-            context_window_tokens=700,
-            reserved_output_tokens=100,
-            soft_high_input_tokens=300,
-            soft_low_input_tokens=120,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[{"role": "system", "content": "S" * 250}],
-            estimate_messages=exact_chars,
-        )
-
-        self.assertEqual(result["status"], "rollover_required")
-        self.assertEqual(result["rollover_reason"], "hard_safe_above_soft_low")
-        self.assertFalse(result["soft_low_reached"])
-        self.assertEqual(result["irreducible_input_tokens"], 257)
-        self.assertEqual(result["eligible_retired_count"], 1)
-        self.assertEqual(result["minimum_fold_source_group_ids"], ["g-old"])
-
-    def test_genuine_hard_window_overflow_remains_blocked(self) -> None:
-        def exact_chars(messages: list[dict]) -> int:
-            return sum(len(str(message.get("content") or "")) for message in messages)
-
-        result = resolve_thread_continuity_context_epoch_plan(
-            [],
-            current_ephemeral={
-                "role": "user",
-                "message_id": "u-current",
-                "content": "C" * 100,
-            },
-            context_window_tokens=500,
-            reserved_output_tokens=50,
-            soft_high_input_tokens=300,
-            soft_low_input_tokens=150,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[{"role": "system", "content": "S" * 400}],
-            estimate_messages=exact_chars,
-        )
-
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["rollover_reason"], "fixed_context_exceeds_budget")
-        self.assertFalse(result["soft_low_reached"])
-        self.assertEqual(result["eligible_retired_count"], 0)
-
-    def test_same_window_profile_identity_does_not_change_epoch_plan(self) -> None:
-        rows = [group("g-one", "hello", "hi")]
-        current = {"role": "user", "message_id": "u-current", "content": "again"}
-        inputs = {
-            "current_ephemeral": current,
-            "context_window_tokens": 32_000,
-            "reserved_output_tokens": 1_024,
-            "soft_high_input_tokens": 20_000,
-            "soft_low_input_tokens": 10_000,
-            "context_epoch_policy": "token_watermark_v1",
-            "fixed_prompt_messages": [{"role": "system", "content": "fixed"}],
-            "estimate_messages": estimate_messages,
-        }
-        before = resolve_thread_continuity_context_epoch_plan(rows, **inputs)
-        after = resolve_thread_continuity_context_epoch_plan(rows, **inputs)
-        self.assertEqual(before, after)
-        self.assertEqual(before["status"], "append_only")
-
-    def test_pure_fixed_point_preflight_does_not_force_legacy_prompt_fold(self) -> None:
-        rows = [group("g-one", "U" * 80, "A" * 80)]
-        current = {"role": "user", "message_id": "u-current", "content": "当前"}
-        selected_assembly = PromptAssembly.from_segments(
-            [
-                PromptSegment(
-                    segment_id="home_global_hot_context",
-                    version="home_global_hot_context.v1",
-                    text="GLOBAL",
-                    cacheable=False,
-                    layer="dynamic_tail",
-                )
-            ]
-        )
-        summary_calls = 0
-
-        def exact_chars(messages: list[dict]) -> int:
-            return sum(len(str(message.get("content") or "")) for message in messages)
-
-        legacy_plan = plan_thread_continuity_fold(
-            rows,
-            current_ephemeral=current,
-            context_window_tokens=320,
-            reserved_output_tokens=64,
-            fixed_non_message_tokens=0,
-            fixed_prompt_messages=[{"role": "system", "content": "L" * 120}],
-            source_complete=True,
-            estimate_messages=exact_chars,
-        )
-        self.assertEqual(legacy_plan["reason"], "token_pressure")
-
-        def finalize(plan_owner: object) -> object:
-            nonlocal summary_calls
-            self.assertEqual(summary_calls, 0)
-            return bind_thread_continuity_fixed_prompt_selection(
-                plan_owner,
-                fixed_prompt_messages=[{"role": "system", "content": "GLOBAL"}],
-                prompt_assembly=selected_assembly,
-            )
-
-        resolved = resolve_thread_continuity_fixed_prompt_plan(
-            rows,
-            current_ephemeral=current,
-            context_window_tokens=320,
-            reserved_output_tokens=64,
-            fixed_non_message_tokens=0,
-            fixed_prompt_messages=[{"role": "system", "content": "L" * 120}],
-            estimate_messages=exact_chars,
-            fixed_prompt_finalizer=finalize,
-        )
-        buffered = resolve_thread_continuity_fixed_prompt_plan(
-            rows,
-            current_ephemeral=current,
-            context_window_tokens=320,
-            reserved_output_tokens=64,
-            fixed_non_message_tokens=20,
-            fixed_prompt_messages=[{"role": "system", "content": "L" * 120}],
-            estimate_messages=exact_chars,
-            fixed_prompt_finalizer=finalize,
-        )
-
-        self.assertEqual(resolved["fold_plan"]["status"], "no_fold")
-        self.assertEqual(buffered["fold_plan"]["status"], "no_fold")
-        self.assertEqual(resolved["status"], "selected")
-        self.assertIs(resolved["private_selected_prompt_assembly"], selected_assembly)
-
-    async def test_fixed_prompt_finalizer_uses_typed_plan_owner_before_one_compile(self) -> None:
-        rows = [group("g-one", "历史用户", "历史回答")]
-        current = {"role": "user", "message_id": "u-current", "content": "当前"}
-        selected_assembly = PromptAssembly.from_segments(
-            [
-                PromptSegment(
-                    segment_id="home_global_hot_context",
-                    version="home_global_hot_context.v1",
-                    text="GLOBAL FINAL",
-                    cacheable=False,
-                    layer="dynamic_tail",
-                )
-            ]
-        )
-        callback_calls: list[object] = []
-
-        def finalize(plan_owner: object) -> object:
-            callback_calls.append(plan_owner)
-            self.assertNotIsInstance(plan_owner, dict)
-            self.assertNotIn("历史用户", repr(plan_owner))
-            bindings = read_thread_continuity_prompt_plan_carriers(plan_owner)
-            self.assertTrue(
-                any(row["carrier_kind"] == "final_raw_suffix" for row in bindings)
-            )
-            self.assertTrue(
-                any(row["carrier_kind"] == "current_ephemeral" for row in bindings)
-            )
-            return bind_thread_continuity_fixed_prompt_selection(
-                plan_owner,
-                fixed_prompt_messages=[
-                    {"role": "system", "content": selected_assembly.text}
-                ],
-                prompt_assembly=selected_assembly,
-            )
-
-        result, provider = await compile_turn(
-            rows,
-            current,
-            window=128_000,
-            reserve=4096,
-            fixed_prompt_finalizer=finalize,
-        )
-
-        self.assertEqual(result["status"], "ready")
-        self.assertEqual(provider.calls, [])
-        self.assertGreaterEqual(len(callback_calls), 2)
-        self.assertEqual(
-            result["physical_provider_messages"][0],
-            {"role": "system", "content": "GLOBAL FINAL"},
-        )
-        self.assertIs(result["private_selected_prompt_assembly"], selected_assembly)
-        self.assertNotIsInstance(result["private_fixed_prompt_selection"], dict)
-        self.assertNotIn("GLOBAL FINAL", repr(result["private_fixed_prompt_selection"]))
-
-    async def test_nonconvergent_fixed_prompt_finalizer_replans_exact_legacy_without_provider_work(self) -> None:
-        rows = [group("g-one", "历史用户", "历史回答")]
-        current = {"role": "user", "message_id": "u-current", "content": "当前"}
-        assemblies = [
-            PromptAssembly.from_segments(
-                [
-                    PromptSegment(
-                        segment_id="home_global_hot_context",
-                        version="home_global_hot_context.v1",
-                        text=text,
-                        cacheable=False,
-                        layer="dynamic_tail",
-                    )
-                ]
-            )
-            for text in ("ALTERNATING A", "ALTERNATING B")
-        ]
-        calls = 0
-
-        def alternate(plan_owner: object) -> object:
-            nonlocal calls
-            assembly = assemblies[calls % 2]
-            calls += 1
-            return bind_thread_continuity_fixed_prompt_selection(
-                plan_owner,
-                fixed_prompt_messages=[{"role": "system", "content": assembly.text}],
-                prompt_assembly=assembly,
-            )
-
-        result, provider = await compile_turn(
-            rows,
-            current,
-            window=128_000,
-            reserve=4096,
-            fixed_prompt_finalizer=alternate,
-        )
-
-        self.assertEqual(result["status"], "ready")
-        self.assertEqual(provider.calls, [])
-        self.assertEqual(calls, 4)
-        self.assertEqual(
-            result["trace"]["fixed_prompt_finalizer_status"],
-            "legacy_fallback_nonconvergent",
-        )
-        self.assertEqual(
-            result["physical_provider_messages"][0],
-            {"role": "system", "content": "固定系统提示"},
-        )
-        self.assertIsNone(result["private_selected_prompt_assembly"])
-        self.assertIsNone(result["private_fixed_prompt_selection"])
-
-    async def test_compacted_fixed_prompt_finalizer_uses_resolved_prompt_for_summary_owner(self) -> None:
-        rows = [
-            group("g-one", "历史用户一", "历史回答一"),
-            group("g-two", "历史用户二", "历史回答二"),
-        ]
-        current = {"role": "user", "message_id": "u-current", "content": "当前"}
-        selected_assembly = PromptAssembly.from_segments(
-            [
-                PromptSegment(
-                    segment_id="home_global_hot_context",
-                    version="home_global_hot_context.v1",
-                    text="GLOBAL FINAL",
-                    cacheable=False,
-                    layer="dynamic_tail",
-                )
-            ]
-        )
-
-        def finalize(plan_owner: object) -> object:
-            return bind_thread_continuity_fixed_prompt_selection(
-                plan_owner,
-                fixed_prompt_messages=[
-                    {"role": "system", "content": selected_assembly.text}
-                ],
-                prompt_assembly=selected_assembly,
-            )
-
-        result, provider = await compile_turn(
-            rows,
-            current,
-            window=128_000,
-            reserve=4096,
-            minimum_fold_source_group_ids=["g-one"],
-            fixed_prompt_finalizer=finalize,
-        )
-
-        self.assertEqual((result["status"], result["mode"]), ("ready", "compacted"))
-        self.assertEqual(len(provider.calls), 1)
-        self.assertEqual(
-            result["physical_provider_messages"][0],
-            {"role": "system", "content": "GLOBAL FINAL"},
-        )
-        self.assertEqual(
-            result["trace"]["fixed_prompt_finalizer_status"], "selected"
-        )
-
-    async def test_proactive_assistant_carrier_keeps_role_and_exact_message_alias(self) -> None:
-        rows = [proactive_group("turn-one", "same owner body")]
-        current = {"role": "user", "message_id": "u-current", "content": "current"}
-        observed: list[dict] = []
-        selected_assembly = PromptAssembly.from_segments(
-            [
-                PromptSegment(
-                    segment_id="home_global_hot_context",
-                    version="home_global_hot_context.v1",
-                    text="GLOBAL FINAL",
-                    cacheable=False,
-                    layer="dynamic_tail",
-                )
-            ]
-        )
-
-        def finalize(plan_owner: object) -> object:
-            observed.extend(read_thread_continuity_prompt_plan_carriers(plan_owner))
-            return bind_thread_continuity_fixed_prompt_selection(
-                plan_owner,
-                fixed_prompt_messages=[{"role": "system", "content": selected_assembly.text}],
-                prompt_assembly=selected_assembly,
-            )
-
-        result, _provider = await compile_turn(
-            rows,
-            current,
-            window=128_000,
-            reserve=4096,
-            fixed_prompt_finalizer=finalize,
-        )
-
-        self.assertEqual(result["status"], "ready")
-        assistant_rows = [row for row in observed if row["role"] == "assistant"]
-        self.assertTrue(assistant_rows)
-        self.assertTrue(all(row["physical_index"] >= 0 for row in assistant_rows))
-        self.assertTrue(
-            all(row["message_aliases"] == ["a-turn-one"] for row in assistant_rows)
-        )
-        self.assertTrue(
-            all("turn-one" in row["group_aliases"] for row in assistant_rows)
-        )
-
-    async def test_verified_transport_boundary_does_not_fold_within_hard_window(self) -> None:
-        rows = [
-            group("g-old-1", "旧用户一", "旧回答一"),
-            group("g-old-2", "旧用户二", "旧回答二"),
-            group("g-near", "近场用户", "近场回答"),
-        ]
-        current = {"role": "user", "message_id": "u-current", "content": "当前"}
-
-        result, provider = await compile_turn(
-            rows,
-            current,
-            window=128000,
-            reserve=4096,
-        )
-
-        self.assertEqual((result["status"], result["mode"]), ("ready", "raw"))
-        self.assertEqual(provider.calls, [])
-        self.assertIsNone(result["checkpoint_candidate"])
-        physical = result["physical_provider_messages"]
-        self.assertTrue(any(row.get("content") == "旧用户一" for row in physical))
-        self.assertTrue(any(row.get("content") == "旧回答二" for row in physical))
-        self.assertTrue(any(row.get("content") == "近场用户" for row in physical))
-        self.assertTrue(any(row.get("content") == "近场回答" for row in physical))
-        self.assertEqual(physical[-1]["content"], "当前")
-        sidecar = result["private_physical_owner_sidecar"]
-        self.assertEqual(
-            sidecar["schema"], "thread_continuity_physical_owner_sidecar.v1"
-        )
-        self.assertEqual(sidecar["physical_message_count"], len(physical))
-        self.assertNotIn("旧用户一", str(sidecar))
-
-    async def test_one_hundred_short_turns_make_zero_history_provider_calls(self) -> None:
-        rows = [
-            group(f"g-{index}", f"短聊用户-{index}", f"短聊回答-{index}")
-            for index in range(100)
-        ]
-        current = {"role": "user", "message_id": "u-current", "content": "继续聊"}
-        epoch = resolve_thread_continuity_context_epoch_plan(
-            rows,
-            current_ephemeral=current,
-            context_window_tokens=128000,
-            reserved_output_tokens=4096,
-            soft_high_input_tokens=48000,
-            soft_low_input_tokens=24000,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[{"role": "system", "content": "fixed"}],
-            estimate_messages=estimate_messages,
-        )
-        self.assertEqual(epoch["status"], "append_only")
-        self.assertEqual(epoch["rollover_reason"], "below_soft_high")
-        self.assertEqual(epoch["maintenance_call_count"], 0)
-
-        result, provider = await compile_turn(
-            rows,
-            current,
-            window=128000,
-            reserve=4096,
-        )
-
-        self.assertEqual((result["status"], result["mode"]), ("ready", "raw"))
-        self.assertEqual(provider.calls, [])
-        self.assertIsNone(result["checkpoint_candidate"])
-        self.assertEqual(result["trace"]["summary_call_count"], 0)
-        self.assertEqual(result["trace"]["final_raw_suffix"]["count"], 100)
-
-    def test_smaller_window_retires_old_raw_but_does_not_treat_soft_low_as_hard(self) -> None:
-        rows = [group("g-large", "U" * 220, "A" * 220)]
-        current = {
-            "role": "user",
-            "message_id": "u-current",
-            "content": "current",
-        }
-
-        def exact_chars(messages: list[dict]) -> int:
-            return sum(
-                len(str(message.get("content") or ""))
-                for message in messages
-            )
-
-        result = resolve_thread_continuity_context_epoch_plan(
-            rows,
-            current_ephemeral=current,
-            context_window_tokens=500,
-            reserved_output_tokens=50,
-            soft_high_input_tokens=400,
-            soft_low_input_tokens=20,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[
-                {"role": "system", "content": "S" * 80}
-            ],
-            estimate_messages=exact_chars,
-        )
-
-        self.assertEqual(result["status"], "rollover_required")
-        self.assertEqual(result["rollover_reason"], "hard_safe_above_soft_low")
-        self.assertFalse(result["soft_low_reached"])
-        self.assertEqual(result["eligible_retired_count"], 1)
-        self.assertEqual(result["minimum_fold_source_group_ids"], ["g-large"])
-        self.assertEqual(result["maintenance_call_count"], 0)
-        self.assertFalse(result["body_included"])
-
-    async def test_soft_low_epoch_runway_absorbs_next_hundred_short_turns(self) -> None:
-        rows = [
-            group(f"g-{index}", "u" * 90, "a" * 90)
-            for index in range(700)
-        ]
-        current = {"role": "user", "message_id": "u-current", "content": "current"}
-
-        def shaped_estimator(messages: list[dict]) -> int:
-            return 20 + sum(
-                2 + len(str(message.get("content") or ""))
-                for message in messages
-            )
-
-        epoch = resolve_thread_continuity_context_epoch_plan(
-            rows,
-            current_ephemeral=current,
-            fixed_prompt_messages=[{"role": "system", "content": "固定系统提示"}],
-            context_window_tokens=128_000,
-            reserved_output_tokens=4_096,
-            soft_high_input_tokens=48_000,
-            soft_low_input_tokens=24_000,
-            context_epoch_policy="token_watermark_v1",
-            estimate_messages=shaped_estimator,
-        )
-        self.assertEqual(epoch["status"], "rollover_required")
-        self.assertEqual(epoch["rollover_reason"], "hard_ceiling_pressure")
-        self.assertEqual(epoch["estimated_target_input_tokens"], 24_000)
-        self.assertTrue(epoch["minimum_fold_source_group_ids"])
-
-        first, first_provider = await compile_turn(
-            rows,
-            current,
-            window=128_000,
-            reserve=4_096,
-            estimator=shaped_estimator,
-            minimum_fold_source_group_ids=epoch[
-                "minimum_fold_source_group_ids"
-            ],
-        )
-        self.assertEqual(first["status"], "ready")
-        self.assertGreater(len(first_provider.calls), 0)
-        checkpoint = first["checkpoint_candidate"]
-        self.assertIsNotNone(checkpoint)
-
-        extended = [
-            *rows,
-            *[
-                group(f"later-{index}", "u" * 90, "a" * 90)
-                for index in range(100)
-            ],
-        ]
-        second_provider = Provider()
-        second_epoch = resolve_thread_continuity_context_epoch_plan(
-            extended,
-            current_ephemeral={
-                "role": "user",
-                "message_id": "u-next",
-                "content": "next",
-            },
-            context_window_tokens=128_000,
-            reserved_output_tokens=4_096,
-            soft_high_input_tokens=48_000,
-            soft_low_input_tokens=24_000,
-            context_epoch_policy="token_watermark_v1",
-            fixed_prompt_messages=[
-                {"role": "system", "content": "固定系统提示"}
-            ],
-            estimate_messages=shaped_estimator,
-            previous_state=checkpoint,
-            minimum_fold_source_group_ids=list(
-                checkpoint["retirement_cursor"]["source_prefix_ids"]
-            ),
-        )
-        self.assertEqual(second_epoch["status"], "append_only")
-        self.assertEqual(second_epoch["rollover_reason"], "below_soft_high")
-        second, _ = await compile_turn(
-            extended,
-            {"role": "user", "message_id": "u-next", "content": "next"},
-            checkpoint=checkpoint,
-            window=128_000,
-            reserve=4_096,
-            estimator=shaped_estimator,
-            provider=second_provider,
-        )
-
-        self.assertEqual(second["status"], "ready")
-        self.assertEqual(second_provider.calls, [])
-        self.assertEqual(second["trace"]["summary_call_count"], 0)
 
     async def test_real_855_message_shape_keeps_only_seven_raw_nearfield_groups(self) -> None:
         rows = [

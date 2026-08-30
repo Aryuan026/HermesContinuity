@@ -811,24 +811,6 @@ class HermesSessionAdapter:
         )
         return {"source": source, "continuity": continuity}
 
-    def compare_and_swap_checkpoint(
-        self,
-        session_id: str,
-        *,
-        expected_revision: int,
-        expected_source_snapshot: str,
-        checkpoint_candidate: Mapping[str, Any],
-    ) -> Dict[str, Any]:
-        if self.metadata_store is None:
-            return {"ok": False, "error": "metadata_store_unavailable"}
-        return self.metadata_store.compare_and_swap_checkpoint(
-            session_id,
-            expected_revision=expected_revision,
-            expected_source_snapshot=expected_source_snapshot,
-            checkpoint_candidate=checkpoint_candidate,
-            source_reread=self.read_source,
-        )
-
     def settle_checkpoint_delivery(
         self,
         session_id: str,
@@ -1848,69 +1830,6 @@ class ContinuityMetadataStore:
             ),
         )
 
-    def compare_and_swap_checkpoint(
-        self,
-        session_id: str,
-        *,
-        expected_revision: int,
-        expected_source_snapshot: str,
-        checkpoint_candidate: Mapping[str, Any],
-        source_reread: Callable[[str], Mapping[str, Any]],
-    ) -> Dict[str, Any]:
-        session_id = str(session_id or "").strip()
-        expected_snapshot = str(expected_source_snapshot or "").strip()
-        if (
-            not session_id
-            or type(expected_revision) is not int
-            or expected_revision < 0
-            or not _SHA256_RE.fullmatch(expected_snapshot)
-        ):
-            return {"ok": False, "error": "checkpoint_cas_input_invalid"}
-        candidate = dict(checkpoint_candidate or {})
-        try:
-            source = dict(source_reread(session_id) or {})
-        except Exception:
-            return {"ok": False, "error": "checkpoint_source_reread_failed"}
-        connection: sqlite3.Connection | None = None
-        try:
-            connection = self._connect()
-            connection.execute("BEGIN IMMEDIATE")
-            outcome = self._checkpoint_outcome(
-                connection,
-                session_id,
-                expected_revision,
-                expected_snapshot,
-                candidate,
-                source,
-            )
-            if outcome["status"] != "applied":
-                connection.rollback()
-                return {
-                    "ok": False,
-                    **{key: value for key, value in outcome.items() if key != "status"},
-                }
-            self._write_checkpoint(
-                connection,
-                session_id,
-                expected_snapshot,
-                outcome["checkpoint"],
-                outcome["source_ids"],
-            )
-            connection.commit()
-            return {
-                "ok": True,
-                "status": "applied",
-                "revision": outcome["checkpoint"]["revision"],
-                "source_snapshot": expected_snapshot,
-            }
-        except sqlite3.Error:
-            if connection is not None:
-                connection.rollback()
-            return {"ok": False, "error": "checkpoint_storage_failed"}
-        finally:
-            if connection is not None:
-                connection.close()
-
     @staticmethod
     def _code(value: Any, field: str) -> str:
         text = str(value or "").strip()
@@ -2212,30 +2131,6 @@ class ContinuityMetadataStore:
         with self._connect() as connection:
             self._insert_receipt(connection, row)
         return row
-
-    def list_receipts(self, session_id: str) -> List[Dict[str, Any]]:
-        session_id = self._code(session_id, "session_id")
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM continuity_receipts
-                WHERE session_id = ? ORDER BY recorded_at, receipt_id
-                """,
-                (session_id,),
-            ).fetchall()
-        return [
-            {
-                "receipt_id": row["receipt_id"],
-                "session_id": row["session_id"],
-                "kind": row["receipt_kind"],
-                "status": row["status"],
-                "source_ids": json.loads(row["source_ids_json"]),
-                "hashes": json.loads(row["hashes_json"]),
-                "counts": json.loads(row["counts_json"]),
-                "recorded_at": row["recorded_at"],
-            }
-            for row in rows
-        ]
 
     def status_summary(self, session_id: str = "") -> Dict[str, Any]:
         """Return restart-safe checkpoint/receipt health without any body."""

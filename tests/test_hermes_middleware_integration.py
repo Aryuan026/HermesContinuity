@@ -77,10 +77,6 @@ class _Adapter:
             },
         }
 
-    def compare_and_swap_checkpoint(self, session_id: str, **kwargs) -> dict:
-        self.cas_calls.append({"session_id": session_id, **copy.deepcopy(kwargs)})
-        return {"ok": True, "status": "applied"}
-
     def settle_checkpoint_delivery(self, session_id: str, **kwargs) -> dict:
         self.cas_calls.append(
             {

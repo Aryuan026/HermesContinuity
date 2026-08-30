@@ -21,11 +21,15 @@
   final-body budget targeted 169/169 and associated 306/306; verified wakeup
   provenance 5/5 over the real loopback API path. These are local exact-tree
   runs, not public-CI claims.
-- Plugin verification in this correction block: the compatible-Hermes suite is
-  239/239 Green after source-policy, metadata-ownership, and real-host wiring
-  correction. The prior clean replay of the eight runtime patches passed
-  229/229; repeat clean replay belongs to the final joint-candidate gate. The
-  final-guard test covers both execution-middleware registration orders.
+- Plugin verification in this correction block: the compatible-Hermes suite
+  was 239/239 Green after source-policy, metadata-ownership, and real-host
+  wiring correction. After removing the unregistered donor gateway,
+  context-epoch/fixed-finalizer, and standalone metadata inspection/write
+  paths, the remaining real-host suite is 221/221 Green. A before/after probe
+  against exact pre-cleanup revision `5c0b84e` produced byte-identical
+  wrapper-consumed compiler, bridge, request projection, provider request, and
+  settlement output for raw, retirement-only, and summarized fixtures. The
+  final-guard test still covers both execution-middleware registration orders.
 - Plugin lifecycle proof: exact public candidates `698fd4d` and `9f01f61`
   installed through the official CLI into a disposable profile with full
   commit pins and remained disabled; Continuity passed native Doctor, Global

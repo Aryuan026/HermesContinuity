@@ -139,14 +139,6 @@ class FakeAdapter:
         self.read_count += 1
         return copy.deepcopy(self.value)
 
-    def compare_and_swap_checkpoint(self, session_id: str, **kwargs) -> dict:
-        self.cas_calls.append({"session_id": session_id, **copy.deepcopy(kwargs)})
-        if self.cas_ok:
-            return {"ok": True, "status": "applied"}
-        if self.cas_error:
-            return {"ok": False, "error": self.cas_error}
-        return {"ok": False, "status": "conflict"}
-
     def settle_checkpoint_delivery(self, session_id: str, **kwargs) -> dict:
         candidate = kwargs.get("checkpoint_candidate")
         if candidate is None:
