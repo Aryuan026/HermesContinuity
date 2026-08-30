@@ -21,11 +21,17 @@
   provenance 5/5 over the real loopback API path. These are local exact-tree
   runs, not public-CI claims.
 - Plugin verification in this correction block: the compatible-Hermes suite is
-  238/238 Green after source-policy and metadata-ownership correction. The
-  prior clean replay of all
-  eight exported patches passed 229/229; repeat clean replay belongs to the
-  final joint-candidate gate. The final-guard test covers both
-  execution-middleware registration orders.
+  239/239 Green after source-policy, metadata-ownership, and real-host wiring
+  correction. The prior clean replay of all eight exported patches passed
+  229/229; repeat clean replay belongs to the final joint-candidate gate. The
+  final-guard test covers both execution-middleware registration orders.
+- Real-host wiring proof: actual Hermes plugin discovery loaded Continuity and
+  Global Hot, two production `AIAgent.run_conversation` turns delivered both
+  blocks exact-once, Continuity and Global Hot settled to their real SQLite
+  stores, and a manager unload/reload read back checkpoint revision 1. A real
+  provider-error turn produced no new delivery receipt. The two successful
+  turns used CLI and gateway-tagged platform contexts; this is synthetic local
+  host proof, not a live channel canary.
 - External review: the first public candidate was judged suitable only for a
   disposable canary. Its source-policy findings are incorporated in this
   replacement root; repeat exact-revision review remains the current gate.
@@ -35,5 +41,6 @@
 - Runtime status: not installed, not enabled, not deployed, and not validated
   in a live Hermes conversation.
 
-The next status update should record the corrected exact revisions and repeat
-external review result. No installation or deployment is authorized here.
+The next review should assess practical installation, patch replay, upgrade and
+rollback behavior, then record the corrected exact revisions. No installation
+or deployment is authorized here.

@@ -20,9 +20,8 @@ config_schema:
     default: ""
     description: Optional checkpoint database path; empty uses profile-scoped plugin data
   additional_human_sources:
-    type: list
     default: []
-    description: Explicit extra session source tags owned by trusted interactive front ends
+    description: Plugin-validated list of extra source tags owned by trusted interactive front ends
   recent_horizon_hours:
     type: int
     default: 72

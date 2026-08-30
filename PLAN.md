@@ -61,8 +61,9 @@ service, but cannot honestly replace this full-prefix contract.
 
 ## Release gates
 
-1. Keep the full standard-library test suite Green, including optional real
-   Hermes integration when `HERMES_SOURCE_ROOT` is available.
+1. Keep the full standard-library suite Green and pass the opt-in real-host
+   entrypoint proof: actual plugin discovery, `AIAgent.run_conversation`, final
+   provider body, post/error settlement, SQLite readback, and manager restart.
 2. Replace the obsolete repository history before public push.
 3. Push the reviewed revision for external web review.
 4. Address external findings and record the exact reviewed revision.
