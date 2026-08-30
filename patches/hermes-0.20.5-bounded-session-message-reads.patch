@@ -1,0 +1,438 @@
+From 20b7b9a3b4f66871686503f222e39f4c55a058a5 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 02:39:46 +0800
+Subject: [PATCH] feat(sessions): add bounded time-window message reads
+
+---
+ hermes_state.py                        | 142 ++++++++++++---
+ tests/test_hermes_state_time_window.py | 239 +++++++++++++++++++++++++
+ 2 files changed, 361 insertions(+), 20 deletions(-)
+ create mode 100644 tests/test_hermes_state_time_window.py
+
+diff --git a/hermes_state.py b/hermes_state.py
+index 9fdc820..d0a7ae9 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -21,6 +21,7 @@ import errno
+ import hashlib
+ import json
+ import logging
++import math
+ import os
+ import queue
+ import random
+@@ -10214,24 +10215,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     [session_id],
+                 )
+                 all_rows = cursor.fetchall()
+-            seen: dict = {}
+-            for row in all_rows:
+-                # Tool fields participate in the dedupe key: compaction copies
+-                # them verbatim, so identical tool messages across generations
+-                # still collapse, while distinct tool calls that happen to
+-                # share role/content/timestamp are never merged.
+-                key = (
+-                    row["role"],
+-                    row["content"],
+-                    row["timestamp"],
+-                    row["tool_call_id"],
+-                    row["tool_calls"],
+-                    row["tool_name"],
+-                )
+-                cur = seen.get(key)
+-                if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
+-                    seen[key] = row
+-            rows = sorted(seen.values(), key=lambda r: r["id"])
++            rows = self._dedupe_compacted_message_rows(all_rows)
+             if latest:
+                 rows = rows[::-1]
+             rows = rows[offset:]
+@@ -10249,6 +10233,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 rows = cursor.fetchall()
+             if latest:
+                 rows.reverse()
++        return self._decode_message_rows(rows)
++
++    @staticmethod
++    def _dedupe_compacted_message_rows(rows: List[Any]) -> List[Any]:
++        """Collapse physical compaction generations to canonical messages."""
++        seen: dict = {}
++        for row in rows:
++            # Tool fields participate in the dedupe key: compaction copies
++            # them verbatim, so identical tool messages across generations
++            # still collapse, while distinct tool calls that happen to share
++            # role/content/timestamp are never merged.
++            key = (
++                row["role"],
++                row["content"],
++                row["timestamp"],
++                row["tool_call_id"],
++                row["tool_calls"],
++                row["tool_name"],
++            )
++            cur = seen.get(key)
++            if cur is None or (row["active"], row["id"]) > (
++                cur["active"],
++                cur["id"],
++            ):
++                seen[key] = row
++        return sorted(seen.values(), key=lambda row: row["id"])
++
++    def _decode_message_rows(self, rows: List[Any]) -> List[Dict[str, Any]]:
++        """Decode stored message rows using the public read representation."""
+         result = []
+         for row in rows:
+             msg = dict(row)
+@@ -10258,13 +10271,102 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 try:
+                     msg["tool_calls"] = json.loads(msg["tool_calls"])
+                 except (json.JSONDecodeError, TypeError):
+-                    logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
++                    logger.warning(
++                        "Failed to deserialize tool_calls in get_messages, "
++                        "falling back to []"
++                    )
+                     msg["tool_calls"] = []
+             if msg.get("display_metadata") is not None:
+-                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
++                msg["display_metadata"] = self._decode_display_metadata(
++                    msg["display_metadata"]
++                )
+             result.append(msg)
+         return result
+ 
++    def get_messages_time_window(
++        self,
++        session_id: str,
++        *,
++        start_timestamp: float,
++        end_timestamp: float,
++        include_inactive: bool = False,
++        include_compacted: bool = False,
++        max_physical_rows: int,
++    ) -> Dict[str, Any]:
++        """Read a bounded, inclusive message timestamp window.
++
++        Lifecycle filtering and both timestamp bounds are applied by SQLite
++        before the physical-row cap.  The query reads at most
++        ``max_physical_rows + 1`` rows; the extra row is an overflow sentinel.
++        Overflow never returns a partial message body because the canonical
++        winner for a compacted generation may be beyond that prefix.
++
++        ``include_compacted`` uses the same canonical generation collapse as
++        :meth:`get_messages`.  ``include_inactive`` takes precedence and
++        returns every physical row for audit/debug use.  Complete results use
++        the same content, tool-call, and display-metadata decoding as
++        :meth:`get_messages` and remain ordered by insertion id, so regressing
++        wall clocks cannot skip or reorder messages inside the window.
++
++        ``physical_row_count`` is exact when ``scan_complete`` is true.  On
++        overflow it is the observed sentinel count (``max_physical_rows + 1``),
++        not the total number of matching rows.
++        """
++        try:
++            start = float(start_timestamp)
++            end = float(end_timestamp)
++        except (TypeError, ValueError) as exc:
++            raise ValueError("timestamps must be finite numbers") from exc
++        if not math.isfinite(start) or not math.isfinite(end):
++            raise ValueError("timestamps must be finite numbers")
++        if start > end:
++            raise ValueError("start_timestamp must be <= end_timestamp")
++        if (
++            isinstance(max_physical_rows, bool)
++            or not isinstance(max_physical_rows, int)
++            or max_physical_rows <= 0
++        ):
++            raise ValueError("max_physical_rows must be a positive integer")
++
++        if include_inactive:
++            lifecycle_clause = ""
++        elif include_compacted:
++            lifecycle_clause = " AND (active = 1 OR compacted = 1)"
++        else:
++            lifecycle_clause = " AND active = 1"
++
++        sql = (
++            "SELECT * FROM messages WHERE session_id = ? "
++            "AND timestamp >= ? AND timestamp <= ?"
++            f"{lifecycle_clause} ORDER BY id ASC LIMIT ?"
++        )
++        with self._read_ctx() as conn:
++            rows = conn.execute(
++                sql,
++                (session_id, start, end, max_physical_rows + 1),
++            ).fetchall()
++
++        physical_row_count = len(rows)
++        overflow = physical_row_count > max_physical_rows
++        if overflow:
++            return {
++                "messages": [],
++                "scan_complete": False,
++                "overflow": True,
++                "physical_row_count": physical_row_count,
++                "max_physical_rows": max_physical_rows,
++            }
++
++        if include_compacted and not include_inactive:
++            rows = self._dedupe_compacted_message_rows(rows)
++        return {
++            "messages": self._decode_message_rows(rows),
++            "scan_complete": True,
++            "overflow": False,
++            "physical_row_count": physical_row_count,
++            "max_physical_rows": max_physical_rows,
++        }
++
+     def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
+         """Tool results in these sessions that mention a GitHub PR url.
+ 
+diff --git a/tests/test_hermes_state_time_window.py b/tests/test_hermes_state_time_window.py
+new file mode 100644
+index 0000000..cfb05ce
+--- /dev/null
++++ b/tests/test_hermes_state_time_window.py
+@@ -0,0 +1,239 @@
++"""Real SessionDB coverage for bounded timestamp-window message reads."""
++
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_state import SessionDB
++
++
++@pytest.fixture()
++def db(tmp_path: Path):
++    store = SessionDB(tmp_path / "state.db")
++    store.create_session("window", source="test")
++    yield store
++    store.close()
++
++
++def _read(db: SessionDB, **overrides):
++    options = {
++        "start_timestamp": 0.0,
++        "end_timestamp": 1_000.0,
++        "max_physical_rows": 100,
++    }
++    options.update(overrides)
++    return db.get_messages_time_window("window", **options)
++
++
++def test_filters_before_cap_and_preserves_id_order_when_clock_regresses(db):
++    for index in range(40):
++        db.append_message("window", "user", f"old-{index}", timestamp=index)
++
++    db.append_message("window", "user", "lower-bound", timestamp=100)
++    db.append_message("window", "assistant", "outside-middle", timestamp=300)
++    db.append_message("window", "assistant", "regressed-clock", timestamp=150)
++    db.append_message("window", "user", "upper-bound", timestamp=200)
++
++    for index in range(40):
++        db.append_message(
++            "window", "assistant", f"future-{index}", timestamp=400 + index
++        )
++
++    materialized_rows = []
++
++    def count_rows(cursor, row):
++        materialized_rows.append(row)
++        return sqlite3.Row(cursor, row)
++
++    wal_active = db._wal_active
++    db._wal_active = False
++    db._conn.row_factory = count_rows
++    try:
++        result = _read(
++            db,
++            start_timestamp=100,
++            end_timestamp=200,
++            max_physical_rows=3,
++        )
++    finally:
++        db._conn.row_factory = sqlite3.Row
++        db._wal_active = wal_active
++
++    assert result["scan_complete"] is True
++    assert result["overflow"] is False
++    assert result["physical_row_count"] == 3
++    assert len(materialized_rows) == 3
++    assert [message["content"] for message in result["messages"]] == [
++        "lower-bound",
++        "regressed-clock",
++        "upper-bound",
++    ]
++
++
++def test_inclusive_bounds_and_overflow_never_return_partial_body(db):
++    db.append_message("window", "user", "start", timestamp=10)
++    db.append_message("window", "assistant", "middle", timestamp=11)
++    db.append_message("window", "user", "end", timestamp=12)
++
++    complete = _read(db, start_timestamp=10, end_timestamp=12, max_physical_rows=3)
++    assert [message["content"] for message in complete["messages"]] == [
++        "start",
++        "middle",
++        "end",
++    ]
++
++    overflow = _read(db, start_timestamp=10, end_timestamp=12, max_physical_rows=2)
++    assert overflow == {
++        "messages": [],
++        "scan_complete": False,
++        "overflow": True,
++        "physical_row_count": 3,
++        "max_physical_rows": 2,
++    }
++
++
++def test_canonical_dedupes_clone_generations_while_raw_exposes_collision(db):
++    db.append_message(
++        "window", "user", "same user", timestamp=100, api_content="old-sidecar"
++    )
++    db.append_message("window", "assistant", "same answer", timestamp=101)
++    original = db.get_messages("window")
++
++    db.archive_and_compact("window", original)
++    assert db.set_latest_user_api_content("window", "same user", "new-sidecar") == 1
++    deleted_id = db.append_message("window", "user", "soft deleted", timestamp=100.5)
++    db._execute_write(
++        lambda conn: conn.execute(
++            "UPDATE messages SET active = 0, compacted = 0 WHERE id = ?",
++            (deleted_id,),
++        )
++    )
++
++    canonical = _read(
++        db,
++        start_timestamp=100,
++        end_timestamp=101,
++        include_compacted=True,
++        max_physical_rows=4,
++    )
++    raw = _read(
++        db,
++        start_timestamp=100,
++        end_timestamp=101,
++        include_inactive=True,
++        max_physical_rows=5,
++    )
++
++    assert canonical["physical_row_count"] == 4
++    assert [message["content"] for message in canonical["messages"]] == [
++        "same user",
++        "same answer",
++    ]
++    canonical_user = next(
++        message for message in canonical["messages"] if message["role"] == "user"
++    )
++    assert canonical_user["active"] == 1
++    assert canonical_user["api_content"] == "new-sidecar"
++
++    assert raw["physical_row_count"] == 5
++    assert len(raw["messages"]) == 5
++    assert "soft deleted" not in {
++        message["content"] for message in canonical["messages"]
++    }
++    assert "soft deleted" in {message["content"] for message in raw["messages"]}
++    raw_users = [
++        message for message in raw["messages"] if message["content"] == "same user"
++    ]
++    assert [(message["active"], message["compacted"]) for message in raw_users] == [
++        (0, 1),
++        (1, 0),
++    ]
++    assert [message["api_content"] for message in raw_users] == [
++        "old-sidecar",
++        "new-sidecar",
++    ]
++
++
++def test_physical_cap_precedes_canonical_generation_dedupe(db):
++    db.append_message("window", "user", "u", timestamp=20)
++    db.append_message("window", "assistant", "a", timestamp=21)
++    db.archive_and_compact("window", db.get_messages("window"))
++
++    result = _read(
++        db,
++        start_timestamp=20,
++        end_timestamp=21,
++        include_compacted=True,
++        max_physical_rows=3,
++    )
++
++    assert result["scan_complete"] is False
++    assert result["overflow"] is True
++    assert result["messages"] == []
++    assert result["physical_row_count"] == 4
++
++
++def test_decoding_matches_get_messages(db):
++    db.append_message(
++        "window",
++        "user",
++        [{"type": "text", "text": "multimodal"}],
++        timestamp=50,
++        display_kind="notice",
++        display_metadata={"nested": {"value": 1}},
++    )
++    db.append_message(
++        "window",
++        "assistant",
++        "calling",
++        timestamp=51,
++        tool_calls=[
++            {
++                "id": "call-1",
++                "type": "function",
++                "function": {"name": "terminal", "arguments": "{}"},
++            }
++        ],
++    )
++
++    assert _read(db, start_timestamp=50, end_timestamp=51)["messages"] == (
++        db.get_messages("window")
++    )
++
++
++def test_time_window_is_available_on_read_only_session_db(tmp_path: Path):
++    db_path = tmp_path / "read-only.db"
++    writable = SessionDB(db_path)
++    writable.create_session("window", source="test")
++    writable.append_message("window", "user", "persisted", timestamp=25)
++    writable.close()
++
++    read_only = SessionDB(db_path, read_only=True)
++    try:
++        result = read_only.get_messages_time_window(
++            "window",
++            start_timestamp=25,
++            end_timestamp=25,
++            include_inactive=True,
++            max_physical_rows=1,
++        )
++    finally:
++        read_only.close()
++
++    assert result["scan_complete"] is True
++    assert [message["content"] for message in result["messages"]] == ["persisted"]
++
++
++@pytest.mark.parametrize(
++    ("overrides", "message"),
++    [
++        ({"start_timestamp": 2, "end_timestamp": 1}, "start_timestamp"),
++        ({"start_timestamp": float("nan")}, "finite"),
++        ({"max_physical_rows": 0}, "positive integer"),
++        ({"max_physical_rows": True}, "positive integer"),
++    ],
++)
++def test_invalid_window_or_capacity_is_rejected(db, overrides, message):
++    with pytest.raises(ValueError, match=message):
++        _read(db, **overrides)
+-- 
+2.50.1 (Apple Git-155)
+

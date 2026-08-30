@@ -1,0 +1,367 @@
+From 22dd21241f3628e0d25b808012f07874d45310d4 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 02:12:43 +0800
+Subject: [PATCH] feat(plugins): add profile-scoped service registry
+
+---
+ hermes_cli/plugins.py         | 104 +++++++++++++++++
+ tests/test_plugin_services.py | 206 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 310 insertions(+)
+ create mode 100644 tests/test_plugin_services.py
+
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 2493d8f..cd99c95 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -1205,11 +1205,21 @@ class PluginRegistration:
+                 self._on_dispose(self)
+ 
+ 
++@dataclass(frozen=True)
++class _PluginServiceEntry:
++    """One manager-local inter-plugin service and its owning plugin."""
++
++    qualified_name: str
++    plugin_id: str
++    service: Any
++
++
+ # ---------------------------------------------------------------------------
+ # PluginContext  – handed to each plugin's ``register()`` function
+ # ---------------------------------------------------------------------------
+ 
+ _PLUGIN_SETTING_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
++_PLUGIN_SERVICE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+ _PLUGIN_SETTING_RESERVED_ROOTS = frozenset({"model", "plugins", "security", "settings"})
+ _PLUGIN_STATE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+ _PLUGIN_STATE_QUOTA_BYTES = 10 * 1024 * 1024
+@@ -1422,6 +1432,33 @@ class PluginContext:
+                 return True
+         return False
+ 
++    def register_service(
++        self,
++        name: str,
++        service: Any,
++    ) -> PluginRegistration:
++        """Publish one profile-local service for other plugins.
++
++        ``name`` is a bare, versionable service name. The host qualifies it as
++        ``<plugin_id>:<name>`` so a plugin cannot publish into another
++        plugin's namespace. Exactly one active owner is allowed per qualified
++        name; ownership and unload cleanup stay host-managed.
++        """
++        return self._manager._register_plugin_service(
++            self.manifest,
++            name,
++            service,
++        )
++
++    def get_service(self, qualified_name: str, default: Any = None) -> Any:
++        """Return a service from this context's profile-local manager.
++
++        Lookup never imports the provider plugin and never falls back to a
++        process-global or differently scoped manager. Missing, not-yet-loaded,
++        and malformed qualified names return ``default``.
++        """
++        return self._manager._get_plugin_service(qualified_name, default)
++
+     # -- namespaced config and durable state --------------------------------
+ 
+     def get_config(self, key: str, default: Any = None) -> Any:
+@@ -3403,6 +3440,8 @@ class PluginManager:
+         self._plugins: Dict[str, LoadedPlugin] = {}
+         self._hooks: Dict[str, List[Callable]] = {}
+         self._middleware: Dict[str, List[Callable]] = {}
++        self._services: Dict[str, _PluginServiceEntry] = {}
++        self._service_lock = threading.RLock()
+         self._plugin_tool_names: Set[str] = set()
+         self._plugin_platform_names: Set[str] = set()
+         self._cli_commands: Dict[str, dict] = {}
+@@ -3472,6 +3511,71 @@ class PluginManager:
+     # Registration ledger internals
+     # -----------------------------------------------------------------------
+ 
++    def _register_plugin_service(
++        self,
++        manifest: PluginManifest,
++        name: str,
++        service: Any,
++    ) -> PluginRegistration:
++        if not isinstance(name, str) or not _PLUGIN_SERVICE_NAME_RE.fullmatch(name):
++            raise ValueError(
++                "plugin service name must match [a-z0-9][a-z0-9_.-]{0,127}"
++            )
++        if service is None:
++            raise TypeError("plugin service must not be None")
++        plugin_id = manifest.key or manifest.name
++        if not plugin_id or ":" in plugin_id:
++            raise ValueError("plugin id cannot qualify a service name")
++        qualified_name = f"{plugin_id}:{name}"
++        entry = _PluginServiceEntry(
++            qualified_name=qualified_name,
++            plugin_id=plugin_id,
++            service=service,
++        )
++        with self._discovery_lock, self._service_lock:
++            existing = self._services.get(qualified_name)
++            if existing is not None:
++                raise ValueError(
++                    f"plugin service {qualified_name!r} is already registered "
++                    f"by {existing.plugin_id!r}"
++                )
++            self._services[qualified_name] = entry
++            try:
++                return self._track_registration(
++                    manifest,
++                    "service",
++                    qualified_name,
++                    lambda: self._remove_plugin_service(qualified_name, entry),
++                )
++            except Exception:
++                self._remove_plugin_service(qualified_name, entry)
++                raise
++
++    def _get_plugin_service(self, qualified_name: str, default: Any = None) -> Any:
++        if not isinstance(qualified_name, str) or qualified_name.count(":") != 1:
++            return default
++        plugin_id, name = qualified_name.split(":", 1)
++        if (
++            not plugin_id
++            or plugin_id != plugin_id.strip()
++            or not _PLUGIN_SERVICE_NAME_RE.fullmatch(name)
++        ):
++            return default
++        with self._service_lock:
++            entry = self._services.get(qualified_name)
++            return entry.service if entry is not None else default
++
++    def _remove_plugin_service(
++        self,
++        qualified_name: str,
++        entry: _PluginServiceEntry,
++    ) -> bool:
++        with self._service_lock:
++            if self._services.get(qualified_name) is not entry:
++                return False
++            self._services.pop(qualified_name, None)
++            return True
++
+     def _track_registration(
+         self,
+         manifest: PluginManifest,
+diff --git a/tests/test_plugin_services.py b/tests/test_plugin_services.py
+new file mode 100644
+index 0000000..41995e6
+--- /dev/null
++++ b/tests/test_plugin_services.py
+@@ -0,0 +1,206 @@
++from __future__ import annotations
++
++import threading
++from pathlib import Path
++
++import pytest
++
++from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
++
++
++def _context(manager: PluginManager, plugin_id: str, *, name: str | None = None):
++    return PluginContext(
++        PluginManifest(name=name or plugin_id, key=plugin_id),
++        manager,
++    )
++
++
++def test_service_registers_under_host_qualified_name_and_requires_full_lookup():
++    manager = PluginManager(scope_key="profile-a")
++    provider = _context(manager, "provider")
++    consumer = _context(manager, "consumer")
++    service = object()
++    missing = object()
++
++    assert consumer.get_service("provider:continuity.v1", missing) is missing
++    registration = provider.register_service("continuity.v1", service)
++
++    assert registration.kind == "service"
++    assert registration.key == "provider:continuity.v1"
++    assert consumer.get_service("provider:continuity.v1") is service
++    assert consumer.get_service("continuity.v1", missing) is missing
++    assert consumer.get_service("provider:missing", missing) is missing
++    assert consumer.get_service("provider:continuity.v1:extra", missing) is missing
++
++
++def test_duplicate_qualified_name_is_rejected_without_replacing_first_owner():
++    manager = PluginManager(scope_key="profile-a")
++    first = _context(manager, "provider", name="first-provider")
++    duplicate = _context(manager, "provider", name="different-provider-instance")
++    original_service = object()
++
++    first.register_service("continuity.v1", original_service)
++    with pytest.raises(ValueError, match="already registered"):
++        first.register_service("continuity.v1", object())
++    with pytest.raises(ValueError, match="already registered"):
++        duplicate.register_service("continuity.v1", object())
++
++    assert first.get_service("provider:continuity.v1") is original_service
++    assert len(manager._services) == 1
++    assert len(manager._ownership_ledger["provider"]) == 1
++
++
++def test_invalid_registration_leaves_service_and_ledger_empty():
++    manager = PluginManager(scope_key="profile-a")
++    provider = _context(manager, "provider")
++    invalid_names = [
++        "",
++        "Upper",
++        ":name",
++        "has:colon",
++        " leading",
++        "a" * 129,
++    ]
++
++    for name in invalid_names:
++        with pytest.raises(ValueError):
++            provider.register_service(name, object())
++    with pytest.raises(TypeError, match="must not be None"):
++        provider.register_service("continuity.v1", None)
++
++    assert manager._services == {}
++    assert manager._ownership_ledger == {}
++    assert manager._registration_order == []
++
++
++def test_owner_unload_and_force_clear_remove_service_but_consumer_unload_does_not():
++    manager = PluginManager(scope_key="profile-a")
++    provider = _context(manager, "provider")
++    consumer = _context(manager, "consumer")
++    service = object()
++    provider.register_service("continuity.v1", service)
++    consumer.on_unload(lambda: None)
++
++    assert manager.unload("consumer") is True
++    assert provider.get_service("provider:continuity.v1") is service
++
++    assert manager.unload("provider") is True
++    assert consumer.get_service("provider:continuity.v1") is None
++
++    provider.register_service("continuity.v1", service)
++    assert manager.unload() is True
++    assert manager._services == {}
++    assert consumer.get_service("provider:continuity.v1") is None
++
++
++def test_disposed_registration_release_cannot_delete_a_successor_entry():
++    manager = PluginManager(scope_key="profile-a")
++    provider = _context(manager, "provider")
++    first = object()
++    first_registration = provider.register_service("continuity.v1", first)
++    stale_release = first_registration.release
++
++    first_registration.dispose()
++    second = object()
++    provider.register_service("continuity.v1", second)
++    stale_release()
++
++    assert provider.get_service("provider:continuity.v1") is second
++    assert len(manager._services) == 1
++
++
++def test_same_service_name_is_isolated_between_profile_managers():
++    first_manager = PluginManager(scope_key="profile-a")
++    second_manager = PluginManager(scope_key="profile-b")
++    first_provider = _context(first_manager, "provider")
++    second_provider = _context(second_manager, "provider")
++    first_consumer = _context(first_manager, "consumer")
++    second_consumer = _context(second_manager, "consumer")
++    first_service = object()
++    second_service = object()
++
++    first_provider.register_service("continuity.v1", first_service)
++    second_provider.register_service("continuity.v1", second_service)
++
++    assert first_consumer.get_service("provider:continuity.v1") is first_service
++    assert second_consumer.get_service("provider:continuity.v1") is second_service
++
++
++def test_existing_context_lookup_does_not_follow_ambient_profile_switch(tmp_path):
++    from hermes_constants import (
++        reset_hermes_home_override,
++        set_hermes_home_override,
++    )
++
++    first_home = tmp_path / "profile-a"
++    second_home = tmp_path / "profile-b"
++    first_manager = PluginManager(scope_key=str(first_home))
++    second_manager = PluginManager(scope_key=str(second_home))
++    first_provider = _context(first_manager, "provider")
++    second_provider = _context(second_manager, "provider")
++    first_consumer = _context(first_manager, "consumer")
++    first_service = object()
++    second_service = object()
++    first_provider.register_service("continuity.v1", first_service)
++    second_provider.register_service("continuity.v1", second_service)
++
++    token = set_hermes_home_override(Path(second_home))
++    try:
++        assert first_consumer.get_service("provider:continuity.v1") is first_service
++    finally:
++        reset_hermes_home_override(token)
++
++
++def test_concurrent_duplicate_registration_has_one_winner_and_one_ledger_entry():
++    manager = PluginManager(scope_key="profile-a")
++    first = _context(manager, "provider", name="first-provider")
++    second = _context(manager, "provider", name="second-provider")
++    barrier = threading.Barrier(3)
++    outcomes: list[tuple[str, object]] = []
++    outcomes_lock = threading.Lock()
++
++    def register(ctx: PluginContext, service: object) -> None:
++        barrier.wait()
++        try:
++            ctx.register_service("continuity.v1", service)
++        except ValueError as exc:
++            outcome = ("error", exc)
++        else:
++            outcome = ("ok", service)
++        with outcomes_lock:
++            outcomes.append(outcome)
++
++    services = [object(), object()]
++    threads = [
++        threading.Thread(target=register, args=(ctx, service))
++        for ctx, service in zip((first, second), services)
++    ]
++    for thread in threads:
++        thread.start()
++    barrier.wait()
++    for thread in threads:
++        thread.join(timeout=5)
++
++    assert [status for status, _value in outcomes].count("ok") == 1
++    assert [status for status, _value in outcomes].count("error") == 1
++    winner = next(value for status, value in outcomes if status == "ok")
++    assert first.get_service("provider:continuity.v1") is winner
++    assert len(manager._services) == 1
++    assert len(manager._ownership_ledger["provider"]) == 1
++
++
++def test_service_object_is_returned_without_protocol_reflection_or_import():
++    manager = PluginManager(scope_key="profile-a")
++    provider = _context(manager, "provider")
++    consumer = _context(manager, "consumer")
++
++    class DuckService:
++        def ping(self):
++            return "pong"
++
++    service = DuckService()
++    provider.register_service("duck.v1", service)
++
++    resolved = consumer.get_service("provider:duck.v1")
++    assert resolved is service
++    assert resolved.ping() == "pong"
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,53 @@
+name: hermes-continuity
+version: 0.4.0
+manifest_version: 2
+api_version: 1
+description: Exact-source rolling continuity bridges for Hermes without owning its transcript or memory backend
+author: Aryuan026
+license: MIT
+homepage: https://github.com/Aryuan026/HermesContinuity
+tags: [context, continuity, receipts, sessiondb]
+provides_hooks:
+  - post_api_request
+  - api_request_error
+config_schema:
+  state_db:
+    type: str
+    default: ""
+    description: Optional Hermes state.db path; empty uses the active profile database
+  metadata_db:
+    type: str
+    default: ""
+    description: Optional checkpoint database path; empty uses profile-scoped plugin data
+  additional_human_sources:
+    type: list
+    default: []
+    description: Explicit extra session source tags owned by trusted interactive front ends
+  recent_horizon_hours:
+    type: int
+    default: 72
+    description: Maximum age represented in the visible recent bridge
+  source_token_limit:
+    type: int
+    default: 24000
+    description: Exact canonical source budget for one bridge build
+  output_token_limit:
+    type: int
+    default: 2048
+    description: Maximum accepted bridge output tokens
+  max_projection_chars:
+    type: int
+    default: 24000
+    description: Hard character ceiling for the request-only bridge carrier
+  max_cached_turns:
+    type: int
+    default: 128
+    description: Hard cap for process-private frozen turns and unsettled attempts
+  attempt_ttl_seconds:
+    type: float
+    default: 600.0
+    description: Expiry for an attempt that never reaches post_api_request or api_request_error
+  summary_timeout_seconds:
+    type: float
+    default: 120.0
+    description: Timeout for a host-owned bridge summary completion

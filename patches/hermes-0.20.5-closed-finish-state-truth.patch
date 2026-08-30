@@ -1,0 +1,1134 @@
+From 5e1b05f04b193ade4eb16fb28f29198b0ee672a3 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 11:23:06 +0800
+Subject: [PATCH] fix(llm): preserve closed finish-state truth
+
+---
+ agent/auxiliary_client.py                     |  90 +++++++-------
+ agent/bedrock_adapter.py                      |  14 +--
+ agent/codex_responses_adapter.py              |  83 +++++++------
+ agent/codex_runtime.py                        |  19 ++-
+ agent/gemini_native_adapter.py                |   6 +-
+ agent/transports/anthropic.py                 |   6 +-
+ agent/transports/bedrock.py                   |   4 +-
+ agent/transports/codex.py                     |   8 +-
+ agent/transports/types.py                     |  10 +-
+ tests/agent/test_aux_progress_streaming.py    |   4 +
+ tests/agent/test_auxiliary_client.py          | 113 +++++++++++++++++-
+ tests/agent/test_bedrock_adapter.py           |  33 +++++
+ tests/agent/test_codex_responses_adapter.py   |  90 ++++++++++++++
+ tests/agent/test_gemini_native_adapter.py     |  33 +++++
+ tests/agent/test_plugin_llm.py                |   6 +
+ .../transports/test_bedrock_transport.py      |  19 +++
+ .../agent/transports/test_codex_transport.py  |   6 +-
+ tests/agent/transports/test_transport.py      |  13 +-
+ tests/agent/transports/test_types.py          |   7 +-
+ 19 files changed, 442 insertions(+), 122 deletions(-)
+
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index a069629..d26c0e1 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -1676,8 +1676,6 @@ class _CodexCompletionsAdapter:
+             )
+ 
+         # Stream and collect the response
+-        text_parts: List[str] = []
+-        tool_calls_raw: List[Any] = []
+         usage = None
+         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
+         deadline = time.monotonic() + float(total_timeout) if total_timeout else None
+@@ -1848,31 +1846,24 @@ class _CodexCompletionsAdapter:
+             if final is None:
+                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
+ 
+-            # Extract text and tool calls from the Responses output.
+-            # Items may be SimpleNamespace (raw-event path) or dicts
+-            # (some legacy fallback paths), so handle both shapes.
+-            def _item_get(obj: Any, key: str, default: Any = None) -> Any:
+-                val = getattr(obj, key, None)
+-                if val is None and isinstance(obj, dict):
+-                    val = obj.get(key, default)
+-                return val if val is not None else default
+-
+-            for item in (getattr(final, "output", None) or []):
+-                item_type = _item_get(item, "type")
+-                if item_type == "message":
+-                    for part in (_item_get(item, "content") or []):
+-                        ptype = _item_get(part, "type")
+-                        if ptype in {"output_text", "text"}:
+-                            text_parts.append(_item_get(part, "text", ""))
+-                elif item_type == "function_call":
+-                    tool_calls_raw.append(SimpleNamespace(
+-                        id=_item_get(item, "call_id", ""),
+-                        type="function",
+-                        function=SimpleNamespace(
+-                            name=_item_get(item, "name", ""),
+-                            arguments=_item_get(item, "arguments", "{}"),
+-                        ),
+-                    ))
++            from agent.codex_responses_adapter import (
++                _classify_responses_issuer,
++                _normalize_codex_response,
++            )
++
++            issuer_kind = _classify_responses_issuer(
++                is_xai_responses=(
++                    base_url_host_matches(_host_for_input, "x.ai")
++                    or base_url_host_matches(_host_for_input, "api.x.ai")
++                ),
++                is_github_responses=_is_github_for_input,
++                is_codex_backend=base_url_host_matches(_host_for_input, "chatgpt.com"),
++                base_url=_host_for_input or None,
++            )
++            normalized_message, finish_reason = _normalize_codex_response(
++                final,
++                issuer_kind=issuer_kind,
++            )
+ 
+             resp_usage = getattr(final, "usage", None)
+             if resp_usage:
+@@ -1893,18 +1884,16 @@ class _CodexCompletionsAdapter:
+             if timeout_timer is not None:
+                 timeout_timer.cancel()
+ 
+-        content = "".join(text_parts).strip() or None
+-
+         # Build a response that looks like chat.completions
+         message = SimpleNamespace(
+             role="assistant",
+-            content=content,
+-            tool_calls=tool_calls_raw or None,
++            content=normalized_message.content or None,
++            tool_calls=normalized_message.tool_calls or None,
+         )
+         choice = SimpleNamespace(
+             index=0,
+             message=message,
+-            finish_reason="stop" if not tool_calls_raw else "tool_calls",
++            finish_reason=finish_reason,
+         )
+         return SimpleNamespace(
+             choices=[choice],
+@@ -8838,24 +8827,37 @@ def _recover_aux_response_message(response: Any) -> Optional[Any]:
+     endpoints return text outside ``choices`` (for example ``output_text`` or
+     ``output`` items).  Preserve that response before declaring it malformed.
+     """
+-    text = _extract_aux_response_text(response)
+-    if not text:
+-        return None
++    status = _obj_get(response, "status")
++    if isinstance(status, str) and (
++        isinstance(_obj_get(response, "output"), list)
++        or isinstance(_obj_get(response, "output_text"), str)
++    ):
++        from agent.codex_responses_adapter import _normalize_codex_response
+ 
+-    choice = SimpleNamespace(
+-        message=SimpleNamespace(content=text),
+-        finish_reason=getattr(response, "finish_reason", None) or "stop",
+-    )
++        message, finish_reason = _normalize_codex_response(response)
++    else:
++        text = _extract_aux_response_text(response)
++        if not text:
++            return None
++        raw_finish_reason = _obj_get(response, "finish_reason")
++        finish_reason = (
++            raw_finish_reason.strip()
++            if isinstance(raw_finish_reason, str) and raw_finish_reason.strip()
++            else None
++        )
++        message = SimpleNamespace(content=text)
++
++    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+     try:
+         response.choices = [choice]
+         return response
+     except Exception:
+         return SimpleNamespace(
+-            id=getattr(response, "id", ""),
+-            model=getattr(response, "model", ""),
+-            object=getattr(response, "object", "chat.completion"),
++            id=_obj_get(response, "id", ""),
++            model=_obj_get(response, "model", ""),
++            object=_obj_get(response, "object", "chat.completion"),
+             choices=[choice],
+-            usage=getattr(response, "usage", None),
++            usage=_obj_get(response, "usage"),
+         )
+ 
+ 
+@@ -9166,7 +9168,7 @@ class _ChatStreamAccumulator:
+         choice = SimpleNamespace(
+             index=0,
+             message=message,
+-            finish_reason=self.finish_reason or "stop",
++            finish_reason=self.finish_reason,
+         )
+         return SimpleNamespace(
+             id=self.resp_id,
+diff --git a/agent/bedrock_adapter.py b/agent/bedrock_adapter.py
+index 8d63323..37505a7 100644
+--- a/agent/bedrock_adapter.py
++++ b/agent/bedrock_adapter.py
+@@ -725,7 +725,7 @@ def convert_messages_to_converse(
+ # Response format conversion: Bedrock Converse → OpenAI
+ # ---------------------------------------------------------------------------
+ 
+-def _converse_stop_reason_to_openai(stop_reason: str) -> str:
++def _converse_stop_reason_to_openai(stop_reason: Optional[str]) -> str:
+     """Map Bedrock Converse stop reasons to OpenAI finish_reason values."""
+     mapping = {
+         "end_turn": "stop",
+@@ -735,7 +735,7 @@ def _converse_stop_reason_to_openai(stop_reason: str) -> str:
+         "content_filtered": "content_filter",
+         "guardrail_intervened": "content_filter",
+     }
+-    return mapping.get(stop_reason, "stop")
++    return mapping.get(stop_reason, "unknown")
+ 
+ 
+ def normalize_converse_response(response: Dict) -> SimpleNamespace:
+@@ -753,7 +753,7 @@ def normalize_converse_response(response: Dict) -> SimpleNamespace:
+     output = response.get("output", {})
+     message = output.get("message", {})
+     content_blocks = message.get("content", [])
+-    stop_reason = response.get("stopReason", "end_turn")
++    stop_reason = response.get("stopReason")
+ 
+     text_parts = []
+     reasoning_parts = []
+@@ -806,7 +806,7 @@ def normalize_converse_response(response: Dict) -> SimpleNamespace:
+     )
+ 
+     finish_reason = _converse_stop_reason_to_openai(stop_reason)
+-    if tool_calls and finish_reason == "stop":
++    if tool_calls and finish_reason in {"stop", "unknown"}:
+         finish_reason = "tool_calls"
+ 
+     choice = SimpleNamespace(
+@@ -885,7 +885,7 @@ def stream_converse_with_callbacks(
+     current_tool: Optional[Dict] = None
+     current_text_buffer: List[str] = []
+     has_tool_use = False
+-    stop_reason = "end_turn"
++    stop_reason = None
+     usage_data: Dict[str, int] = {}
+ 
+     for event in event_stream.get("stream", []):
+@@ -960,7 +960,7 @@ def stream_converse_with_callbacks(
+                 current_text_buffer = []
+ 
+         elif "messageStop" in event:
+-            stop_reason = event["messageStop"].get("stopReason", "end_turn")
++            stop_reason = event["messageStop"].get("stopReason")
+ 
+         elif "metadata" in event:
+             meta_usage = event["metadata"].get("usage", {})
+@@ -995,7 +995,7 @@ def stream_converse_with_callbacks(
+     )
+ 
+     finish_reason = _converse_stop_reason_to_openai(stop_reason)
+-    if tool_calls and finish_reason == "stop":
++    if tool_calls and finish_reason in {"stop", "unknown"}:
+         finish_reason = "tool_calls"
+ 
+     choice = SimpleNamespace(
+diff --git a/agent/codex_responses_adapter.py b/agent/codex_responses_adapter.py
+index 1b02a62..63f53aa 100644
+--- a/agent/codex_responses_adapter.py
++++ b/agent/codex_responses_adapter.py
+@@ -1243,18 +1243,25 @@ def _preflight_codex_api_kwargs(
+ # Response extraction helpers
+ # ---------------------------------------------------------------------------
+ 
++def _responses_field(obj: Any, name: str, default: Any = None) -> Any:
++    """Read one Responses field from either SDK objects or raw JSON dicts."""
++    if isinstance(obj, dict):
++        return obj.get(name, default)
++    return getattr(obj, name, default)
++
++
+ def _extract_responses_message_text(item: Any) -> str:
+     """Extract assistant text from a Responses message output item."""
+-    content = getattr(item, "content", None)
++    content = _responses_field(item, "content")
+     if not isinstance(content, list):
+         return ""
+ 
+     chunks: List[str] = []
+     for part in content:
+-        ptype = getattr(part, "type", None)
++        ptype = _responses_field(part, "type")
+         if ptype not in {"output_text", "text"}:
+             continue
+-        text = getattr(part, "text", None)
++        text = _responses_field(part, "text")
+         if isinstance(text, str) and text:
+             chunks.append(text)
+     return "".join(chunks).strip()
+@@ -1262,16 +1269,16 @@ def _extract_responses_message_text(item: Any) -> str:
+ 
+ def _extract_responses_reasoning_text(item: Any) -> str:
+     """Extract a compact reasoning text from a Responses reasoning item."""
+-    summary = getattr(item, "summary", None)
++    summary = _responses_field(item, "summary")
+     if isinstance(summary, list):
+         chunks: List[str] = []
+         for part in summary:
+-            text = getattr(part, "text", None)
++            text = _responses_field(part, "text")
+             if isinstance(text, str) and text:
+                 chunks.append(text)
+         if chunks:
+             return "\n".join(chunks).strip()
+-    text = getattr(item, "text", None)
++    text = _responses_field(item, "text")
+     if isinstance(text, str) and text:
+         return text.strip()
+     return ""
+@@ -1335,28 +1342,28 @@ def _normalize_codex_response(
+     differs from the one that minted the encrypted_content blob and drop
+     the item instead of triggering HTTP 400 invalid_encrypted_content.
+     """
+-    response_status = getattr(response, "status", None)
++    response_status = _responses_field(response, "status")
+     if isinstance(response_status, str):
+         response_status = response_status.strip().lower()
+     else:
+         response_status = None
+ 
+-    incomplete_details = getattr(response, "incomplete_details", None)
++    incomplete_details = _responses_field(response, "incomplete_details")
+     incomplete_reason = ""
+     if isinstance(incomplete_details, dict):
+         incomplete_reason = str(incomplete_details.get("reason") or "").strip().lower()
+     elif incomplete_details is not None:
+-        incomplete_reason = str(getattr(incomplete_details, "reason", "") or "").strip().lower()
++        incomplete_reason = str(_responses_field(incomplete_details, "reason", "") or "").strip().lower()
+     response_incomplete_content_filter = (
+         response_status == "incomplete" and incomplete_reason == "content_filter"
+     )
+ 
+-    output = getattr(response, "output", None)
++    output = _responses_field(response, "output")
+     if not isinstance(output, list) or not output:
+         # The Codex backend can return empty output when the answer was
+         # delivered entirely via stream events. Check output_text as a
+         # last-resort fallback before raising.
+-        out_text = getattr(response, "output_text", None)
++        out_text = _responses_field(response, "output_text")
+         if isinstance(out_text, str) and out_text.strip():
+             logger.debug(
+                 "Codex response has empty output but output_text is present (%d chars); "
+@@ -1366,7 +1373,10 @@ def _normalize_codex_response(
+                 type="message", role="assistant", status="completed",
+                 content=[SimpleNamespace(type="output_text", text=out_text.strip())],
+             )]
+-            response.output = output
++            if isinstance(response, dict):
++                response["output"] = output
++            else:
++                response.output = output
+         elif response_incomplete_content_filter:
+             # This is a deterministic provider safety block, not a partial
+             # answer. Synthesize an empty message so finish_reason below becomes
+@@ -1375,12 +1385,15 @@ def _normalize_codex_response(
+             output = [SimpleNamespace(
+                 type="message", role="assistant", status="completed", content=[]
+             )]
+-            response.output = output
++            if isinstance(response, dict):
++                response["output"] = output
++            else:
++                response.output = output
+         else:
+             raise RuntimeError("Responses API returned no output items")
+ 
+     if response_status in {"failed", "cancelled"}:
+-        error_obj = getattr(response, "error", None)
++        error_obj = _responses_field(response, "error")
+         error_msg = _format_responses_error(error_obj, response_status)
+         raise RuntimeError(error_msg)
+ 
+@@ -1423,8 +1436,8 @@ def _normalize_codex_response(
+     }
+ 
+     for item in output:
+-        item_type = getattr(item, "type", None)
+-        item_status = getattr(item, "status", None)
++        item_type = _responses_field(item, "type")
++        item_status = _responses_field(item, "status")
+         if isinstance(item_status, str):
+             item_status = item_status.strip().lower()
+         else:
+@@ -1438,7 +1451,7 @@ def _normalize_codex_response(
+             saw_streaming_or_item_incomplete = True
+ 
+         if item_type == "message":
+-            item_phase = getattr(item, "phase", None)
++            item_phase = _responses_field(item, "phase")
+             normalized_phase = None
+             is_commentary_phase = False
+             if isinstance(item_phase, str):
+@@ -1468,7 +1481,7 @@ def _normalize_codex_response(
+                     "status": _normalize_responses_message_status(item_status),
+                     "content": [{"type": "output_text", "text": message_text}],
+                 }
+-                item_id = getattr(item, "id", None)
++                item_id = _responses_field(item, "id")
+                 if isinstance(item_id, str) and item_id:
+                     raw_message_item["id"] = item_id
+                 if normalized_phase:
+@@ -1482,7 +1495,7 @@ def _normalize_codex_response(
+             # Capture the full reasoning item for multi-turn continuity.
+             # encrypted_content is an opaque blob the API needs back on
+             # subsequent turns to maintain coherent reasoning chains.
+-            encrypted = getattr(item, "encrypted_content", None)
++            encrypted = _responses_field(item, "encrypted_content")
+             if isinstance(encrypted, str) and encrypted:
+                 raw_item = {"type": "reasoning", "encrypted_content": encrypted}
+                 # Stamp the issuer so future turns can detect when a
+@@ -1491,7 +1504,7 @@ def _normalize_codex_response(
+                 # cross-issuer guard.
+                 if issuer_kind:
+                     raw_item["_issuer_kind"] = issuer_kind
+-                item_id = getattr(item, "id", None)
++                item_id = _responses_field(item, "id")
+                 if isinstance(item_id, str) and item_id.startswith("rs_tmp_"):
+                     logger.debug(
+                         "Skipping transient Codex reasoning item during normalization: %s",
+@@ -1501,11 +1514,11 @@ def _normalize_codex_response(
+                 if isinstance(item_id, str) and item_id:
+                     raw_item["id"] = item_id
+                 # Capture summary — required by the API when replaying reasoning items
+-                summary = getattr(item, "summary", None)
++                summary = _responses_field(item, "summary")
+                 if isinstance(summary, list):
+                     raw_summary = []
+                     for part in summary:
+-                        text = getattr(part, "text", None)
++                        text = _responses_field(part, "text")
+                         if isinstance(text, str):
+                             raw_summary.append({"type": "summary_text", "text": text})
+                     raw_item["summary"] = raw_summary
+@@ -1517,7 +1530,7 @@ def _normalize_codex_response(
+             # codex_reasoning_items sidecar so it inherits persistence
+             # (state.db), session replay, the cross-issuer guard, and the
+             # invalid-encrypted-content kill switch without new state.
+-            encrypted = getattr(item, "encrypted_content", None)
++            encrypted = _responses_field(item, "encrypted_content")
+             if isinstance(encrypted, str) and encrypted:
+                 raw_item = {"type": "compaction", "encrypted_content": encrypted}
+                 if issuer_kind:
+@@ -1530,12 +1543,12 @@ def _normalize_codex_response(
+         elif item_type == "function_call":
+             if item_status in {"queued", "in_progress", "incomplete"}:
+                 continue
+-            fn_name = getattr(item, "name", "") or ""
+-            arguments = getattr(item, "arguments", "{}")
++            fn_name = _responses_field(item, "name", "") or ""
++            arguments = _responses_field(item, "arguments", "{}")
+             if not isinstance(arguments, str):
+                 arguments = json.dumps(arguments, ensure_ascii=False)
+-            raw_call_id = getattr(item, "call_id", None)
+-            raw_item_id = getattr(item, "id", None)
++            raw_call_id = _responses_field(item, "call_id")
++            raw_item_id = _responses_field(item, "id")
+             embedded_call_id, _ = _split_responses_tool_id(raw_item_id)
+             call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id.strip() else embedded_call_id
+             if not isinstance(call_id, str) or not call_id.strip():
+@@ -1551,12 +1564,12 @@ def _normalize_codex_response(
+                 function=SimpleNamespace(name=fn_name, arguments=arguments),
+             ))
+         elif item_type == "custom_tool_call":
+-            fn_name = getattr(item, "name", "") or ""
+-            arguments = getattr(item, "input", "{}")
++            fn_name = _responses_field(item, "name", "") or ""
++            arguments = _responses_field(item, "input", "{}")
+             if not isinstance(arguments, str):
+                 arguments = json.dumps(arguments, ensure_ascii=False)
+-            raw_call_id = getattr(item, "call_id", None)
+-            raw_item_id = getattr(item, "id", None)
++            raw_call_id = _responses_field(item, "call_id")
++            raw_item_id = _responses_field(item, "id")
+             embedded_call_id, _ = _split_responses_tool_id(raw_item_id)
+             call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id.strip() else embedded_call_id
+             if not isinstance(call_id, str) or not call_id.strip():
+@@ -1575,10 +1588,10 @@ def _normalize_codex_response(
+     final_text = "\n".join([p for p in content_parts if p]).strip()
+     if (
+         not final_text
+-        and hasattr(response, "output_text")
++        and _responses_field(response, "output_text") is not None
+         and not (saw_commentary_phase and not saw_final_answer_phase)
+     ):
+-        out_text = getattr(response, "output_text", "")
++        out_text = _responses_field(response, "output_text", "")
+         if isinstance(out_text, str):
+             final_text = out_text.strip()
+ 
+@@ -1696,6 +1709,8 @@ def _normalize_codex_response(
+             finish_reason = "stop"
+         else:
+             finish_reason = "incomplete"
+-    else:
++    elif response_status == "completed":
+         finish_reason = "stop"
++    else:
++        finish_reason = "unknown"
+     return assistant_message, finish_reason
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index 8a4ee43..fa900a9 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -979,6 +979,7 @@ _TERMINAL_EVENT_TYPES = frozenset({
+     "response.completed",
+     "response.incomplete",
+     "response.failed",
++    "response.cancelled",
+ })
+ 
+ 
+@@ -1057,11 +1058,12 @@ def _consume_codex_event_stream(
+       if no message item was emitted directly.
+     * ``output_text``: assembled text from ``response.output_text.delta`` deltas.
+     * ``usage``: copied from the terminal event's ``response.usage`` (when present).
+-    * ``status``: ``completed`` / ``incomplete`` / ``failed`` (or ``completed`` if
+-      the stream ended without a terminal frame but produced content).
++    * ``status``: ``completed`` / ``incomplete`` / ``failed`` / ``cancelled``
++      (or ``completed`` if the stream ended without a terminal frame but
++      produced content).
+     * ``id``: ``response.id`` when present.
+     * ``incomplete_details``: passed through for ``response.incomplete`` frames.
+-    * ``error``: passed through for ``response.failed`` frames.
++    * ``error``: passed through for ``response.failed`` / ``response.cancelled`` frames.
+     * ``model``: from kwargs (the wire model name is not authoritative).
+ 
+     Critically, we never read ``response.output`` from the terminal event for
+@@ -1233,6 +1235,7 @@ def _consume_codex_event_stream(
+         if event_type in _TERMINAL_EVENT_TYPES:
+             saw_terminal = True
+             resp_obj = _event_field(event, "response")
++            rstatus = None
+             if resp_obj is not None:
+                 terminal_usage = getattr(resp_obj, "usage", None)
+                 if terminal_usage is None and isinstance(resp_obj, dict):
+@@ -1250,16 +1253,12 @@ def _consume_codex_event_stream(
+                     terminal_incomplete_details = getattr(resp_obj, "incomplete_details", None)
+                     if terminal_incomplete_details is None and isinstance(resp_obj, dict):
+                         terminal_incomplete_details = resp_obj.get("incomplete_details")
+-                if event_type == "response.failed":
++                if event_type in {"response.failed", "response.cancelled"}:
+                     terminal_error = getattr(resp_obj, "error", None)
+                     if terminal_error is None and isinstance(resp_obj, dict):
+                         terminal_error = resp_obj.get("error")
+-            if event_type == "response.completed":
+-                terminal_status = terminal_status or "completed"
+-            elif event_type == "response.incomplete":
+-                terminal_status = terminal_status or "incomplete"
+-            elif event_type == "response.failed":
+-                terminal_status = terminal_status or "failed"
++            if not isinstance(rstatus, str) or not rstatus.strip():
++                terminal_status = event_type.removeprefix("response.")
+             # Stop on terminal event.
+             break
+ 
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index 01e14c2..58538c6 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -656,9 +656,9 @@ def _map_gemini_finish_reason(reason: str) -> str:
+         "MAX_TOKENS": "length",
+         "SAFETY": "content_filter",
+         "RECITATION": "content_filter",
+-        "OTHER": "stop",
++        "OTHER": "unknown",
+     }
+-    return mapping.get(str(reason or "").upper(), "stop")
++    return mapping.get(str(reason or "").upper(), "unknown")
+ 
+ 
+ def _tool_call_extra_from_part(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+@@ -677,7 +677,7 @@ def _empty_response(model: str) -> SimpleNamespace:
+         reasoning_content=None,
+         reasoning_details=None,
+     )
+-    choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
++    choice = SimpleNamespace(index=0, message=message, finish_reason="unknown")
+     usage = SimpleNamespace(
+         prompt_tokens=0,
+         completion_tokens=0,
+diff --git a/agent/transports/anthropic.py b/agent/transports/anthropic.py
+index 98721f7..bab32e0 100644
+--- a/agent/transports/anthropic.py
++++ b/agent/transports/anthropic.py
+@@ -159,7 +159,9 @@ class AnthropicTransport(ProviderTransport):
+                     )
+                 )
+ 
+-        finish_reason = self._STOP_REASON_MAP.get(response.stop_reason, "stop")
++        finish_reason = self._STOP_REASON_MAP.get(
++            getattr(response, "stop_reason", None), "unknown"
++        )
+ 
+         provider_data = {}
+         if reasoning_details:
+@@ -242,7 +244,7 @@ class AnthropicTransport(ProviderTransport):
+ 
+     def map_finish_reason(self, raw_reason: str) -> str:
+         """Map Anthropic stop_reason to OpenAI finish_reason."""
+-        return self._STOP_REASON_MAP.get(raw_reason, "stop")
++        return self._STOP_REASON_MAP.get(raw_reason, "unknown")
+ 
+ 
+ # Auto-register on import
+diff --git a/agent/transports/bedrock.py b/agent/transports/bedrock.py
+index af549e7..c3d33d0 100644
+--- a/agent/transports/bedrock.py
++++ b/agent/transports/bedrock.py
+@@ -83,7 +83,7 @@ class BedrockTransport(ProviderTransport):
+ 
+         choice = ns.choices[0]
+         msg = choice.message
+-        finish_reason = choice.finish_reason or "stop"
++        finish_reason = choice.finish_reason or "unknown"
+ 
+         tool_calls = None
+         if msg.tool_calls:
+@@ -145,7 +145,7 @@ class BedrockTransport(ProviderTransport):
+             "guardrail_intervened": "content_filter",
+             "content_filtered": "content_filter",
+         }
+-        return _MAP.get(raw_reason, "stop")
++        return _MAP.get(raw_reason, "unknown")
+ 
+ 
+ # Auto-register on import
+diff --git a/agent/transports/codex.py b/agent/transports/codex.py
+index 38e86a6..cae84f3 100644
+--- a/agent/transports/codex.py
++++ b/agent/transports/codex.py
+@@ -813,7 +813,7 @@ class ResponsesApiTransport(ProviderTransport):
+         return NormalizedResponse(
+             content=msg.content if msg else None,
+             tool_calls=tool_calls,
+-            finish_reason=finish_reason or "stop",
++            finish_reason=finish_reason or "unknown",
+             reasoning=msg.reasoning if msg and hasattr(msg, "reasoning") else None,
+             usage=None,  # Codex usage is extracted separately in normalize_usage()
+             provider_data=provider_data or None,
+@@ -893,10 +893,10 @@ class ResponsesApiTransport(ProviderTransport):
+         _MAP = {
+             "completed": "stop",
+             "incomplete": "length",
+-            "failed": "stop",
+-            "cancelled": "stop",
++            "failed": "failed",
++            "cancelled": "cancelled",
+         }
+-        return _MAP.get(raw_reason, "stop")
++        return _MAP.get(raw_reason, "unknown")
+ 
+ 
+ # Auto-register on import
+diff --git a/agent/transports/types.py b/agent/transports/types.py
+index 6ad20f2..aa729b0 100644
+--- a/agent/transports/types.py
++++ b/agent/transports/types.py
+@@ -103,7 +103,9 @@ class NormalizedResponse:
+ 
+     content: str | None
+     tool_calls: list[ToolCall] | None
+-    finish_reason: str  # "stop", "tool_calls", "length", "content_filter"
++    # Normalized provider state. Terminal failures may remain provider-specific
++    # strings; consumers must treat only ``stop`` as proven completion.
++    finish_reason: str
+     reasoning: str | None = None
+     usage: Usage | None = None
+     provider_data: dict[str, Any] | None = field(default=None, repr=False)
+@@ -167,8 +169,8 @@ def build_tool_call(
+ def map_finish_reason(reason: str | None, mapping: dict[str, str]) -> str:
+     """Translate a provider-specific stop reason to the normalised set.
+ 
+-    Falls back to ``"stop"`` for unknown or ``None`` reasons.
++    Unknown or missing reasons must not be promoted to successful completion.
+     """
+     if reason is None:
+-        return "stop"
+-    return mapping.get(reason, "stop")
++        return "unknown"
++    return mapping.get(reason, "unknown")
+diff --git a/tests/agent/test_aux_progress_streaming.py b/tests/agent/test_aux_progress_streaming.py
+index fbb554f..5f413de 100644
+--- a/tests/agent/test_aux_progress_streaming.py
++++ b/tests/agent/test_aux_progress_streaming.py
+@@ -193,6 +193,10 @@ class TestAggregateChatStream:
+         assert result.choices[0].message.content == "ok"
+         assert closed == [True]
+ 
++    def test_missing_terminal_reason_is_not_promoted_to_success(self):
++        result = _aggregate_chat_stream(iter([_chunk(content="partial")]))
++        assert result.choices[0].finish_reason is None
++
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/tests/agent/test_auxiliary_client.py b/tests/agent/test_auxiliary_client.py
+index ad4966a..99468e5 100644
+--- a/tests/agent/test_auxiliary_client.py
++++ b/tests/agent/test_auxiliary_client.py
+@@ -3404,8 +3404,8 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
+ 
+         assert response.choices[0].message.content == "aux survived"
+ 
+-    def test_handles_final_output_is_none_after_consumer(self):
+-        """Regression for #33368 — defense against ``final.output`` being ``None``.
++    def test_final_output_none_without_text_is_not_promoted_to_success(self):
++        """A completed-looking shim with no output cannot prove success.
+ 
+         The event-driven consumer always sets ``final.output`` to a list, so this
+         shape can't come from our own path. But a mocked client / compatibility
+@@ -3454,10 +3454,8 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
+             fake_client = SimpleNamespace(responses=FakeResponses())
+             adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+ 
+-            # Should not raise TypeError: 'NoneType' object is not iterable
+-            response = adapter.create(messages=[{"role": "user", "content": "x"}])
+-            assert response.choices[0].message.content is None
+-            assert response.choices[0].finish_reason == "stop"
++            with pytest.raises(RuntimeError, match="no output items"):
++                adapter.create(messages=[{"role": "user", "content": "x"}])
+         finally:
+             codex_runtime._consume_codex_event_stream = original_consume
+ 
+@@ -3499,6 +3497,109 @@ class TestCodexAuxiliaryAdapterCompletedResponse:
+         assert response.usage.total_tokens == 14
+ 
+ 
++class TestCodexAuxiliaryFinishTruth:
++    @staticmethod
++    def _call(response):
++        class FakeResponses:
++            def create(self, **kwargs):
++                assert kwargs["stream"] is True
++                return response
++
++        client = SimpleNamespace(responses=FakeResponses())
++        adapter = _CodexCompletionsAdapter(client, "gpt-test")
++        return adapter.create(messages=[{"role": "user", "content": "summarize"}])
++
++    @staticmethod
++    def _message_response(status, *, text="partial", reason=None):
++        return SimpleNamespace(
++            status=status,
++            output=[SimpleNamespace(
++                type="message",
++                status="completed",
++                content=[SimpleNamespace(type="output_text", text=text)],
++            )],
++            output_text="",
++            incomplete_details=(
++                SimpleNamespace(reason=reason) if reason is not None else None
++            ),
++            error=None,
++            usage=None,
++        )
++
++    @pytest.mark.parametrize(
++        ("status", "reason", "expected"),
++        [
++            ("completed", None, "stop"),
++            ("incomplete", "max_output_tokens", "incomplete"),
++            ("provider_added_a_new_status", None, "unknown"),
++        ],
++    )
++    def test_text_status_uses_shared_responses_normalizer(
++        self, status, reason, expected
++    ):
++        result = self._call(self._message_response(status, reason=reason))
++        assert result.choices[0].message.content == "partial"
++        assert result.choices[0].finish_reason == expected
++
++    def test_content_filter_and_tool_call_remain_distinct(self):
++        filtered = SimpleNamespace(
++            status="incomplete",
++            output=[],
++            output_text="",
++            incomplete_details=SimpleNamespace(reason="content_filter"),
++            error=None,
++            usage=None,
++        )
++        assert self._call(filtered).choices[0].finish_reason == "content_filter"
++
++        tool = SimpleNamespace(
++            status="completed",
++            output=[SimpleNamespace(
++                type="function_call",
++                status="completed",
++                call_id="call_1",
++                id="fc_1",
++                name="lookup",
++                arguments='{"q":"x"}',
++            )],
++            output_text="",
++            incomplete_details=None,
++            error=None,
++            usage=None,
++        )
++        assert self._call(tool).choices[0].finish_reason == "tool_calls"
++
++    @pytest.mark.parametrize("status", ["failed", "cancelled"])
++    def test_terminal_failure_raises_instead_of_synthesizing_stop(self, status):
++        response = self._message_response(status)
++        response.error = {"code": status, "message": "terminal failure"}
++        with pytest.raises(RuntimeError, match="terminal failure"):
++            self._call(response)
++
++    @pytest.mark.parametrize(
++        ("status", "expected"),
++        [
++            ("completed", "stop"),
++            ("incomplete", "incomplete"),
++            ("provider_added_a_new_status", "unknown"),
++        ],
++    )
++    def test_generic_responses_recovery_uses_same_finish_truth(self, status, expected):
++        from agent.auxiliary_client import _recover_aux_response_message
++
++        response = self._message_response(status)
++        recovered = _recover_aux_response_message(response)
++        assert recovered.choices[0].finish_reason == expected
++
++    def test_generic_text_recovery_without_status_keeps_reason_unknown(self):
++        from agent.auxiliary_client import _recover_aux_response_message
++
++        recovered = _recover_aux_response_message(
++            SimpleNamespace(output_text="partial")
++        )
++        assert recovered.choices[0].finish_reason is None
++
++
+ # ---------------------------------------------------------------------------
+ # Issue #23432 — auxiliary timeout poisons cached client; later aux calls fail
+ # ---------------------------------------------------------------------------
+diff --git a/tests/agent/test_bedrock_adapter.py b/tests/agent/test_bedrock_adapter.py
+index e6c2c3c..9a5c015 100644
+--- a/tests/agent/test_bedrock_adapter.py
++++ b/tests/agent/test_bedrock_adapter.py
+@@ -297,6 +297,29 @@ class TestNormalizeConverseResponse:
+         assert tool_calls[0].function.name == "read_file"
+         assert json.loads(tool_calls[0].function.arguments) == {"path": "/tmp/test.txt"}
+ 
++    @pytest.mark.parametrize(
++        ("stop_reason", "expected"),
++        [
++            ("max_tokens", "length"),
++            ("content_filtered", "content_filter"),
++            ("provider_added_a_new_reason", "unknown"),
++        ],
++    )
++    def test_terminal_reason_truth(self, stop_reason, expected):
++        from agent.bedrock_adapter import normalize_converse_response
++
++        response = {
++            "output": {
++                "message": {
++                    "role": "assistant",
++                    "content": [{"text": "partial"}],
++                },
++            },
++            "stopReason": stop_reason,
++            "usage": {},
++        }
++        assert normalize_converse_response(response).choices[0].finish_reason == expected
++
+ 
+ 
+ 
+@@ -351,6 +374,16 @@ class TestNormalizeConverseStreamEvents:
+         assert tc[0].function.name == "read_file"
+         assert json.loads(tc[0].function.arguments) == {"path": "/tmp/f"}
+ 
++    def test_stream_without_message_stop_is_not_promoted_to_success(self):
++        from agent.bedrock_adapter import normalize_converse_stream_events
++
++        events = {"stream": [
++            {"contentBlockDelta": {"delta": {"text": "partial"}}},
++            {"contentBlockStop": {}},
++        ]}
++        result = normalize_converse_stream_events(events)
++        assert result.choices[0].finish_reason == "unknown"
++
+ 
+ 
+ 
+diff --git a/tests/agent/test_codex_responses_adapter.py b/tests/agent/test_codex_responses_adapter.py
+index f9f7e91..a8e52aa 100644
+--- a/tests/agent/test_codex_responses_adapter.py
++++ b/tests/agent/test_codex_responses_adapter.py
+@@ -271,6 +271,96 @@ def test_normalize_codex_response_treats_summary_only_reasoning_as_incomplete():
+     assert assistant_message.codex_reasoning_items is None
+ 
+ 
++@pytest.mark.parametrize(
++    ("status", "expected"),
++    [
++        ("completed", "stop"),
++        ("incomplete", "incomplete"),
++        ("queued", "incomplete"),
++        ("in_progress", "incomplete"),
++        ("provider_added_a_new_status", "unknown"),
++        (None, "unknown"),
++    ],
++)
++def test_normalize_codex_response_requires_known_completed_status(status, expected):
++    response = SimpleNamespace(
++        status=status,
++        output=[SimpleNamespace(
++            type="message",
++            role="assistant",
++            status="completed",
++            content=[SimpleNamespace(type="output_text", text="partial")],
++        )],
++        incomplete_details=None,
++    )
++
++    message, finish_reason = _normalize_codex_response(response)
++
++    assert message.content == "partial"
++    assert finish_reason == expected
++
++
++def test_normalize_codex_response_supports_raw_dict_items_without_losing_status():
++    response = {
++        "status": "incomplete",
++        "incomplete_details": {"reason": "max_output_tokens"},
++        "output": [{
++            "type": "message",
++            "status": "completed",
++            "content": [{"type": "output_text", "text": "partial"}],
++        }],
++    }
++
++    message, finish_reason = _normalize_codex_response(response)
++
++    assert message.content == "partial"
++    assert finish_reason == "incomplete"
++
++
++@pytest.mark.parametrize("status", ["failed", "cancelled"])
++def test_normalize_codex_response_terminal_failure_never_becomes_stop(status):
++    response = SimpleNamespace(
++        status=status,
++        output=[SimpleNamespace(
++            type="message",
++            status="incomplete",
++            content=[SimpleNamespace(type="output_text", text="partial")],
++        )],
++        error={"code": status, "message": "terminal failure"},
++    )
++
++    with pytest.raises(RuntimeError, match=rf"^{status}: terminal failure$"):
++        _normalize_codex_response(response)
++
++
++def test_codex_event_consumer_preserves_cancelled_terminal_status():
++    from agent.codex_runtime import _consume_codex_event_stream
++
++    events = [
++        SimpleNamespace(
++            type="response.output_item.done",
++            item=SimpleNamespace(
++                type="message",
++                status="incomplete",
++                content=[SimpleNamespace(type="output_text", text="partial")],
++            ),
++        ),
++        SimpleNamespace(
++            type="response.cancelled",
++            response=SimpleNamespace(
++                status="cancelled",
++                error={"code": "cancelled", "message": "cancelled by provider"},
++            ),
++        ),
++    ]
++
++    final = _consume_codex_event_stream(events, model="gpt-test")
++
++    assert final.status == "cancelled"
++    with pytest.raises(RuntimeError, match="cancelled by provider"):
++        _normalize_codex_response(final)
++
++
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/tests/agent/test_gemini_native_adapter.py b/tests/agent/test_gemini_native_adapter.py
+index 4db7344..65d86aa 100644
+--- a/tests/agent/test_gemini_native_adapter.py
++++ b/tests/agent/test_gemini_native_adapter.py
+@@ -163,6 +163,39 @@ def test_translate_native_response_surfaces_reasoning_and_tool_calls():
+     assert json.loads(choice.message.tool_calls[0].function.arguments) == {"q": "hermes"}
+ 
+ 
++@pytest.mark.parametrize(
++    ("wire_reason", "expected"),
++    [
++        ("STOP", "stop"),
++        ("MAX_TOKENS", "length"),
++        ("SAFETY", "content_filter"),
++        ("OTHER", "unknown"),
++        ("A_NEW_REASON", "unknown"),
++        (None, "unknown"),
++    ],
++)
++def test_translate_native_response_preserves_finish_truth(wire_reason, expected):
++    from agent.gemini_native_adapter import translate_gemini_response
++
++    candidate = {
++        "content": {"parts": [{"text": "partial"}]},
++    }
++    if wire_reason is not None:
++        candidate["finishReason"] = wire_reason
++    response = translate_gemini_response(
++        {"candidates": [candidate]},
++        model="gemini-test",
++    )
++    assert response.choices[0].finish_reason == expected
++
++
++def test_empty_native_response_is_not_promoted_to_success():
++    from agent.gemini_native_adapter import translate_gemini_response
++
++    response = translate_gemini_response({}, model="gemini-test")
++    assert response.choices[0].finish_reason == "unknown"
++
++
+ def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatch):
+     from agent.gemini_native_adapter import GeminiNativeClient
+ 
+diff --git a/tests/agent/test_plugin_llm.py b/tests/agent/test_plugin_llm.py
+index 4d12484..730a271 100644
+--- a/tests/agent/test_plugin_llm.py
++++ b/tests/agent/test_plugin_llm.py
+@@ -352,6 +352,12 @@ class TestPluginLlmFacade:
+         [
+             (" stop ", "stop"),
+             ("length", "length"),
++            ("content_filter", "content_filter"),
++            ("tool_calls", "tool_calls"),
++            ("incomplete", "incomplete"),
++            ("failed", "failed"),
++            ("cancelled", "cancelled"),
++            ("provider_added_a_new_reason", "provider_added_a_new_reason"),
+             (_MISSING_FINISH_REASON, None),
+         ],
+     )
+diff --git a/tests/agent/transports/test_bedrock_transport.py b/tests/agent/transports/test_bedrock_transport.py
+index 2d721bb..482306b 100644
+--- a/tests/agent/transports/test_bedrock_transport.py
++++ b/tests/agent/transports/test_bedrock_transport.py
+@@ -84,6 +84,9 @@ class TestBedrockMapFinishReason:
+     def test_end_turn(self, transport):
+         assert transport.map_finish_reason("end_turn") == "stop"
+ 
++    def test_unknown_is_not_promoted_to_success(self, transport):
++        assert transport.map_finish_reason("provider_added_a_new_reason") == "unknown"
++
+ 
+ 
+ 
+@@ -123,6 +126,22 @@ class TestBedrockNormalize:
+         assert len(nr.tool_calls) == 1
+         assert nr.tool_calls[0].name == "terminal"
+ 
++    @pytest.mark.parametrize(
++        ("stop_reason", "expected"),
++        [
++            ("end_turn", "stop"),
++            ("max_tokens", "length"),
++            ("guardrail_intervened", "content_filter"),
++            ("provider_added_a_new_reason", "unknown"),
++            (None, "unknown"),
++        ],
++    )
++    def test_finish_reason_truth(self, transport, stop_reason, expected):
++        raw = self._make_bedrock_response(stop_reason=stop_reason)
++        if stop_reason is None:
++            raw.pop("stopReason")
++        assert transport.normalize_response(raw).finish_reason == expected
++
+ 
+     def test_already_normalized_response(self, transport):
+         """Test normalize_response handles already-normalized SimpleNamespace (from dispatch site)."""
+diff --git a/tests/agent/transports/test_codex_transport.py b/tests/agent/transports/test_codex_transport.py
+index 47b5c4e..80b4595 100644
+--- a/tests/agent/transports/test_codex_transport.py
++++ b/tests/agent/transports/test_codex_transport.py
+@@ -1006,8 +1006,12 @@ class TestCodexValidateResponse:
+ 
+ class TestCodexMapFinishReason:
+ 
+-    def test_completed(self, transport):
++    def test_terminal_statuses(self, transport):
+         assert transport.map_finish_reason("completed") == "stop"
++        assert transport.map_finish_reason("incomplete") == "length"
++        assert transport.map_finish_reason("failed") == "failed"
++        assert transport.map_finish_reason("cancelled") == "cancelled"
++        assert transport.map_finish_reason("provider_added_a_new_status") == "unknown"
+ 
+ 
+ 
+diff --git a/tests/agent/transports/test_transport.py b/tests/agent/transports/test_transport.py
+index 5d29a15..574530e 100644
+--- a/tests/agent/transports/test_transport.py
++++ b/tests/agent/transports/test_transport.py
+@@ -113,7 +113,18 @@ class TestAnthropicTransport:
+         assert transport.map_finish_reason("stop_sequence") == "stop"
+         assert transport.map_finish_reason("refusal") == "content_filter"
+         assert transport.map_finish_reason("model_context_window_exceeded") == "length"
+-        assert transport.map_finish_reason("unknown") == "stop"
++        assert transport.map_finish_reason("unknown") == "unknown"
++
++    def test_unknown_stop_reason_is_not_promoted_to_success(self, transport):
++        block = SimpleNamespace(type="text", text="partial")
++        nr = transport.normalize_response(
++            SimpleNamespace(
++                content=[block],
++                stop_reason="provider_added_a_new_reason",
++                usage=SimpleNamespace(input_tokens=1, output_tokens=1),
++            )
++        )
++        assert nr.finish_reason == "unknown"
+ 
+ 
+ 
+diff --git a/tests/agent/transports/test_types.py b/tests/agent/transports/test_types.py
+index 49d0042..b990738 100644
+--- a/tests/agent/transports/test_types.py
++++ b/tests/agent/transports/test_types.py
+@@ -115,11 +115,11 @@ class TestMapFinishReason:
+         assert map_finish_reason("max_tokens", self.ANTHROPIC_MAP) == "length"
+         assert map_finish_reason("refusal", self.ANTHROPIC_MAP) == "content_filter"
+ 
+-    def test_unknown_reason_defaults_to_stop(self):
+-        assert map_finish_reason("something_new", self.ANTHROPIC_MAP) == "stop"
++    def test_unknown_reason_is_not_promoted_to_success(self):
++        assert map_finish_reason("something_new", self.ANTHROPIC_MAP) == "unknown"
+ 
+     def test_none_reason(self):
+-        assert map_finish_reason(None, self.ANTHROPIC_MAP) == "stop"
++        assert map_finish_reason(None, self.ANTHROPIC_MAP) == "unknown"
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -197,4 +197,3 @@ class TestNormalizedResponseBackwardCompat:
+ 
+ 
+ 
+-
+-- 
+2.50.1 (Apple Git-155)
+

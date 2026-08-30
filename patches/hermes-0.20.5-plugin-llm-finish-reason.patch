@@ -1,0 +1,215 @@
+From 201fe7756c57c35aaed9af8e9886e10ff4d25cfe Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 00:36:57 +0800
+Subject: [PATCH] feat(plugins): expose LLM finish reasons
+
+---
+ agent/plugin_llm.py            | 29 +++++++++++
+ tests/agent/test_plugin_llm.py | 89 +++++++++++++++++++++++++++++++---
+ 2 files changed, 111 insertions(+), 7 deletions(-)
+
+diff --git a/agent/plugin_llm.py b/agent/plugin_llm.py
+index e0cc8cc..1805ffe 100644
+--- a/agent/plugin_llm.py
++++ b/agent/plugin_llm.py
+@@ -143,6 +143,7 @@ class PluginLlmCompleteResult:
+     agent_id: str
+     usage: PluginLlmUsage = field(default_factory=PluginLlmUsage)
+     audit: Dict[str, Any] = field(default_factory=dict)
++    finish_reason: Optional[str] = None
+ 
+ 
+ @dataclass
+@@ -162,6 +163,7 @@ class PluginLlmStructuredResult:
+     parsed: Optional[Any] = None
+     content_type: str = "text"
+     audit: Dict[str, Any] = field(default_factory=dict)
++    finish_reason: Optional[str] = None
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -651,6 +653,29 @@ def _extract_text(response: Any) -> str:
+     return ""
+ 
+ 
++def _extract_finish_reason(response: Any) -> Optional[str]:
++    """Pull a normalized finish reason from an OpenAI-shaped response."""
++    try:
++        choices = (
++            response.get("choices")
++            if isinstance(response, dict)
++            else getattr(response, "choices", None)
++        )
++        choice = choices[0]
++        reason = (
++            choice.get("finish_reason")
++            if isinstance(choice, dict)
++            else getattr(choice, "finish_reason", None)
++        )
++    except (AttributeError, IndexError, KeyError, TypeError):
++        return None
++
++    if not isinstance(reason, str):
++        return None
++    normalized = reason.strip()
++    return normalized or None
++
++
+ def _resolve_attribution(
+     *,
+     provider_override: Optional[str],
+@@ -799,6 +824,7 @@ class PluginLlm:
+                 "profile": eff_profile or "",
+                 "task": eff_task or "",
+             },
++            finish_reason=_extract_finish_reason(response),
+         )
+         logger.info(
+             "plugin_llm.complete plugin=%s provider=%s model=%s task=%s "
+@@ -898,6 +924,7 @@ class PluginLlm:
+                 "schema_name": schema_name or "",
+                 "task": eff_task or "",
+             },
++            finish_reason=_extract_finish_reason(response),
+         )
+         logger.info(
+             "plugin_llm.complete_structured plugin=%s provider=%s model=%s "
+@@ -957,6 +984,7 @@ class PluginLlm:
+                 "profile": eff_profile or "",
+                 "task": eff_task or "",
+             },
++            finish_reason=_extract_finish_reason(response),
+         )
+         logger.info(
+             "plugin_llm.acomplete plugin=%s provider=%s model=%s task=%s "
+@@ -1040,6 +1068,7 @@ class PluginLlm:
+                 "schema_name": schema_name or "",
+                 "task": eff_task or "",
+             },
++            finish_reason=_extract_finish_reason(response),
+         )
+         logger.info(
+             "plugin_llm.acomplete_structured plugin=%s provider=%s model=%s "
+diff --git a/tests/agent/test_plugin_llm.py b/tests/agent/test_plugin_llm.py
+index 3801694..4d12484 100644
+--- a/tests/agent/test_plugin_llm.py
++++ b/tests/agent/test_plugin_llm.py
+@@ -26,6 +26,7 @@ from agent.plugin_llm import (
+     _build_structured_messages,
+     _check_overrides,
+     _coerce_allowlist,
++    _extract_finish_reason,
+     _parse_structured_text,
+     _strip_code_fences,
+     _TrustPolicy,
+@@ -38,15 +39,24 @@ from agent.plugin_llm import (
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def _fake_response(text: str, *, prompt: int = 4, completion: int = 6) -> SimpleNamespace:
++_MISSING_FINISH_REASON = object()
++
++
++def _fake_response(
++    text: str,
++    *,
++    prompt: int = 4,
++    completion: int = 6,
++    finish_reason: Any = "stop",
++) -> SimpleNamespace:
+     """Build an OpenAI-shaped response with the given text + token usage."""
++    choice = SimpleNamespace(
++        message=SimpleNamespace(content=text, role="assistant"),
++    )
++    if finish_reason is not _MISSING_FINISH_REASON:
++        choice.finish_reason = finish_reason
+     return SimpleNamespace(
+-        choices=[
+-            SimpleNamespace(
+-                message=SimpleNamespace(content=text, role="assistant"),
+-                finish_reason="stop",
+-            )
+-        ],
++        choices=[choice],
+         usage=SimpleNamespace(
+             prompt_tokens=prompt,
+             completion_tokens=completion,
+@@ -328,6 +338,58 @@ class TestPluginLlmFacade:
+         assert captured["max_tokens"] == 128
+         assert captured["timeout"] == 10.0
+ 
++    @pytest.mark.parametrize(
++        ("method", "is_async", "structured", "text"),
++        [
++            ("complete", False, False, "plain response"),
++            ("complete_structured", False, True, '{"ok": true}'),
++            ("acomplete", True, False, "plain response"),
++            ("acomplete_structured", True, True, '{"ok": true}'),
++        ],
++    )
++    @pytest.mark.parametrize(
++        ("wire_reason", "expected"),
++        [
++            (" stop ", "stop"),
++            ("length", "length"),
++            (_MISSING_FINISH_REASON, None),
++        ],
++    )
++    def test_results_expose_finish_reason(
++        self,
++        method: str,
++        is_async: bool,
++        structured: bool,
++        text: str,
++        wire_reason: Any,
++        expected: Any,
++    ):
++        def fake_caller(**_kwargs):
++            return "openai", "gpt-4o", _fake_response(
++                text, finish_reason=wire_reason
++            )
++
++        async def fake_async(**_kwargs):
++            return fake_caller(**_kwargs)
++
++        llm = make_plugin_llm_for_test(
++            plugin_id="my-plugin",
++            policy=_TrustPolicy(plugin_id="my-plugin"),
++            sync_caller=fake_caller,
++            async_caller=fake_async,
++        )
++        if structured:
++            call = getattr(llm, method)(
++                instructions="Return JSON",
++                input=[PluginLlmTextInput(text="hi")],
++                json_mode=True,
++            )
++        else:
++            call = getattr(llm, method)([{"role": "user", "content": "hi"}])
++
++        result = asyncio.run(call) if is_async else call
++        assert result.finish_reason == expected
++
+     def test_complete_structured_returns_parsed_json(self):
+         def fake_caller(**_kwargs):
+             return "openai", "gpt-4o", _fake_response(
+@@ -427,6 +489,19 @@ class TestAsyncSurface:
+         assert result.content_type == "json"
+ 
+ 
++@pytest.mark.parametrize(
++    ("response", "expected"),
++    [
++        ({"choices": [{"finish_reason": " stop "}]}, "stop"),
++        ({"choices": [{"finish_reason": ""}]}, None),
++        ({"choices": [{}]}, None),
++        ({"choices": [{"finish_reason": 42}]}, None),
++    ],
++)
++def test_extract_finish_reason_supports_dict_responses(response: Any, expected: Any):
++    assert _extract_finish_reason(response) == expected
++
++
+ # ---------------------------------------------------------------------------
+ # Config-driven trust gate (round-trip via plugins.entries.<id>.llm)
+ # ---------------------------------------------------------------------------

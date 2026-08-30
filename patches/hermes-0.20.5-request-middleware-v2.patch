@@ -1,0 +1,402 @@
+From b7fac683859f5997b4cc63a951078b99c209abbc Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 01:59:20 +0800
+Subject: [PATCH] fix(middleware): compose request callbacks sequentially
+
+---
+ hermes_cli/middleware.py  |  92 +++++++++++------
+ tests/test_middleware.py  | 212 ++++++++++++++++++++++++++++++++++++++
+ tests/test_model_tools.py |  17 ++-
+ 3 files changed, 279 insertions(+), 42 deletions(-)
+ create mode 100644 tests/test_middleware.py
+
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index e8c00e8..170e131 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List
+ logger = logging.getLogger(__name__)
+ 
+ OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
+-MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v1"
++MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v2"
+ 
+ TOOL_REQUEST_MIDDLEWARE = "tool_request"
+ TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
+@@ -95,19 +95,15 @@ def apply_llm_request_middleware(
+     current_request = _safe_copy(original_request)
+     trace: List[Dict[str, Any]] = []
+ 
+-    for result in _invoke_middleware(
++    current_request, trace = _apply_request_callbacks(
+         LLM_REQUEST_MIDDLEWARE,
+-        request=current_request,
+-        original_request=original_request,
+-        **context,
+-    ):
+-        if not isinstance(result, dict):
+-            continue
+-        next_request = result.get("request")
+-        if not isinstance(next_request, dict):
+-            continue
+-        current_request = _safe_copy(next_request)
+-        trace.append(_trace_entry(result))
++        payload_key="request",
++        original_key="original_request",
++        current_payload=current_request,
++        original_payload=original_request,
++        context=context,
++        trace=trace,
++    )
+ 
+     return RequestMiddlewareResult(
+         payload=current_request,
+@@ -153,20 +149,15 @@ def apply_tool_request_middleware(
+             trace=trace,
+         )
+ 
+-    for result in _invoke_middleware(
++    current_args, trace = _apply_request_callbacks(
+         TOOL_REQUEST_MIDDLEWARE,
+-        tool_name=tool_name,
+-        args=current_args,
+-        original_args=original_args,
+-        **context,
+-    ):
+-        if not isinstance(result, dict):
+-            continue
+-        next_args = result.get("args")
+-        if not isinstance(next_args, dict):
+-            continue
+-        current_args = _safe_copy(next_args)
+-        trace.append(_trace_entry(result))
++        payload_key="args",
++        original_key="original_args",
++        current_payload=current_args,
++        original_payload=original_args,
++        context={"tool_name": tool_name, **context},
++        trace=trace,
++    )
+ 
+     return RequestMiddlewareResult(
+         payload=current_args,
+@@ -233,12 +224,6 @@ def run_api_execution_middleware(
+     return run_llm_execution_middleware(request, next_call, **context)
+ 
+ 
+-def _invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
+-    from hermes_cli.plugins import invoke_middleware
+-
+-    return invoke_middleware(kind, **middleware_payload(**kwargs))
+-
+-
+ def _has_middleware(kind: str) -> bool:
+     from hermes_cli.plugins import has_middleware
+ 
+@@ -251,6 +236,49 @@ def _get_middleware_callbacks(kind: str) -> List[Callable]:
+     return list(get_plugin_manager()._middleware.get(kind, []))
+ 
+ 
++def _apply_request_callbacks(
++    kind: str,
++    *,
++    payload_key: str,
++    original_key: str,
++    current_payload: Dict[str, Any],
++    original_payload: Dict[str, Any],
++    context: Dict[str, Any],
++    trace: List[Dict[str, Any]],
++) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
++    """Apply request middleware in registration order.
++
++    Each callback receives the last accepted payload and an isolated copy of
++    the pre-middleware baseline.  A callback may mutate its working payload in
++    place and return it, but exceptions and invalid returns cannot corrupt the
++    last accepted payload or the baseline seen by later callbacks.
++    """
++    current = current_payload
++    for callback in _get_middleware_callbacks(kind):
++        working = _safe_copy(current)
++        call_kwargs = middleware_payload(**context)
++        call_kwargs[payload_key] = working
++        call_kwargs[original_key] = _safe_copy(original_payload)
++        try:
++            result = callback(**call_kwargs)
++        except Exception as exc:
++            logger.warning(
++                "Middleware '%s' callback %s raised: %s",
++                kind,
++                getattr(callback, "__name__", repr(callback)),
++                exc,
++            )
++            continue
++        if not isinstance(result, dict):
++            continue
++        next_payload = result.get(payload_key)
++        if not isinstance(next_payload, dict):
++            continue
++        current = _safe_copy(next_payload)
++        trace.append(_trace_entry(result))
++    return current, trace
++
++
+ def _run_execution_chain(
+     kind: str,
+     callbacks: List[Callable],
+diff --git a/tests/test_middleware.py b/tests/test_middleware.py
+new file mode 100644
+index 0000000..63f275f
+--- /dev/null
++++ b/tests/test_middleware.py
+@@ -0,0 +1,212 @@
++from __future__ import annotations
++
++import copy
++
++from hermes_cli import middleware
++
++
++def _install_request_callbacks(monkeypatch, callbacks_by_kind):
++    monkeypatch.setattr(middleware, "_has_middleware", lambda kind: True)
++    monkeypatch.setattr(
++        middleware,
++        "_get_middleware_callbacks",
++        lambda kind: list(callbacks_by_kind.get(kind, [])),
++    )
++
++
++def test_llm_request_middleware_composes_replacements_sequentially(monkeypatch):
++    baseline = {
++        "messages": [{"role": "user", "content": "hello"}],
++        "metadata": {"steps": []},
++    }
++    calls = []
++    schemas = []
++
++    def first(
++        *, request, original_request, middleware_schema_version, **_kwargs
++    ):
++        calls.append("first")
++        schemas.append(middleware_schema_version)
++        assert request == baseline
++        assert original_request == baseline
++        return {
++            "request": {**request, "metadata": {"steps": ["first"]}},
++            "source": "first",
++        }
++
++    def second(
++        *, request, original_request, middleware_schema_version, **_kwargs
++    ):
++        calls.append("second")
++        schemas.append(middleware_schema_version)
++        assert request["metadata"]["steps"] == ["first"]
++        assert original_request == baseline
++        return {
++            "request": {
++                **request,
++                "metadata": {"steps": [*request["metadata"]["steps"], "second"]},
++            },
++            "source": "second",
++        }
++
++    _install_request_callbacks(
++        monkeypatch,
++        {middleware.LLM_REQUEST_MIDDLEWARE: [first, second]},
++    )
++    result = middleware.apply_llm_request_middleware(baseline)
++
++    assert calls == ["first", "second"]
++    assert schemas == ["hermes.middleware.v2", "hermes.middleware.v2"]
++    assert result.payload["metadata"]["steps"] == ["first", "second"]
++    assert result.original_payload == baseline
++    assert baseline["metadata"]["steps"] == []
++    assert result.trace == [{"source": "first"}, {"source": "second"}]
++
++
++def test_exception_none_and_invalid_return_discard_working_mutations(monkeypatch):
++    baseline = {"messages": [], "metadata": {"steps": []}}
++    seen = []
++
++    def accepted(*, request, **_kwargs):
++        request["metadata"]["steps"].append("accepted")
++        return {"request": request, "source": "accepted"}
++
++    def raises(*, request, original_request, **_kwargs):
++        request["metadata"]["steps"].append("raised")
++        original_request["metadata"]["steps"].append("corrupt")
++        raise RuntimeError("boom")
++
++    def returns_none(*, request, **_kwargs):
++        # Bare mutation is not a commit: request middleware must return the
++        # documented {"request": dict} shape to publish its working copy.
++        request["metadata"]["steps"].append("none")
++        return None
++
++    def returns_invalid(*, request, **_kwargs):
++        request["metadata"]["steps"].append("invalid")
++        return {"request": "not-a-dict"}
++
++    def observes(*, request, original_request, **_kwargs):
++        seen.append((copy.deepcopy(request), copy.deepcopy(original_request)))
++        return {"request": request, "source": "observes"}
++
++    _install_request_callbacks(
++        monkeypatch,
++        {
++            middleware.LLM_REQUEST_MIDDLEWARE: [
++                accepted,
++                raises,
++                returns_none,
++                returns_invalid,
++                observes,
++            ]
++        },
++    )
++    result = middleware.apply_llm_request_middleware(baseline)
++
++    assert seen == [
++        (
++            {"messages": [], "metadata": {"steps": ["accepted"]}},
++            baseline,
++        )
++    ]
++    assert result.payload["metadata"]["steps"] == ["accepted"]
++    assert result.original_payload == baseline
++    assert baseline["metadata"]["steps"] == []
++    assert result.trace == [{"source": "accepted"}, {"source": "observes"}]
++
++
++def test_tool_request_middleware_composes_and_preserves_original_args(monkeypatch):
++    baseline = {"query": "hello", "options": {"steps": []}}
++    calls = []
++
++    def first(*, tool_name, args, original_args, **_kwargs):
++        calls.append(("first", tool_name, copy.deepcopy(original_args)))
++        args["options"]["steps"].append("first")
++        return {"args": args, "source": "first"}
++
++    def second(*, tool_name, args, original_args, **_kwargs):
++        calls.append(("second", tool_name, copy.deepcopy(original_args)))
++        assert args["options"]["steps"] == ["first"]
++        return {
++            "args": {
++                **args,
++                "options": {"steps": [*args["options"]["steps"], "second"]},
++            },
++            "source": "second",
++        }
++
++    _install_request_callbacks(
++        monkeypatch,
++        {middleware.TOOL_REQUEST_MIDDLEWARE: [first, second]},
++    )
++    result = middleware.apply_tool_request_middleware(
++        "web_search", baseline, skip_relay=True
++    )
++
++    assert [row[:2] for row in calls] == [
++        ("first", "web_search"),
++        ("second", "web_search"),
++    ]
++    assert all(row[2] == baseline for row in calls)
++    assert result.payload["options"]["steps"] == ["first", "second"]
++    assert result.original_payload == baseline
++    assert baseline["options"]["steps"] == []
++
++
++def test_each_retry_starts_from_a_clean_request(monkeypatch):
++    baseline = {"messages": [], "metadata": {"steps": []}}
++    call_count = 0
++
++    def callback(*, request, **_kwargs):
++        nonlocal call_count
++        call_count += 1
++        request["metadata"]["steps"].append("once")
++        return {"request": request}
++
++    _install_request_callbacks(
++        monkeypatch,
++        {middleware.LLM_REQUEST_MIDDLEWARE: [callback]},
++    )
++    first = middleware.apply_llm_request_middleware(baseline)
++    retry = middleware.apply_llm_request_middleware(baseline)
++
++    assert first.payload == retry.payload == {
++        "messages": [],
++        "metadata": {"steps": ["once"]},
++    }
++    assert baseline["metadata"]["steps"] == []
++    assert call_count == 2
++
++
++def test_execution_chain_still_calls_each_wrapper_and_provider_once(monkeypatch):
++    calls = []
++
++    def first(*, request, next_call, **_kwargs):
++        calls.append("first")
++        return next_call({**request, "first": True})
++
++    def second(*, request, next_call, **_kwargs):
++        calls.append("second")
++        result = next_call({**request, "second": True})
++        try:
++            next_call(request)
++        except RuntimeError:
++            calls.append("second-call-blocked")
++        return result
++
++    def provider(request):
++        calls.append("provider")
++        return request
++
++    monkeypatch.setattr(
++        middleware,
++        "_get_middleware_callbacks",
++        lambda kind: [first, second]
++        if kind == middleware.LLM_EXECUTION_MIDDLEWARE
++        else [],
++    )
++    result = middleware.run_llm_execution_middleware({}, provider)
++
++    assert result == {"first": True, "second": True}
++    assert calls == ["first", "second", "provider", "second-call-blocked"]
+diff --git a/tests/test_model_tools.py b/tests/test_model_tools.py
+index a967f61..7ffcb36 100644
+--- a/tests/test_model_tools.py
++++ b/tests/test_model_tools.py
+@@ -100,14 +100,12 @@ class TestHandleFunctionCall:
+     def test_tool_request_and_execution_middleware_wrap_registry_dispatch(self, monkeypatch):
+         seen = {}
+ 
+-        def fake_invoke_middleware(kind, **kwargs):
+-            if kind == "tool_request":
+-                return [{
+-                    "args": {**kwargs["args"], "rewritten": True},
+-                    "source": "test-middleware",
+-                    "reason": "rewrite",
+-                }]
+-            return []
++        def request_middleware(**kwargs):
++            return {
++                "args": {**kwargs["args"], "rewritten": True},
++                "source": "test-middleware",
++                "reason": "rewrite",
++            }
+ 
+         def execution_middleware(**kwargs):
+             seen["execution_args"] = kwargs["args"]
+@@ -120,9 +118,8 @@ class TestHandleFunctionCall:
+         manager = type(
+             "Manager",
+             (),
+-            {"_middleware": {"tool_request": [fake_invoke_middleware], "tool_execution": [execution_middleware]}},
++            {"_middleware": {"tool_request": [request_middleware], "tool_execution": [execution_middleware]}},
+         )()
+-        monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", fake_invoke_middleware)
+         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+         hook_calls = []
+         monkeypatch.setattr(
+-- 
+2.50.1 (Apple Git-155)
+

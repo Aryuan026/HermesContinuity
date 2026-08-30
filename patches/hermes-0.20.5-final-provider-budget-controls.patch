@@ -1,0 +1,2110 @@
+From 7a5c6ca23b544d73fb37a3a1c7d8b08d1a82938c Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 11:23:17 +0800
+Subject: [PATCH] feat(middleware): expose final provider budget controls
+
+---
+ agent/agent_init.py                 |  21 ++
+ agent/agent_runtime_helpers.py      |   4 +
+ agent/chat_completion_helpers.py    |   5 +
+ agent/context_compressor.py         |  18 ++
+ agent/conversation_loop.py          |  34 +++
+ agent/model_metadata.py             | 293 +++++++++++++++++--
+ agent/relay_llm.py                  |  22 +-
+ hermes_cli/middleware.py            | 279 +++++++++++++++++-
+ hermes_cli/plugins.py               |  24 +-
+ tests/agent/test_model_metadata.py  |  64 +++++
+ tests/agent/test_relay_llm.py       |  14 +
+ tests/agent/test_transport_truth.py | 165 ++++++++++-
+ tests/test_middleware.py            | 432 +++++++++++++++++++++++++++-
+ 13 files changed, 1328 insertions(+), 47 deletions(-)
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index db92f18..22a6952 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -2359,6 +2359,9 @@ def init_agent(
+         _config_context_length = _model_cfg.get("context_length")
+     else:
+         _config_context_length = None
++    _context_window_config_source = (
++        "config" if _config_context_length is not None else None
++    )
+     if _config_context_length is not None:
+         try:
+             _config_context_length = int(_config_context_length)
+@@ -2376,6 +2379,7 @@ def init_agent(
+                 file=sys.stderr,
+             )
+             _config_context_length = None
++            _context_window_config_source = None
+ 
+     # Resolve custom_providers once before route-scoping a global context pin:
+     # a named custom provider may keep its base URL only in this list rather
+@@ -2548,6 +2552,7 @@ def init_agent(
+                 _configured_base_url or _model_cfg.get("provider"),
+             )
+             _config_context_length = None
++            _context_window_config_source = None
+ 
+     # Store for reuse by _check_compression_model_feasibility (auxiliary
+     # compression model context-length detection needs the same list).
+@@ -2565,6 +2570,7 @@ def init_agent(
+             )
+             if _cp_ctx_resolved:
+                 _config_context_length = int(_cp_ctx_resolved)
++                _context_window_config_source = "custom_provider"
+         except Exception:
+             _cp_ctx_resolved = None
+ 
+@@ -2619,6 +2625,18 @@ def init_agent(
+         _config_context_length,
+         _lmstudio_runtime_context_length,
+     )
++    if isinstance(_effective_context_length, int) and _effective_context_length > 0:
++        agent._context_window_resolution = {
++            "tokens": _effective_context_length,
++            "source": (
++                "lmstudio_runtime"
++                if _lmstudio_runtime_context_length == _effective_context_length
++                else _context_window_config_source or "config"
++            ),
++            "confidence": "authoritative",
++        }
++    else:
++        agent._context_window_resolution = None
+ 
+ 
+ 
+@@ -2691,6 +2709,7 @@ def init_agent(
+         agent._compression_threshold_autoraised = None
+         # Resolve context_length for plugin engines — mirrors switch_model() path
+         from agent.model_metadata import get_model_context_length
++        _plugin_ctx_resolution = {}
+         _plugin_ctx_len = get_model_context_length(
+             agent.model,
+             base_url=agent.base_url,
+@@ -2698,7 +2717,9 @@ def init_agent(
+             config_context_length=_effective_context_length,
+             provider=agent.provider,
+             custom_providers=_custom_providers,
++            _resolution=_plugin_ctx_resolution,
+         )
++        agent._context_window_resolution = _plugin_ctx_resolution or None
+         # Per-model threshold overrides are part of the explicit
+         # context-engine contract: assign them BEFORE the initial
+         # update_model() call so the first resolution (which derives
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 1c89288..b5b5cc5 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -2668,6 +2668,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
+             "_anthropic_base_url",
+             "_is_anthropic_oauth",
+             "_config_context_length",
++            "_context_window_resolution",
+             "_reasoning_echo_flag",
+         )
+     }
+@@ -2931,6 +2932,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
+         # length normally resolves via config or static catalogs and
+         # never hits a probe, but coerce to empty string defensively.
+         _ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
++        _context_window_resolution = {}
+         new_context_length = get_model_context_length(
+             agent.model,
+             base_url=agent.base_url,
+@@ -2938,7 +2940,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
+             provider=agent.provider,
+             config_context_length=_effective_context_length,
+             custom_providers=_sm_custom_providers,
++            _resolution=_context_window_resolution,
+         )
++        agent._context_window_resolution = _context_window_resolution or None
+         agent.context_compressor.update_model(
+             model=agent.model,
+             context_length=new_context_length,
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index b034c1d..9c1329f 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -2781,11 +2781,16 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
+             # probes. Foundry typically resolves via config/static
+             # catalogs anyway, so coerce defensively.
+             _fb_ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
++            _fb_context_window_resolution = {}
+             fb_context_length = get_model_context_length(
+                 agent.model, base_url=agent.base_url,
+                 api_key=_fb_ctx_api_key, provider=agent.provider,
+                 config_context_length=getattr(agent, "_config_context_length", None),
+                 custom_providers=getattr(agent, "_custom_providers", None),
++                _resolution=_fb_context_window_resolution,
++            )
++            agent._context_window_resolution = (
++                _fb_context_window_resolution or None
+             )
+             agent.context_compressor.update_model(
+                 model=agent.model,
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 4c48794..b408b94 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -2165,13 +2165,20 @@ class ContextCompressor(ContextEngine):
+     def _resolve_context_length(self) -> int:
+         """Resolve and cache the model's context length on first access."""
+         if self._resolved_context_length is None:
++            resolution: Dict[str, Any] = {}
+             self._resolved_context_length = get_model_context_length(
+                 self.model,
+                 base_url=self.base_url,
+                 api_key=self.api_key,
+                 config_context_length=self._config_context_length,
+                 provider=self.provider,
++                _resolution=resolution,
+             )
++            self._context_window_resolution = resolution or {
++                "tokens": self._resolved_context_length,
++                "source": "unknown",
++                "confidence": "unknown",
++            }
+             # Small-context threshold floor: models under 512K trigger at
+             # >=75% so compaction doesn't fire with half the window still
+             # free. Raise-only; must run AFTER context_length is resolved
+@@ -2198,8 +2205,18 @@ class ContextCompressor(ContextEngine):
+         # (see conversation_compression's aux-context threshold sync), which
+         # persisted on main's eager-init behavior.
+         if value == getattr(self, "_resolved_context_length", None):
++            self._context_window_resolution = {
++                "tokens": value,
++                "source": "runtime",
++                "confidence": "authoritative",
++            }
+             return
+         self._resolved_context_length = value
++        self._context_window_resolution = {
++            "tokens": value,
++            "source": "runtime",
++            "confidence": "authoritative",
++        }
+         # Re-apply the small-context floor (raise-only) for the genuinely new
+         # window so the invalidated budgets below recompute coherently —
+         # percent and tokens must derive from the same window. Skipped on
+@@ -3109,6 +3126,7 @@ class ContextCompressor(ContextEngine):
+         self._config_context_length = config_context_length
+         self._configured_threshold_percent = self.threshold_percent
+         self._resolved_context_length: int | None = None
++        self._context_window_resolution: Dict[str, Any] | None = None
+         self._threshold_tokens: int | None = None
+         self._tail_token_budget: int | None = None
+         self._max_summary_tokens: int | None = None
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 1a6cbfe..eae220c 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -118,6 +118,37 @@ RUN_BUDGET_WRAPUP_NOTICE = (
+ )
+ 
+ 
++def _middleware_context_window(agent: Any) -> Dict[str, Any]:
++    """Return the current host-resolved context window without guessing."""
++    engine = getattr(agent, "context_compressor", None)
++    try:
++        tokens = getattr(engine, "context_length", None)
++        if not isinstance(tokens, int) or tokens <= 0:
++            raise ValueError("invalid context window")
++    except Exception:
++        return {
++            "context_window_tokens": None,
++            "context_window_source": "unknown",
++            "context_window_confidence": "unknown",
++        }
++
++    resolution = getattr(agent, "_context_window_resolution", None)
++    if not isinstance(resolution, dict) or resolution.get("tokens") != tokens:
++        resolution = getattr(engine, "_context_window_resolution", None)
++    if not isinstance(resolution, dict) or resolution.get("tokens") != tokens:
++        resolution = {
++            "source": "unknown",
++            "confidence": "unknown",
++        }
++    return {
++        "context_window_tokens": tokens,
++        "context_window_source": str(resolution.get("source") or "unknown"),
++        "context_window_confidence": str(
++            resolution.get("confidence") or "unknown"
++        ),
++    }
++
++
+ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:
+     """Inject the one-time wall-clock wrap-up notice when past 80% of budget.
+ 
+@@ -2916,6 +2947,7 @@ def run_conversation(
+                     _xh["x-initiator"] = "user"
+                     api_kwargs["extra_headers"] = _xh
+                     agent._is_user_initiated_turn = False
++                _context_window_middleware = _middleware_context_window(agent)
+                 try:
+                     from hermes_cli.middleware import apply_llm_request_middleware
+ 
+@@ -2931,6 +2963,7 @@ def run_conversation(
+                         base_url=agent.base_url,
+                         api_mode=agent.api_mode,
+                         api_call_count=api_call_count,
++                        **_context_window_middleware,
+                     )
+                     api_kwargs = _llm_request_mw.payload
+                     _original_api_kwargs = _llm_request_mw.original_payload
+@@ -3167,6 +3200,7 @@ def run_conversation(
+                         middleware_trace=list(_llm_middleware_trace),
+                         transport_record=_transport_record,
+                         transport_schema_version=TRANSPORT_SCHEMA_VERSION,
++                        **_context_window_middleware,
+                     )
+                     _transport_record.settle()
+                 finally:
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 8a8a4be..a1f772a 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -2706,6 +2706,45 @@ def _resolve_nous_context_length(
+     return None, ""
+ 
+ 
++def _resolved_context_length(
++    value: int,
++    resolution: dict[str, Any] | None,
++    *,
++    source: str,
++    confidence: str,
++) -> int:
++    if resolution is not None:
++        resolution.clear()
++        resolution.update(
++            tokens=int(value),
++            source=source,
++            confidence=confidence,
++        )
++    return int(value)
++
++
++def get_model_context_window(
++    model: str,
++    base_url: str = "",
++    api_key: str = "",
++    config_context_length: int | None = None,
++    provider: str = "",
++    custom_providers: list | None = None,
++) -> dict[str, Any]:
++    """Return the resolved window together with conservative provenance."""
++    resolution: dict[str, Any] = {}
++    get_model_context_length(
++        model,
++        base_url=base_url,
++        api_key=api_key,
++        config_context_length=config_context_length,
++        provider=provider,
++        custom_providers=custom_providers,
++        _resolution=resolution,
++    )
++    return resolution
++
++
+ def get_model_context_length(
+     model: str,
+     base_url: str = "",
+@@ -2713,6 +2752,7 @@ def get_model_context_length(
+     config_context_length: int | None = None,
+     provider: str = "",
+     custom_providers: list | None = None,
++    _resolution: dict[str, Any] | None = None,
+ ) -> int:
+     """Get the context length for a model.
+ 
+@@ -2742,7 +2782,12 @@ def get_model_context_length(
+     9. Default fallback (256K)"""
+     # 0. Explicit config override — user knows best
+     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
+-        return config_context_length
++        return _resolved_context_length(
++            config_context_length,
++            _resolution,
++            source="config",
++            confidence="authoritative",
++        )
+ 
+     # 0a. MoA virtual provider — ``model`` is a preset name, not a real model,
+     # and ``base_url`` is the local virtual endpoint, so every probe below would
+@@ -2769,12 +2814,20 @@ def get_model_context_length(
+             agg_model = str(agg.get("model") or "").strip()
+             if agg_model and agg_provider and agg_provider.lower() != "moa":
+                 rt = resolve_runtime_provider(requested=agg_provider, target_model=agg_model)
+-                return get_model_context_length(
++                nested_resolution: dict[str, Any] = {}
++                result = get_model_context_length(
+                     agg_model,
+                     base_url=rt.get("base_url", "") or "",
+                     api_key=rt.get("api_key", "") or "",
+                     provider=rt.get("provider") or agg_provider,
+                     custom_providers=effective_custom_providers,
++                    _resolution=nested_resolution,
++                )
++                return _resolved_context_length(
++                    result,
++                    _resolution,
++                    source=f"moa_aggregator:{nested_resolution.get('source', 'unknown')}",
++                    confidence=str(nested_resolution.get("confidence") or "unknown"),
+                 )
+         except Exception:
+             logger.debug("MoA aggregator context-length resolution failed", exc_info=True)
+@@ -2792,7 +2845,12 @@ def get_model_context_length(
+             from agent.models_dev import _override_context_window
+             mo_ctx = _override_context_window(provider, model)
+             if mo_ctx is not None and mo_ctx > 0:
+-                return mo_ctx
++                return _resolved_context_length(
++                    mo_ctx,
++                    _resolution,
++                    source="model_override",
++                    confidence="authoritative",
++                )
+         except Exception:
+             pass  # fall through to other resolution paths
+ 
+@@ -2809,7 +2867,12 @@ def get_model_context_length(
+                 custom_providers=custom_providers,
+             )
+             if cp_ctx:
+-                return cp_ctx
++                return _resolved_context_length(
++                    cp_ctx,
++                    _resolution,
++                    source="custom_provider",
++                    confidence="authoritative",
++                )
+         except Exception:
+             pass  # fall through to probing
+ 
+@@ -2835,7 +2898,12 @@ def get_model_context_length(
+             "No model id provided for context length resolution — defaulting to %s tokens.",
+             f"{DEFAULT_FALLBACK_CONTEXT:,}",
+         )
+-        return DEFAULT_FALLBACK_CONTEXT
++        return _resolved_context_length(
++            DEFAULT_FALLBACK_CONTEXT,
++            _resolution,
++            source="fallback",
++            confidence="fallback",
++        )
+ 
+     # Normalise provider-prefixed model names (e.g. "local:model-name" →
+     # "model-name") so cache lookups and server queries use the bare ID that
+@@ -2847,7 +2915,12 @@ def get_model_context_length(
+     # cannot override the endpoint where the model was actually validated.
+     endpoint_context = _endpoint_scoped_context_length(model, base_url)
+     if endpoint_context is not None:
+-        return endpoint_context
++        return _resolved_context_length(
++            endpoint_context,
++            _resolution,
++            source="endpoint_metadata",
++            confidence="authoritative",
++        )
+ 
+     is_bedrock_context = provider == "bedrock" or (
+         base_url
+@@ -2930,16 +3003,37 @@ def get_model_context_length(
+                             f"{bedrock_ctx:,}",
+                         )
+                         _invalidate_cached_context_length(model, base_url)
+-                        return bedrock_ctx
++                        return _resolved_context_length(
++                            bedrock_ctx,
++                            _resolution,
++                            source="bedrock_catalog",
++                            confidence="catalog",
++                        )
+                 except ImportError:
+                     pass
+-                return cached
++                return _resolved_context_length(
++                    cached,
++                    _resolution,
++                    source="cache",
++                    confidence="cached",
++                )
+             else:
+                 if is_local_endpoint(base_url):
+-                    return _reconcile_local_cached_context_length(
++                    reconciled = _reconcile_local_cached_context_length(
+                         model, base_url, cached, api_key=api_key,
+                     )
+-                return cached
++                    return _resolved_context_length(
++                        reconciled,
++                        _resolution,
++                        source="local_cache_reconciled",
++                        confidence="cached",
++                    )
++                return _resolved_context_length(
++                    cached,
++                    _resolution,
++                    source="cache",
++                    confidence="cached",
++                )
+ 
+     # 1b. AWS Bedrock — use static context length table.
+     # Bedrock's ListFoundationModels API doesn't expose context window sizes,
+@@ -2968,7 +3062,12 @@ def get_model_context_length(
+             cache_key_url = base_url or "bedrock://"
+             cached = get_cached_context_length(model, cache_key_url)
+             if cached is not None:
+-                return cached
++                return _resolved_context_length(
++                    cached,
++                    _resolution,
++                    source="bedrock_cache",
++                    confidence="cached",
++                )
+             # Resolve region from the base_url host first, then the standard
+             # AWS region chain.  An empty region disables probing (table only).
+             region = ""
+@@ -2987,14 +3086,24 @@ def get_model_context_length(
+                 # table fallback shouldn't poison the cache against a later
+                 # successful probe.
+                 save_context_length(model, cache_key_url, ctx)
+-            return ctx
++            return _resolved_context_length(
++                ctx,
++                _resolution,
++                source="bedrock",
++                confidence="catalog",
++            )
+ 
+     if provider == "novita" or (base_url and base_url_host_matches(base_url, "api.novita.ai")):
+         ctx = _resolve_endpoint_context_length(model, base_url or "https://api.novita.ai/openai/v1", api_key=api_key)
+         if ctx is not None:
+             if base_url:
+                 save_context_length(model, base_url, ctx)
+-            return ctx
++            return _resolved_context_length(
++                ctx,
++                _resolution,
++                source="novita_endpoint",
++                confidence="authoritative",
++            )
+ 
+     # 2. Active endpoint metadata for truly custom/unknown endpoints.
+     # Known providers (Copilot, OpenAI, Anthropic, etc.) skip this — their
+@@ -3004,7 +3113,12 @@ def get_model_context_length(
+     if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
+         context_length = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+         if context_length is not None:
+-            return context_length
++            return _resolved_context_length(
++                context_length,
++                _resolution,
++                source="custom_endpoint",
++                confidence="authoritative",
++            )
+         if not _is_known_provider_base_url(base_url):
+             # For local endpoints, run the probe that respects configured
+             # Modelfile context values first.  _query_local_context_length
+@@ -3017,7 +3131,12 @@ def get_model_context_length(
+                 if local_ctx and local_ctx > 0:
+                     if not _skip_persistent_context_cache(base_url, provider):
+                         _maybe_cache_local_context_length(model, base_url, local_ctx)
+-                    return local_ctx
++                    return _resolved_context_length(
++                        local_ctx,
++                        _resolution,
++                        source="local_endpoint",
++                        confidence="authoritative",
++                    )
+             # 2b. Ollama native /api/show — non-local endpoints preserve
+             # the existing generic /api/show GGUF-first behavior.
+             # Non-Ollama servers return 404/405 quickly.
+@@ -3025,7 +3144,12 @@ def get_model_context_length(
+             if ctx is not None:
+                 if not _skip_persistent_context_cache(base_url, provider):
+                     save_context_length(model, base_url, ctx)
+-                return ctx
++                return _resolved_context_length(
++                    ctx,
++                    _resolution,
++                    source="ollama",
++                    confidence="authoritative",
++                )
+             # 3. Probe-down fallback after endpoint-specific detection failed
+             logger.info(
+                 "Could not detect context length for model %r at %s — "
+@@ -3052,11 +3176,21 @@ def get_model_context_length(
+                         "(custom endpoint, catalog match on %r)",
+                         f"{length:,}", model, default_model,
+                     )
+-                    return length
++                    return _resolved_context_length(
++                        length,
++                        _resolution,
++                        source="catalog",
++                        confidence="catalog",
++                    )
+             # Same silent-256K bug class as the step-9 fallback below —
+             # warn here too so custom/local endpoints aren't left invisible.
+             _warn_context_length_fallback(model, base_url)
+-            return DEFAULT_FALLBACK_CONTEXT
++            return _resolved_context_length(
++                DEFAULT_FALLBACK_CONTEXT,
++                _resolution,
++                source="fallback",
++                confidence="fallback",
++            )
+ 
+     # 4. Anthropic /v1/models API (only for regular API keys, not OAuth)
+     if provider == "anthropic" or (
+@@ -3064,7 +3198,12 @@ def get_model_context_length(
+     ):
+         ctx = _query_anthropic_context_length(model, base_url or "https://api.anthropic.com", api_key)
+         if ctx:
+-            return ctx
++            return _resolved_context_length(
++                ctx,
++                _resolution,
++                source="anthropic_endpoint",
++                confidence="authoritative",
++            )
+ 
+     # 4b. (Bedrock handled earlier at step 1b — before custom-endpoint probe.)
+ 
+@@ -3089,7 +3228,12 @@ def get_model_context_length(
+             from hermes_cli.models import get_copilot_model_context
+             ctx = get_copilot_model_context(model, api_key=api_key)
+             if ctx:
+-                return ctx
++                return _resolved_context_length(
++                    ctx,
++                    _resolution,
++                    source="copilot_endpoint",
++                    confidence="authoritative",
++                )
+         except Exception:
+             pass  # Fall through to models.dev
+ 
+@@ -3106,7 +3250,12 @@ def get_model_context_length(
+             # want it leaking into the persistent cache for Nous URLs.
+             if base_url and source == "portal":
+                 save_context_length(model, base_url, ctx)
+-            return ctx
++            return _resolved_context_length(
++                ctx,
++                _resolution,
++                source=f"nous_{source or 'unknown'}",
++                confidence="authoritative" if source == "portal" else "catalog",
++            )
+     if effective_provider == "openai-codex":
+         # Codex OAuth enforces lower context limits than the direct OpenAI
+         # API for the same slug (e.g. gpt-5.5 is 1.05M on the API but 272K
+@@ -3120,13 +3269,23 @@ def get_model_context_length(
+             # transient OAuth/network failure cannot poison future probes.
+             if base_url and codex_source == "live":
+                 save_context_length(model, base_url, codex_ctx)
+-            return codex_ctx
++            return _resolved_context_length(
++                codex_ctx,
++                _resolution,
++                source=f"codex_{codex_source or 'unknown'}",
++                confidence="authoritative" if codex_source == "live" else "catalog",
++            )
+     if effective_provider == "gmi" and base_url:
+         # GMI exposes authoritative context_length via /models, but it is not
+         # in models.dev yet. Preserve that higher-fidelity endpoint lookup.
+         ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+         if ctx is not None:
+-            return ctx
++            return _resolved_context_length(
++                ctx,
++                _resolution,
++                source="gmi_endpoint",
++                confidence="authoritative",
++            )
+     # 5e. Ollama native /api/show probe — runs for providers whose base_url
+     # is NOT a known non-Ollama provider.  Ollama-compatible servers expose
+     # this endpoint regardless of hostname (local Ollama, Ollama Cloud,
+@@ -3149,7 +3308,12 @@ def get_model_context_length(
+             if ctx is not None:
+                 if not _skip_persistent_context_cache(base_url, provider):
+                     save_context_length(model, base_url, ctx)
+-                return ctx
++                return _resolved_context_length(
++                    ctx,
++                    _resolution,
++                    source="ollama",
++                    confidence="authoritative",
++                )
+     # 5f. OpenRouter live /models metadata — authoritative for OpenRouter-routed
+     # models. OpenRouter's catalog carries per-model context_length (e.g.
+     # anthropic/claude-fable-5 -> 1M) and refreshes as new slugs ship, so it
+@@ -3170,7 +3334,12 @@ def get_model_context_length(
+             if isinstance(or_ctx, int) and or_ctx > 0 and not (
+                 or_ctx == 32768 and _model_name_suggests_kimi(model)
+             ):
+-                return or_ctx
++                return _resolved_context_length(
++                    or_ctx,
++                    _resolution,
++                    source="openrouter",
++                    confidence="catalog",
++                )
+ 
+     if effective_provider:
+         from agent.models_dev import lookup_models_dev_context
+@@ -3187,7 +3356,12 @@ def get_model_context_length(
+                         ctx, model, f"{catalog:,}",
+                     )
+                     ctx = catalog
+-            return ctx
++            return _resolved_context_length(
++                ctx,
++                _resolution,
++                source="models_dev",
++                confidence="catalog",
++            )
+ 
+     # 6. OpenRouter live API metadata — provider-unaware fallback.
+     # Only consulted when the provider is unknown (no effective_provider),
+@@ -3206,7 +3380,12 @@ def get_model_context_length(
+                     or_ctx, model,
+                 )
+             else:
+-                return or_ctx
++                return _resolved_context_length(
++                    or_ctx,
++                    _resolution,
++                    source="openrouter",
++                    confidence="catalog",
++                )
+ 
+     # 7. Query local server before hardcoded defaults — model names like
+     # ``Hermes-3-Llama-3.1-70B`` substring-match ``llama`` (131072) even when
+@@ -3216,7 +3395,12 @@ def get_model_context_length(
+         if local_ctx and local_ctx > 0:
+             if not _skip_persistent_context_cache(base_url, provider):
+                 _maybe_cache_local_context_length(model, base_url, local_ctx)
+-            return local_ctx
++            return _resolved_context_length(
++                local_ctx,
++                _resolution,
++                source="local_endpoint",
++                confidence="authoritative",
++            )
+ 
+     # 8. Hardcoded defaults (fuzzy match — longest key first for specificity)
+     # Only check `default_model in model` (is the key a substring of the input).
+@@ -3227,13 +3411,23 @@ def get_model_context_length(
+         DEFAULT_CONTEXT_LENGTHS.items(), key=lambda x: len(x[0]), reverse=True
+     ):
+         if default_model in model_lower:
+-            return length
++            return _resolved_context_length(
++                length,
++                _resolution,
++                source="catalog",
++                confidence="catalog",
++            )
+ 
+     # 9. Default fallback — warn (deduped per model+endpoint) so
+     #    small-context models don't silently get 256K. See
+     #    _warn_context_length_fallback for rationale.
+     _warn_context_length_fallback(model, base_url)
+-    return DEFAULT_FALLBACK_CONTEXT
++    return _resolved_context_length(
++        DEFAULT_FALLBACK_CONTEXT,
++        _resolution,
++        source="fallback",
++        confidence="fallback",
++    )
+ 
+ 
+ async def get_model_context_length_async(
+@@ -3547,6 +3741,45 @@ def estimate_request_tokens_rough(
+     return total
+ 
+ 
++def estimate_provider_body_tokens_rough(body: Any) -> dict[str, Any]:
++    """Estimate the major input-token buckets in a final provider body.
++
++    This is deliberately labelled heuristic rather than an exact tokenizer
++    result.  It reuses Hermes' message/tool/image estimators and adds a small
++    fixed reserve plus a 15% safety margin for provider framing overhead.
++    """
++    if not isinstance(body, dict):
++        return {
++            "estimated_tokens": None,
++            "estimate_source": "unknown",
++            "estimate_confidence": "unknown",
++        }
++
++    total = 0
++    for key in ("messages", "input"):
++        value = body.get(key)
++        if isinstance(value, list):
++            total += estimate_messages_tokens_rough(value)
++        elif value:
++            total += estimate_tokens_rough(str(value))
++    for key in ("system", "instructions"):
++        value = body.get(key)
++        if value:
++            total += estimate_tokens_rough(str(value))
++    tools = body.get("tools")
++    if isinstance(tools, list):
++        total += _estimate_tools_tokens_rough(tools)
++    elif tools:
++        total += estimate_tokens_rough(str(tools))
++
++    estimated = int(total * 1.15) + (64 if total else 0)
++    return {
++        "estimated_tokens": estimated,
++        "estimate_source": "hermes.provider_body.rough.v1",
++        "estimate_confidence": "heuristic_with_margin",
++    }
++
++
+ # NOTE: tool schemas can be large. Avoid repeated `str(tools)` conversions,
+ # which are CPU-heavy and can stall GUI event loops under GIL pressure.
+ #
+diff --git a/agent/relay_llm.py b/agent/relay_llm.py
+index 2d5c537..6e4e195 100644
+--- a/agent/relay_llm.py
++++ b/agent/relay_llm.py
+@@ -35,15 +35,27 @@ def _capture_provider_body(body: dict[str, Any]) -> None:
+ 
+ 
+ @contextmanager
+-def provider_body_scope(body: dict[str, Any]) -> Iterator[None]:
+-    """Capture final SDK JSON kwargs, then hide the record from nested calls."""
++def provider_body_scope(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
++    """Filter and capture final SDK JSON kwargs, hiding client-only timeout."""
+ 
++    from hermes_cli.middleware import current_transport_record
++
++    client_timeout = body.get("timeout")
++    has_client_timeout = "timeout" in body
+     provider_body = {key: value for key, value in body.items() if key != "timeout"}
++    record = current_transport_record()
++    if record is not None:
++        filtered = record.filter_provider_body(provider_body)
++        if filtered is not None:
++            provider_body = filtered
+     _capture_provider_body(provider_body)
++    final_body = dict(provider_body)
++    if has_client_timeout:
++        final_body["timeout"] = client_timeout
+     from hermes_cli.middleware import transport_record_scope
+ 
+     with transport_record_scope(None):
+-        yield
++        yield final_body
+ 
+ 
+ def call_provider_body(
+@@ -52,8 +64,8 @@ def call_provider_body(
+ ) -> Any:
+     """Invoke an SDK surface while recording only its JSON request body."""
+ 
+-    with provider_body_scope(body):
+-        return callback(**body)
++    with provider_body_scope(body) as final_body:
++        return callback(**final_body)
+ 
+ 
+ def _without_transport_record(callback: Callable[..., Any], *args: Any) -> Any:
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index 2ee4a74..abb50f1 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -20,7 +20,12 @@ logger = logging.getLogger(__name__)
+ 
+ OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
+ MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v2"
+-TRANSPORT_SCHEMA_VERSION = "hermes.transport.v1"
++TRANSPORT_SCHEMA_VERSION = "hermes.transport.v3"
++PROVIDER_BODY_FILTER_TRANSFORM = "transform"
++PROVIDER_BODY_FILTER_FINAL_GUARD = "final_guard"
++_PROVIDER_BODY_FILTER_PHASES = frozenset(
++    {PROVIDER_BODY_FILTER_TRANSFORM, PROVIDER_BODY_FILTER_FINAL_GUARD}
++)
+ 
+ _TRANSPORT_PRIVATE_KEYS = frozenset(
+     {
+@@ -33,6 +38,10 @@ _CURRENT_TRANSPORT_RECORD: ContextVar["TransportRecord | None"] = ContextVar(
+     "hermes_transport_record",
+     default=None,
+ )
++_CURRENT_MIDDLEWARE_OWNER: ContextVar[str | None] = ContextVar(
++    "hermes_middleware_owner",
++    default=None,
++)
+ 
+ TOOL_REQUEST_MIDDLEWARE = "tool_request"
+ TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
+@@ -73,6 +82,13 @@ class TransportRecord:
+         self._capture_count = 0
+         self._ambiguous = False
+         self._settled = False
++        self._provider_body_filters: List[
++            tuple[str, str, Callable[[Dict[str, Any]], Any]]
++        ] = []
++        self._provider_body_filters_applied = False
++        self._provider_body_estimated_tokens: int | None = None
++        self._provider_body_estimate_source = "unknown"
++        self._provider_body_estimate_confidence = "unknown"
+ 
+     @property
+     def middleware_verified_request(self) -> Dict[str, Any] | None:
+@@ -99,6 +115,154 @@ class TransportRecord:
+         with self._lock:
+             return self._settled
+ 
++    @property
++    def provider_body_filter_owners(self) -> tuple[str, ...]:
++        with self._lock:
++            return tuple(
++                owner for owner, _phase, _callback in self._provider_body_filters
++            )
++
++    @property
++    def provider_body_filter_phases(self) -> tuple[str, ...]:
++        with self._lock:
++            return tuple(
++                phase for _owner, phase, _callback in self._provider_body_filters
++            )
++
++    @property
++    def provider_body_estimated_tokens(self) -> int | None:
++        with self._lock:
++            return self._provider_body_estimated_tokens
++
++    @property
++    def provider_body_estimate_source(self) -> str:
++        with self._lock:
++            return self._provider_body_estimate_source
++
++    @property
++    def provider_body_estimate_confidence(self) -> str:
++        with self._lock:
++            return self._provider_body_estimate_confidence
++
++    def register_provider_body_filter(
++        self,
++        callback: Callable[[Dict[str, Any]], Any],
++        *,
++        phase: str = PROVIDER_BODY_FILTER_TRANSFORM,
++    ) -> None:
++        """Register one owner-bound final provider-body filter.
++
++        Registration is intentionally available only while a host-owned LLM
++        execution middleware callback is running.  The host supplies the
++        owner from the plugin registry; plugins cannot claim another owner.
++        Regular transforms run in registration order before every
++        ``final_guard``. Guards also preserve registration order but may only
++        keep or shrink the final body.
++        """
++        owner = _CURRENT_MIDDLEWARE_OWNER.get()
++        if not owner:
++            raise RuntimeError(
++                "provider-body filters may only be registered by plugin-owned "
++                "LLM execution middleware"
++            )
++        if not callable(callback):
++            raise TypeError("provider-body filter must be callable")
++        if phase not in _PROVIDER_BODY_FILTER_PHASES:
++            raise ValueError(
++                "provider-body filter phase must be 'transform' or 'final_guard'"
++            )
++        with self._lock:
++            if self._capture_count or self._provider_body_filters_applied:
++                raise RuntimeError("provider-body filter registration is closed")
++            if any(
++                existing_owner == owner
++                for existing_owner, _phase, _callback in self._provider_body_filters
++            ):
++                raise ValueError(
++                    f"plugin {owner!r} already registered a provider-body filter"
++                )
++            self._provider_body_filters.append((owner, phase, callback))
++
++    def filter_provider_body(self, body: Any) -> Dict[str, Any] | None:
++        """Apply final-body filters once, isolating every plugin failure."""
++        initial = _provider_filter_snapshot(body)
++        with self._lock:
++            if self._provider_body_filters_applied:
++                self._ambiguous = True
++                self._settled = False
++                return initial
++            self._provider_body_filters_applied = True
++            filters = sorted(
++                self._provider_body_filters,
++                key=lambda item: item[1] == PROVIDER_BODY_FILTER_FINAL_GUARD,
++            )
++            preexisting_ambiguity = self._ambiguous
++
++        if initial is None:
++            self._mark_ambiguous()
++            self._store_provider_body_estimate(_provider_body_estimate(None))
++            return None
++        if not filters:
++            return initial
++        if preexisting_ambiguity:
++            self._store_provider_body_estimate(_provider_body_estimate(initial))
++            return initial
++
++        current = initial
++        for _owner, phase, callback in filters:
++            working = deepcopy(current)
++            estimate = _provider_body_estimate(current)
++            try:
++                result = _invoke_provider_body_filter(callback, working, estimate)
++            except Exception as exc:
++                logger.warning(
++                    "Provider-body filter %s raised: %s",
++                    getattr(callback, "__name__", repr(callback)),
++                    exc,
++                )
++                self._mark_ambiguous()
++                continue
++            accepted = _provider_filter_snapshot(result)
++            if accepted is None or "timeout" in accepted:
++                self._mark_ambiguous()
++                continue
++            if phase == PROVIDER_BODY_FILTER_FINAL_GUARD:
++                accepted_estimate = _provider_body_estimate(accepted)
++                if not _provider_body_guard_is_non_expansive(
++                    current,
++                    accepted,
++                    estimate,
++                    accepted_estimate,
++                ):
++                    logger.warning(
++                        "Provider-body final guard %s expanded the body; "
++                        "keeping the previous body",
++                        getattr(callback, "__name__", repr(callback)),
++                    )
++                    self._mark_ambiguous()
++                    continue
++            current = accepted
++        self._store_provider_body_estimate(_provider_body_estimate(current))
++        return current
++
++    def _store_provider_body_estimate(self, estimate: Dict[str, Any]) -> None:
++        with self._lock:
++            tokens = estimate.get("estimated_tokens")
++            self._provider_body_estimated_tokens = (
++                tokens if isinstance(tokens, int) and tokens >= 0 else None
++            )
++            self._provider_body_estimate_source = str(
++                estimate.get("estimate_source") or "unknown"
++            )
++            self._provider_body_estimate_confidence = str(
++                estimate.get("estimate_confidence") or "unknown"
++            )
++
++    def _mark_ambiguous(self) -> None:
++        with self._lock:
++            self._ambiguous = True
++            self._settled = False
++
+     def mark_middleware_verified(self, request: Any) -> None:
+         if isinstance(request, dict) and "_moa_prepared_request" in request:
+             with self._lock:
+@@ -162,6 +326,86 @@ def _transport_snapshot(request: Any) -> Dict[str, Any] | None:
+         return None
+ 
+ 
++def _provider_filter_snapshot(body: Any) -> Dict[str, Any] | None:
++    if not isinstance(body, dict) or any(key in body for key in _TRANSPORT_PRIVATE_KEYS):
++        return None
++    try:
++        if not _transport_value_supported(body):
++            return None
++        return deepcopy(body)
++    except Exception:
++        return None
++
++
++def _provider_body_estimate(body: Any) -> Dict[str, Any]:
++    try:
++        from agent.model_metadata import estimate_provider_body_tokens_rough
++
++        return estimate_provider_body_tokens_rough(body)
++    except Exception:
++        return {
++            "estimated_tokens": None,
++            "estimate_source": "unknown",
++            "estimate_confidence": "unknown",
++        }
++
++
++def _invoke_provider_body_filter(
++    callback: Callable[..., Any],
++    body: Dict[str, Any],
++    estimate: Dict[str, Any],
++) -> Any:
++    try:
++        parameters = inspect.signature(callback).parameters
++    except (TypeError, ValueError):
++        return callback(body)
++    if any(
++        parameter.kind is inspect.Parameter.VAR_KEYWORD
++        for parameter in parameters.values()
++    ):
++        return callback(body, **estimate)
++    compatible = {
++        key: value for key, value in estimate.items() if key in parameters
++    }
++    return callback(body, **compatible)
++
++
++def _provider_body_guard_is_non_expansive(
++    before: Dict[str, Any],
++    after: Dict[str, Any],
++    before_estimate: Dict[str, Any],
++    after_estimate: Dict[str, Any],
++) -> bool:
++    before_tokens = before_estimate.get("estimated_tokens")
++    after_tokens = after_estimate.get("estimated_tokens")
++    if not isinstance(before_tokens, int) or not isinstance(after_tokens, int):
++        return False
++    return (
++        after_tokens <= before_tokens
++        and _transport_value_size(after) <= _transport_value_size(before)
++    )
++
++
++def _transport_value_size(value: Any) -> int:
++    """Return structural size for guard monotonicity, not token estimation."""
++    if value is None:
++        return 0
++    if isinstance(value, bytes):
++        return len(value)
++    if isinstance(value, str):
++        return len(value)
++    if isinstance(value, (bool, int, float)):
++        return len(str(value))
++    if isinstance(value, dict):
++        return sum(
++            len(key) + _transport_value_size(item)
++            for key, item in value.items()
++        )
++    if isinstance(value, (list, tuple)):
++        return sum(_transport_value_size(item) for item in value)
++    return 0
++
++
+ def _transport_value_supported(value: Any) -> bool:
+     if value is None or isinstance(value, (bool, int, float, str, bytes)):
+         return True
+@@ -369,6 +613,17 @@ def _get_middleware_callbacks(kind: str) -> List[Callable]:
+     return list(get_plugin_manager()._middleware.get(kind, []))
+ 
+ 
++def _get_middleware_owner(kind: str, index: int, callback: Callable) -> str | None:
++    from hermes_cli.plugins import get_plugin_manager
++
++    manager = get_plugin_manager()
++    callbacks = manager._middleware.get(kind, [])
++    owners = getattr(manager, "_middleware_owners", {}).get(kind, [])
++    if index >= len(callbacks) or index >= len(owners) or callbacks[index] is not callback:
++        return None
++    return owners[index]
++
++
+ def _apply_request_callbacks(
+     kind: str,
+     *,
+@@ -393,7 +648,7 @@ def _apply_request_callbacks(
+         call_kwargs[payload_key] = working
+         call_kwargs[original_key] = _safe_copy(original_payload)
+         try:
+-            result = callback(**call_kwargs)
++            result = _invoke_additive_callback(callback, call_kwargs)
+         except Exception as exc:
+             logger.warning(
+                 "Middleware '%s' callback %s raised: %s",
+@@ -457,6 +712,9 @@ def _run_execution_chain(
+         call_kwargs = middleware_payload(**kwargs)
+         call_kwargs[payload_key] = payload
+         call_kwargs["next_call"] = next_call
++        owner_token = _CURRENT_MIDDLEWARE_OWNER.set(
++            _get_middleware_owner(kind, index, callback)
++        )
+         try:
+             return _invoke_execution_callback(callback, call_kwargs)
+         except _DownstreamExecutionError as exc:
+@@ -473,6 +731,8 @@ def _run_execution_chain(
+             if next_called:
+                 raise
+             return call_at(index + 1, payload)
++        finally:
++            _CURRENT_MIDDLEWARE_OWNER.reset(owner_token)
+ 
+     return call_at(0, kwargs[payload_key])
+ 
+@@ -483,6 +743,13 @@ def _invoke_execution_callback(
+ ) -> Any:
+     """Hide additive transport kwargs from pre-H5 narrow callbacks."""
+ 
++    return _invoke_additive_callback(callback, call_kwargs)
++
++
++def _invoke_additive_callback(
++    callback: Callable[..., Any],
++    call_kwargs: Dict[str, Any],
++) -> Any:
+     try:
+         parameters = inspect.signature(callback).parameters
+     except (TypeError, ValueError):
+@@ -493,7 +760,13 @@ def _invoke_execution_callback(
+     ):
+         return callback(**call_kwargs)
+     compatible = dict(call_kwargs)
+-    for key in ("transport_record", "transport_schema_version"):
++    for key in (
++        "transport_record",
++        "transport_schema_version",
++        "context_window_tokens",
++        "context_window_source",
++        "context_window_confidence",
++    ):
+         if key not in parameters:
+             compatible.pop(key, None)
+     return callback(**compatible)
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index cd99c95..70bd85a 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -3346,11 +3346,10 @@ class PluginContext:
+             )
+         callbacks = self._manager._middleware.setdefault(kind, [])
+         callbacks.append(callback)
++        self._manager._middleware_owners.setdefault(kind, []).append(self.plugin_id)
+         handle = self._track(
+             "middleware", kind,
+-            lambda: self._manager._remove_callback(
+-                self._manager._middleware, kind, callback
+-            ),
++            lambda: self._manager._remove_middleware_callback(kind, callback),
+         )
+         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
+         return handle
+@@ -3440,6 +3439,7 @@ class PluginManager:
+         self._plugins: Dict[str, LoadedPlugin] = {}
+         self._hooks: Dict[str, List[Callable]] = {}
+         self._middleware: Dict[str, List[Callable]] = {}
++        self._middleware_owners: Dict[str, List[str]] = {}
+         self._services: Dict[str, _PluginServiceEntry] = {}
+         self._service_lock = threading.RLock()
+         self._plugin_tool_names: Set[str] = set()
+@@ -3620,6 +3620,23 @@ class PluginManager:
+         if not callbacks:
+             mapping.pop(key, None)
+ 
++    def _remove_middleware_callback(self, kind: str, callback: Callable) -> None:
++        callbacks = self._middleware.get(kind)
++        if callbacks is None:
++            return
++        for index in range(len(callbacks) - 1, -1, -1):
++            if callbacks[index] is not callback:
++                continue
++            del callbacks[index]
++            owners = self._middleware_owners.get(kind)
++            if owners is not None and index < len(owners):
++                del owners[index]
++                if not owners:
++                    self._middleware_owners.pop(kind, None)
++            break
++        if not callbacks:
++            self._middleware.pop(kind, None)
++
+     def _restore_mapping(
+         self,
+         mapping: Dict[str, Any],
+@@ -3824,6 +3841,7 @@ class PluginManager:
+             self._plugins.clear()
+             self._hooks.clear()
+             self._middleware.clear()
++            self._middleware_owners.clear()
+             self._plugin_tool_names.clear()
+             self._plugin_platform_names.clear()
+             self._cli_commands.clear()
+diff --git a/tests/agent/test_model_metadata.py b/tests/agent/test_model_metadata.py
+index 1760516..60614e7 100644
+--- a/tests/agent/test_model_metadata.py
++++ b/tests/agent/test_model_metadata.py
+@@ -24,6 +24,7 @@ from agent.model_metadata import (
+     estimate_tokens_rough,
+     estimate_messages_tokens_rough,
+     get_model_context_length,
++    get_model_context_window,
+     get_next_probe_tier,
+     get_cached_context_length,
+     parse_context_limit_from_error,
+@@ -31,6 +32,7 @@ from agent.model_metadata import (
+     fetch_model_metadata,
+     _MODEL_CACHE_TTL,
+     estimate_request_tokens_rough,
++    estimate_provider_body_tokens_rough,
+ )
+ 
+ 
+@@ -42,6 +44,36 @@ class TestEstimateTokensRough:
+     def test_empty_string(self):
+         assert estimate_tokens_rough("") == 0
+ 
++    def test_provider_body_estimator_covers_responses_images_and_fixed_buckets(self):
++        estimate = estimate_provider_body_tokens_rough(
++            {
++                "input": [
++                    {
++                        "role": "user",
++                        "content": [
++                            {"type": "input_text", "text": "inspect"},
++                            {"type": "input_image", "image_url": "data:image/png;base64,x"},
++                        ],
++                    }
++                ],
++                "instructions": "be concise",
++                "tools": [
++                    {
++                        "type": "function",
++                        "function": {
++                            "name": "lookup",
++                            "description": "look up one value",
++                            "parameters": {"type": "object"},
++                        },
++                    }
++                ],
++            }
++        )
++
++        assert estimate["estimated_tokens"] > 1_700
++        assert estimate["estimate_source"] == "hermes.provider_body.rough.v1"
++        assert estimate["estimate_confidence"] == "heuristic_with_margin"
++
+ 
+     def test_known_length(self):
+         assert estimate_tokens_rough("a" * 400) == 100
+@@ -307,6 +339,38 @@ class TestDefaultContextLengths:
+         assert get_model_context_length("") == DEFAULT_FALLBACK_CONTEXT
+         assert get_model_context_length(None) == DEFAULT_FALLBACK_CONTEXT  # type: ignore[arg-type]
+ 
++    def test_context_window_provenance_distinguishes_config_and_fallback(self):
++        assert get_model_context_window(
++            "test-model", config_context_length=96_000
++        ) == {
++            "tokens": 96_000,
++            "source": "config",
++            "confidence": "authoritative",
++        }
++        assert get_model_context_window("") == {
++            "tokens": DEFAULT_FALLBACK_CONTEXT,
++            "source": "fallback",
++            "confidence": "fallback",
++        }
++
++    def test_context_window_provenance_preserves_custom_provider_owner(self):
++        custom_providers = [
++            {
++                "name": "local-test",
++                "base_url": "https://example.invalid/v1",
++                "models": {"test-model": {"context_length": 48_000}},
++            }
++        ]
++        assert get_model_context_window(
++            "test-model",
++            base_url="https://example.invalid/v1",
++            custom_providers=custom_providers,
++        ) == {
++            "tokens": 48_000,
++            "source": "custom_provider",
++            "confidence": "authoritative",
++        }
++
+ 
+     def test_xai_oauth_grok_build_uses_xai_models_dev_context(self):
+         """xAI OAuth should share the xAI provider metadata path.
+diff --git a/tests/agent/test_relay_llm.py b/tests/agent/test_relay_llm.py
+index 2bc70b8..6ac7ce0 100644
+--- a/tests/agent/test_relay_llm.py
++++ b/tests/agent/test_relay_llm.py
+@@ -13,9 +13,18 @@ import pytest
+ pytest.importorskip("nemo_relay")
+ 
+ from agent import relay_llm, relay_runtime
++from hermes_cli import middleware
+ from hermes_cli.middleware import TransportRecord, transport_record_scope
+ 
+ 
++def _register_test_filter(record, callback):
++    token = middleware._CURRENT_MIDDLEWARE_OWNER.set("test-relay-filter")
++    try:
++        record.register_provider_body_filter(callback)
++    finally:
++        middleware._CURRENT_MIDDLEWARE_OWNER.reset(token)
++
++
+ @pytest.fixture()
+ def relay_turn(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+@@ -401,6 +410,10 @@ def test_managed_nonstream_captures_relay_rewritten_final_sdk_body(
+     monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+     try:
+         record.mark_middleware_verified(original)
++        _register_test_filter(
++            record,
++            lambda body: {**body, "top_p": 0.9},
++        )
+         with transport_record_scope(record):
+             result = relay_llm.execute(
+                 original,
+@@ -426,6 +439,7 @@ def test_managed_nonstream_captures_relay_rewritten_final_sdk_body(
+             "model": "test-model",
+             "messages": [{"role": "user", "content": "hello"}],
+             "temperature": 0.25,
++            "top_p": 0.9,
+             "timeout": 1800.0,
+         }
+     ]
+diff --git a/tests/agent/test_transport_truth.py b/tests/agent/test_transport_truth.py
+index 03b8fe9..b74a5bc 100644
+--- a/tests/agent/test_transport_truth.py
++++ b/tests/agent/test_transport_truth.py
+@@ -11,6 +11,14 @@ from hermes_cli import lifecycle, middleware, plugins
+ from run_agent import AIAgent
+ 
+ 
++def _register_test_filter(record, callback):
++    token = middleware._CURRENT_MIDDLEWARE_OWNER.set("test-provider-filter")
++    try:
++        record.register_provider_body_filter(callback)
++    finally:
++        middleware._CURRENT_MIDDLEWARE_OWNER.reset(token)
++
++
+ def _response(text: str = "done") -> SimpleNamespace:
+     return SimpleNamespace(
+         id="response-1",
+@@ -33,6 +41,28 @@ def _response(text: str = "done") -> SimpleNamespace:
+     )
+ 
+ 
++def test_native_fallback_context_window_is_explicitly_identified():
++    from agent.context_compressor import ContextCompressor
++    from agent.conversation_loop import _middleware_context_window
++
++    compressor = ContextCompressor(
++        model="",
++        quiet_mode=True,
++        base_url="",
++        provider="",
++    )
++    agent = SimpleNamespace(
++        context_compressor=compressor,
++        _context_window_resolution=None,
++    )
++
++    assert _middleware_context_window(agent) == {
++        "context_window_tokens": 256_000,
++        "context_window_source": "fallback",
++        "context_window_confidence": "fallback",
++    }
++
++
+ def _agent(monkeypatch) -> AIAgent:
+     from agent import context_compressor, model_metadata
+ 
+@@ -181,11 +211,11 @@ def test_direct_stream_fallback_settles_only_before_post_and_calls_provider_once
+         execution_observations[0]
+     )
+     assert execution_schema == "hermes.middleware.v2"
+-    assert transport_schema == "hermes.transport.v1"
++    assert transport_schema == "hermes.transport.v3"
+     assert captured == provider_requests[0]
+     assert settled is False
+     assert post_observations[0] == (
+-        "hermes.transport.v1",
++        "hermes.transport.v3",
+         execution_record,
+         provider_requests[0],
+         True,
+@@ -235,6 +265,103 @@ def test_provider_error_never_settles_or_fires_post(monkeypatch):
+     assert post_records == []
+ 
+ 
++def test_request_and_execution_receive_current_context_window_truth(monkeypatch):
++    observed = []
++
++    def request_middleware(
++        *,
++        request,
++        context_window_tokens,
++        context_window_source,
++        context_window_confidence,
++        **_kwargs,
++    ):
++        observed.append(
++            (
++                "request",
++                context_window_tokens,
++                context_window_source,
++                context_window_confidence,
++            )
++        )
++        return {"request": request}
++
++    def execution_middleware(
++        *,
++        request,
++        next_call,
++        context_window_tokens,
++        context_window_source,
++        context_window_confidence,
++        **_kwargs,
++    ):
++        observed.append(
++            (
++                "execution",
++                context_window_tokens,
++                context_window_source,
++                context_window_confidence,
++            )
++        )
++        return next_call(request)
++
++    monkeypatch.setattr(
++        middleware,
++        "_get_middleware_callbacks",
++        lambda kind: [request_middleware]
++        if kind == middleware.LLM_REQUEST_MIDDLEWARE
++        else [execution_middleware]
++        if kind == middleware.LLM_EXECUTION_MIDDLEWARE
++        else [],
++    )
++    monkeypatch.setattr(
++        middleware,
++        "_has_middleware",
++        lambda kind: kind == middleware.LLM_REQUEST_MIDDLEWARE,
++    )
++    monkeypatch.setattr(lifecycle, "has_hook", lambda _name: False)
++    monkeypatch.setattr(plugins, "invoke_hook", lambda *_args, **_kwargs: [])
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++
++    for resolution, expected_source, expected_confidence in (
++        (None, "unknown", "unknown"),
++        (
++            {
++                "tokens": 128_000,
++                "source": "custom_provider",
++                "confidence": "authoritative",
++            },
++            "custom_provider",
++            "authoritative",
++        ),
++    ):
++        agent = _agent(monkeypatch)
++        agent._context_window_resolution = resolution
++
++        def provider(request, *, on_first_delta=None):
++            del on_first_delta
++            with relay_llm.provider_body_scope(request):
++                return _response()
++
++        agent._interruptible_streaming_api_call = provider
++        result = agent.run_conversation(
++            "hello",
++            conversation_history=[],
++            task_id=f"task-context-{expected_source}",
++        )
++
++        assert result["final_response"] == "done"
++        expected = [
++            ("request", 128_000, expected_source, expected_confidence),
++            ("execution", 128_000, expected_source, expected_confidence),
++        ]
++        assert observed[-2:] == expected
++
++
+ def test_disable_streaming_records_final_openai_sdk_body_without_timeout(
+     monkeypatch,
+ ):
+@@ -311,6 +438,10 @@ def test_anthropic_nonstream_records_late_sanitized_sdk_body(monkeypatch):
+     }
+     record = middleware.TransportRecord()
+     record.mark_middleware_verified(request)
++    _register_test_filter(
++        record,
++        lambda body: {**body, "metadata": {"filtered": True}},
++    )
+ 
+     with middleware.transport_record_scope(record):
+         result = create_anthropic_message(
+@@ -329,6 +460,7 @@ def test_anthropic_nonstream_records_late_sanitized_sdk_body(monkeypatch):
+         "parallel_tool_calls",
+     }.intersection(sdk_calls[0])
+     assert sdk_calls[0]["timeout"] == 1800.0
++    assert sdk_calls[0]["metadata"] == {"filtered": True}
+     assert record.provider_body == {
+         key: value for key, value in sdk_calls[0].items() if key != "timeout"
+     }
+@@ -364,6 +496,16 @@ def test_bedrock_nonstream_records_final_converse_body(monkeypatch):
+     }
+     record = middleware.TransportRecord()
+     record.mark_middleware_verified(request)
++    _register_test_filter(
++        record,
++        lambda body: {
++            **body,
++            "inferenceConfig": {
++                **body["inferenceConfig"],
++                "temperature": 0.25,
++            },
++        },
++    )
+ 
+     with middleware.transport_record_scope(record):
+         result = _dispatch_nonstreaming_api_request(
+@@ -378,7 +520,7 @@ def test_bedrock_nonstream_records_final_converse_body(monkeypatch):
+         {
+             "modelId": "anthropic.claude-test",
+             "messages": [],
+-            "inferenceConfig": {"maxTokens": 128},
++            "inferenceConfig": {"maxTokens": 128, "temperature": 0.25},
+         }
+     ]
+     assert record.provider_body == sdk_calls[0]
+@@ -433,6 +575,10 @@ def test_openai_stream_records_final_sdk_kwargs_not_client_timeout(monkeypatch):
+     request = {"model": "test-model", "messages": []}
+     record = middleware.TransportRecord()
+     record.mark_middleware_verified(request)
++    _register_test_filter(
++        record,
++        lambda body: {**body, "temperature": 0.25},
++    )
+ 
+     with middleware.transport_record_scope(record):
+         response = cch.interruptible_streaming_api_call(agent, request)
+@@ -443,6 +589,7 @@ def test_openai_stream_records_final_sdk_kwargs_not_client_timeout(monkeypatch):
+     assert isinstance(provider_calls[0]["timeout"], Timeout)
+     assert provider_calls[0]["stream"] is True
+     assert provider_calls[0]["stream_options"] == {"include_usage": True}
++    assert provider_calls[0]["temperature"] == 0.25
+     assert record.provider_body == {
+         key: value for key, value in provider_calls[0].items() if key != "timeout"
+     }
+@@ -515,13 +662,17 @@ def test_anthropic_stream_records_final_sanitized_sdk_kwargs(monkeypatch):
+     }
+     record = middleware.TransportRecord()
+     record.mark_middleware_verified(request)
++    _register_test_filter(
++        record,
++        lambda body: {**body, "metadata": {"filtered": True}},
++    )
+ 
+     with middleware.transport_record_scope(record):
+         response = cch.interruptible_streaming_api_call(agent, request)
+     record.settle()
+ 
+     assert response is final_message
+-    assert provider_calls == [request]
++    assert provider_calls == [{**request, "metadata": {"filtered": True}}]
+     assert record.provider_body == provider_calls[0]
+     assert record.capture_count == 1
+     assert record.settled is True
+@@ -574,6 +725,10 @@ def test_codex_stream_records_final_sanitized_responses_kwargs(monkeypatch):
+     }
+     record = middleware.TransportRecord()
+     record.mark_middleware_verified(request)
++    _register_test_filter(
++        record,
++        lambda body: {**body, "temperature": 0.25},
++    )
+ 
+     with middleware.transport_record_scope(record):
+         try:
+@@ -589,11 +744,13 @@ def test_codex_stream_records_final_sanitized_responses_kwargs(monkeypatch):
+             "input": "hello",
+             "timeout": 1800.0,
+             "stream": True,
++            "temperature": 0.25,
+         }
+     ]
+     assert record.provider_body == {
+         "model": "gpt-5.6-sol",
+         "input": "hello",
+         "stream": True,
++        "temperature": 0.25,
+     }
+     assert record.capture_count == 1
+diff --git a/tests/test_middleware.py b/tests/test_middleware.py
+index 40613b1..14facdd 100644
+--- a/tests/test_middleware.py
++++ b/tests/test_middleware.py
+@@ -228,7 +228,7 @@ def test_transport_record_preserves_bytes_and_strips_only_host_private_keys():
+     record.capture_provider_body(provider_body)
+     record.settle()
+ 
+-    assert record.schema_version == "hermes.transport.v1"
++    assert record.schema_version == "hermes.transport.v3"
+     assert record.middleware_verified_request == {
+         "messages": [{"role": "user", "content": b"before"}]
+     }
+@@ -415,7 +415,7 @@ def test_execution_callback_receives_transport_record_and_schema(monkeypatch):
+         == "ok"
+     )
+     assert calls == [
+-        ("hermes.middleware.v2", "hermes.transport.v1", record),
++        ("hermes.middleware.v2", "hermes.transport.v3", record),
+         "provider",
+     ]
+ 
+@@ -475,6 +475,434 @@ def test_provider_body_scope_strips_client_timeout_and_clears_nested_context():
+     assert record.settled is True
+ 
+ 
++def test_plugin_owned_provider_body_filters_compose_once_before_sdk(monkeypatch):
++    from agent import relay_llm
++    from hermes_cli import plugins
++
++    manager = plugins.PluginManager(scope_key="/tmp/hermes-filter-owner-test")
++    first_ctx = plugins.PluginContext(
++        plugins.PluginManifest(name="first", key="first"), manager
++    )
++    second_ctx = plugins.PluginContext(
++        plugins.PluginManifest(name="second", key="second"), manager
++    )
++    seen = []
++
++    def first_filter(
++        body,
++        *,
++        estimated_tokens,
++        estimate_source,
++        estimate_confidence,
++    ):
++        seen.append(("first", copy.deepcopy(body)))
++        assert estimated_tokens > 0
++        assert estimate_source == "hermes.provider_body.rough.v1"
++        assert estimate_confidence == "heuristic_with_margin"
++        body["metadata"] = {"filters": ["first"]}
++        return body
++
++    def second_filter(body):
++        seen.append(("second", copy.deepcopy(body)))
++        body["metadata"]["filters"].append("second")
++        return body
++
++    def first_execution(*, request, next_call, transport_record, **_kwargs):
++        transport_record.register_provider_body_filter(first_filter)
++        return next_call(request)
++
++    def second_execution(*, request, next_call, transport_record, **_kwargs):
++        transport_record.register_provider_body_filter(second_filter)
++        return next_call(request)
++
++    first_handle = first_ctx.register_middleware(
++        middleware.LLM_EXECUTION_MIDDLEWARE, first_execution
++    )
++    second_ctx.register_middleware(
++        middleware.LLM_EXECUTION_MIDDLEWARE, second_execution
++    )
++    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
++
++    request = {
++        "model": "test",
++        "messages": [{"role": "user", "content": "hello"}],
++    }
++    record = middleware.TransportRecord()
++    sdk_calls = []
++    client_timeout = object()
++
++    def terminal(final):
++        record.mark_middleware_verified(final)
++        with middleware.transport_record_scope(record):
++            return relay_llm.call_provider_body(
++                lambda **body: sdk_calls.append(body) or "ok",
++                {**final, "timeout": client_timeout},
++            )
++
++    result = middleware.run_llm_execution_middleware(
++        request,
++        terminal,
++        transport_record=record,
++    )
++    record.settle()
++
++    assert result == "ok"
++    assert [name for name, _body in seen] == ["first", "second"]
++    assert all("timeout" not in body for _name, body in seen)
++    assert sdk_calls[0]["metadata"] == {"filters": ["first", "second"]}
++    assert sdk_calls[0]["timeout"] is client_timeout
++    assert len(sdk_calls) == 1
++    assert record.provider_body == {
++        key: value for key, value in sdk_calls[0].items() if key != "timeout"
++    }
++    assert record.provider_body_filter_owners == ("first", "second")
++    assert record.provider_body_filter_phases == ("transform", "transform")
++    assert record.provider_body_estimated_tokens is not None
++    assert record.provider_body_estimate_source == "hermes.provider_body.rough.v1"
++    assert (
++        record.provider_body_estimate_confidence == "heuristic_with_margin"
++    )
++    assert record.settled is True
++
++    first_handle.dispose()
++    assert manager._middleware[middleware.LLM_EXECUTION_MIDDLEWARE] == [
++        second_execution
++    ]
++    assert manager._middleware_owners[middleware.LLM_EXECUTION_MIDDLEWARE] == [
++        "second"
++    ]
++
++
++def test_invalid_provider_body_filter_fails_closed_without_blocking_sdk(monkeypatch):
++    from agent import relay_llm
++    from hermes_cli import plugins
++
++    manager = plugins.PluginManager(scope_key="/tmp/hermes-filter-error-test")
++    ctx = plugins.PluginContext(
++        plugins.PluginManifest(name="broken", key="broken"), manager
++    )
++    provider_calls = []
++
++    def execution(*, request, next_call, transport_record, **_kwargs):
++        transport_record.register_provider_body_filter(
++            lambda body: {**body, "timeout": "plugin-owned"}
++        )
++        return next_call(request)
++
++    ctx.register_middleware(middleware.LLM_EXECUTION_MIDDLEWARE, execution)
++    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
++    request = {"model": "test", "messages": []}
++    record = middleware.TransportRecord()
++
++    def terminal(final):
++        record.mark_middleware_verified(final)
++        with middleware.transport_record_scope(record):
++            return relay_llm.call_provider_body(
++                lambda **body: provider_calls.append(body) or "ok",
++                {**final, "timeout": 60},
++            )
++
++    assert (
++        middleware.run_llm_execution_middleware(
++            request, terminal, transport_record=record
++        )
++        == "ok"
++    )
++    record.settle()
++
++    assert provider_calls == [{**request, "timeout": 60}]
++    assert record.provider_body == request
++    assert record.ambiguous is True
++    assert record.settled is False
++
++
++def test_provider_body_filter_removes_its_own_block_before_single_sdk_call(
++    monkeypatch,
++):
++    from agent import relay_llm
++    from hermes_cli import plugins
++
++    manager = plugins.PluginManager(scope_key="/tmp/hermes-filter-removal-test")
++    ctx = plugins.PluginContext(
++        plugins.PluginManifest(name="continuity", key="continuity"), manager
++    )
++    provider_calls = []
++    filter_estimates = []
++
++    def execution(*, request, next_call, transport_record, **_kwargs):
++        def remove_owned_block(
++            body,
++            *,
++            estimated_tokens,
++            estimate_source,
++            estimate_confidence,
++        ):
++            filter_estimates.append(
++                (estimated_tokens, estimate_source, estimate_confidence)
++            )
++            body["messages"][-1]["content"] = body["messages"][-1][
++                "content"
++            ].replace("\n<continuity>bridge</continuity>", "")
++            return body
++
++        transport_record.register_provider_body_filter(
++            remove_owned_block,
++            phase=middleware.PROVIDER_BODY_FILTER_FINAL_GUARD,
++        )
++        return next_call(request)
++
++    ctx.register_middleware(middleware.LLM_EXECUTION_MIDDLEWARE, execution)
++    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
++    request = {
++        "messages": [
++            {
++                "role": "user",
++                "content": "hello\n<continuity>bridge</continuity>",
++            }
++        ]
++    }
++    record = middleware.TransportRecord()
++
++    def terminal(final):
++        record.mark_middleware_verified(final)
++        with middleware.transport_record_scope(record):
++            return relay_llm.call_provider_body(
++                lambda **body: provider_calls.append(body) or "ok",
++                final,
++            )
++
++    assert (
++        middleware.run_llm_execution_middleware(
++            request, terminal, transport_record=record
++        )
++        == "ok"
++    )
++    record.settle()
++
++    assert provider_calls == [
++        {"messages": [{"role": "user", "content": "hello"}]}
++    ]
++    assert record.middleware_verified_request == request
++    assert record.provider_body == provider_calls[0]
++    assert record.capture_count == 1
++    assert filter_estimates[0][0] > record.provider_body_estimated_tokens
++    assert filter_estimates[0][1:] == (
++        "hermes.provider_body.rough.v1",
++        "heuristic_with_margin",
++    )
++    assert record.settled is True
++
++
++def test_final_guard_runs_after_later_expanding_transform_in_both_orders(
++    monkeypatch,
++):
++    from agent import relay_llm
++    from hermes_cli import plugins
++
++    for order in (("guard", "transform"), ("transform", "guard")):
++        manager = plugins.PluginManager(
++            scope_key=f"/tmp/hermes-filter-phase-{'-'.join(order)}"
++        )
++        guard_ctx = plugins.PluginContext(
++            plugins.PluginManifest(name="guard", key="guard"), manager
++        )
++        transform_ctx = plugins.PluginContext(
++            plugins.PluginManifest(name="transform", key="transform"), manager
++        )
++        guard_observations = []
++        provider_calls = []
++
++        def guard_execution(*, request, next_call, transport_record, **_kwargs):
++            def remove_owned_block(body, *, estimated_tokens, **_estimate):
++                content = body["messages"][-1]["content"]
++                guard_observations.append((content, estimated_tokens))
++                body["messages"][-1]["content"] = content.replace(
++                    "<continuity>bridge</continuity>", ""
++                )
++                return body
++
++            transport_record.register_provider_body_filter(
++                remove_owned_block,
++                phase=middleware.PROVIDER_BODY_FILTER_FINAL_GUARD,
++            )
++            return next_call(request)
++
++        def transform_execution(*, request, next_call, transport_record, **_kwargs):
++            def expand(body):
++                body["messages"][-1]["content"] += "<later>" + ("x" * 20_000)
++                return body
++
++            transport_record.register_provider_body_filter(expand)
++            return next_call(request)
++
++        callbacks = {
++            "guard": (guard_ctx, guard_execution),
++            "transform": (transform_ctx, transform_execution),
++        }
++        for name in order:
++            context, callback = callbacks[name]
++            context.register_middleware(
++                middleware.LLM_EXECUTION_MIDDLEWARE, callback
++            )
++        monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
++
++        request = {
++            "messages": [
++                {
++                    "role": "user",
++                    "content": "hello<continuity>bridge</continuity>",
++                }
++            ]
++        }
++        record = middleware.TransportRecord()
++
++        def terminal(final):
++            record.mark_middleware_verified(final)
++            with middleware.transport_record_scope(record):
++                return relay_llm.call_provider_body(
++                    lambda **body: provider_calls.append(body) or "ok",
++                    final,
++                )
++
++        assert (
++            middleware.run_llm_execution_middleware(
++                request, terminal, transport_record=record
++            )
++            == "ok"
++        )
++        record.settle()
++
++        assert len(guard_observations) == 1
++        assert "<later>" in guard_observations[0][0]
++        assert guard_observations[0][1] > 5_000
++        assert len(provider_calls) == 1
++        delivered = provider_calls[0]["messages"][-1]["content"]
++        assert "<continuity>" not in delivered
++        assert "<later>" in delivered
++        assert record.capture_count == 1
++        assert record.settled is True
++
++
++def test_final_guard_expansion_or_exception_keeps_body_and_provider_once(
++    monkeypatch,
++):
++    from agent import relay_llm
++    from hermes_cli import plugins
++
++    for failure in ("expands", "raises"):
++        manager = plugins.PluginManager(
++            scope_key=f"/tmp/hermes-filter-guard-{failure}"
++        )
++        ctx = plugins.PluginContext(
++            plugins.PluginManifest(name=failure, key=failure), manager
++        )
++        provider_calls = []
++
++        def execution(*, request, next_call, transport_record, **_kwargs):
++            def guard(body):
++                if failure == "raises":
++                    raise RuntimeError("boom")
++                body["messages"][-1]["content"] += "x" * 20_000
++                return body
++
++            transport_record.register_provider_body_filter(
++                guard,
++                phase=middleware.PROVIDER_BODY_FILTER_FINAL_GUARD,
++            )
++            return next_call(request)
++
++        ctx.register_middleware(middleware.LLM_EXECUTION_MIDDLEWARE, execution)
++        monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
++        request = {
++            "messages": [{"role": "user", "content": "unchanged"}]
++        }
++        record = middleware.TransportRecord()
++
++        def terminal(final):
++            record.mark_middleware_verified(final)
++            with middleware.transport_record_scope(record):
++                return relay_llm.call_provider_body(
++                    lambda **body: provider_calls.append(body) or "ok",
++                    final,
++                )
++
++        assert (
++            middleware.run_llm_execution_middleware(
++                request, terminal, transport_record=record
++            )
++            == "ok"
++        )
++        record.settle()
++
++        assert provider_calls == [request]
++        assert record.provider_body == request
++        assert record.capture_count == 1
++        assert record.ambiguous is True
++        assert record.settled is False
++
++
++def test_provider_body_filter_registration_requires_real_middleware_owner():
++    record = middleware.TransportRecord()
++
++    try:
++        record.register_provider_body_filter(lambda body: body)
++    except RuntimeError as exc:
++        assert "plugin-owned" in str(exc)
++    else:  # pragma: no cover - defensive
++        raise AssertionError("unowned filter registration should fail")
++
++
++def test_provider_body_filter_owner_can_register_only_once_across_phases():
++    record = middleware.TransportRecord()
++    owner_token = middleware._CURRENT_MIDDLEWARE_OWNER.set("one-owner")
++    try:
++        record.register_provider_body_filter(lambda body: body)
++        try:
++            record.register_provider_body_filter(
++                lambda body: body,
++                phase=middleware.PROVIDER_BODY_FILTER_FINAL_GUARD,
++            )
++        except ValueError as exc:
++            assert "already registered" in str(exc)
++        else:  # pragma: no cover - defensive
++            raise AssertionError("one owner must not register twice")
++    finally:
++        middleware._CURRENT_MIDDLEWARE_OWNER.reset(owner_token)
++
++    assert record.provider_body_filter_owners == ("one-owner",)
++    assert record.provider_body_filter_phases == ("transform",)
++
++
++def test_provider_body_filter_exception_keeps_body_and_provider_available():
++    from agent import relay_llm
++
++    record = middleware.TransportRecord()
++    request = {"model": "test", "messages": []}
++    record.mark_middleware_verified(request)
++    owner_token = middleware._CURRENT_MIDDLEWARE_OWNER.set("broken")
++    try:
++        def broken_filter(_body):
++            raise RuntimeError("boom")
++
++        record.register_provider_body_filter(broken_filter)
++    finally:
++        middleware._CURRENT_MIDDLEWARE_OWNER.reset(owner_token)
++    provider_calls = []
++
++    with middleware.transport_record_scope(record):
++        result = relay_llm.call_provider_body(
++            lambda **body: provider_calls.append(body) or "ok",
++            request,
++        )
++    record.settle()
++
++    assert result == "ok"
++    assert provider_calls == [request]
++    assert record.provider_body == request
++    assert record.ambiguous is True
++    assert record.settled is False
++
++
+ def test_transport_context_isolated_across_concurrent_sessions():
+     from agent import relay_llm
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,1938 @@
+From 81f8fa21167b1fcd3929b27ee172b6cf7a94ec21 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 03:07:49 +0800
+Subject: [PATCH] feat(middleware): expose provider transport truth
+
+---
+ agent/anthropic_adapter.py                    |   6 +-
+ agent/chat_completion_helpers.py              |  34 +-
+ agent/codex_runtime.py                        |   5 +-
+ agent/conversation_loop.py                    |  91 ++-
+ agent/relay_llm.py                            |  67 +-
+ hermes_cli/middleware.py                      | 159 ++++-
+ .../test_bedrock_interrupt_post_worker.py     |  25 +-
+ tests/agent/test_codex_responses_adapter.py   |  46 +-
+ tests/agent/test_relay_llm.py                 | 271 +++++++-
+ tests/agent/test_transport_truth.py           | 599 ++++++++++++++++++
+ tests/test_middleware.py                      | 316 +++++++++
+ 11 files changed, 1547 insertions(+), 72 deletions(-)
+ create mode 100644 tests/agent/test_transport_truth.py
+
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index ce311fa..6a4393e 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -3239,6 +3239,8 @@ def create_anthropic_message(
+     in particular. Only fires on the streaming path, which is the one the main
+     turn loop takes.
+     """
++    from agent import relay_llm
++
+     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
+ 
+     messages_api = getattr(client, "messages", None)
+@@ -3247,7 +3249,7 @@ def create_anthropic_message(
+         stream_kwargs = dict(api_kwargs)
+         stream_kwargs.pop("stream", None)
+         try:
+-            with stream_fn(**stream_kwargs) as stream:
++            with relay_llm.call_provider_body(stream_fn, stream_kwargs) as stream:
+                 if callable(on_response):
+                     try:
+                         on_response(getattr(stream, "response", None))
+@@ -3281,4 +3283,4 @@ def create_anthropic_message(
+ 
+     create_kwargs = dict(api_kwargs)
+     create_kwargs.pop("stream", None)
+-    return messages_api.create(**create_kwargs)
++    return relay_llm.call_provider_body(messages_api.create, create_kwargs)
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 7af486d..b034c1d 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -939,6 +939,8 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+     interrupt, abort, cancellation, and close semantics stay in the callers —
+     this helper only issues the request.
+     """
++    from agent import relay_llm
++
+     if agent.api_mode == "codex_responses":
+         request_client = make_client("codex_stream_request")
+         return agent._run_codex_stream(
+@@ -969,7 +971,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+         api_kwargs.pop("__bedrock_converse__", None)
+         client = _get_bedrock_runtime_client(region)
+         try:
+-            raw_response = client.converse(**api_kwargs)
++            raw_response = relay_llm.call_provider_body(client.converse, api_kwargs)
+         except Exception as _bedrock_exc:
+             # Evict the cached client on stale-connection failures
+             # so the outer retry loop builds a fresh client/pool.
+@@ -994,9 +996,15 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+         _completions = getattr(getattr(agent.client, "chat", None), "completions", None)
+         if not callable(getattr(_completions, "prepare", None)):
+             api_kwargs.pop("_moa_prepared_request", None)
+-        return agent.client.chat.completions.create(**api_kwargs)
++        return relay_llm.call_provider_body(
++            agent.client.chat.completions.create,
++            api_kwargs,
++        )
+     request_client = make_client("chat_completion_request")
+-    return request_client.chat.completions.create(**api_kwargs)
++    return relay_llm.call_provider_body(
++        request_client.chat.completions.create,
++        api_kwargs,
++    )
+ 
+ 
+ def should_use_direct_api_call(agent) -> bool:
+@@ -3408,7 +3416,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                     final_kwargs.pop("__bedrock_converse__", None)
+                     client = _get_bedrock_runtime_client(region)
+                     try:
+-                        raw_response = client.converse_stream(**final_kwargs)
++                        raw_response = relay_llm.call_provider_body(
++                            client.converse_stream,
++                            final_kwargs,
++                        )
+                     except Exception as _bedrock_exc:
+                         # InvokeModel-only policies cannot open a stream. Keep
+                         # the fallback inside the same managed Relay attempt so
+@@ -3427,7 +3438,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                                 type(_bedrock_exc).__name__,
+                             )
+                             return normalize_converse_response(
+-                                client.converse(**final_kwargs)
++                                relay_llm.call_provider_body(
++                                    client.converse,
++                                    final_kwargs,
++                                )
+                             )
+                         if is_stale_connection_error(_bedrock_exc):
+                             invalidate_runtime_client(region)
+@@ -3927,7 +3941,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+             attempt_request_client["value"] = request_client
+             last_chunk_time["t"] = time.time()
+             agent._touch_activity("waiting for provider response (streaming)")
+-            return request_client.chat.completions.create(**stream_kwargs)
++            return relay_llm.call_provider_body(
++                request_client.chat.completions.create,
++                stream_kwargs,
++            )
+ 
+         def _stream_created(raw_stream: Any) -> None:
+             response = getattr(raw_stream, "response", None)
+@@ -4509,7 +4526,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                 final_kwargs,
+                 log_prefix=getattr(agent, "log_prefix", ""),
+             )
+-            manager = request_client.messages.stream(**final_kwargs)
++            manager = relay_llm.call_provider_body(
++                request_client.messages.stream,
++                final_kwargs,
++            )
+             _stream_context["manager"] = manager
+             return manager.__enter__()
+ 
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index 6c8a811..8a4ee43 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -1408,7 +1408,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+                 next_api_kwargs,
+             )
+             stream_kwargs["stream"] = True
+-            return active_client.responses.create(**stream_kwargs)
++            return relay_llm.call_provider_body(
++                active_client.responses.create,
++                stream_kwargs,
++            )
+ 
+         def _codex_stream_created(_raw_stream: Any) -> None:
+             # Claim the delta sink for THIS physical attempt. A newer attempt
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 3d7f07e..1a6cbfe 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -3085,42 +3085,60 @@ def run_conversation(
+                     if isinstance(getattr(agent, "client", None), Mock):
+                         _use_streaming = False
+ 
++                from hermes_cli.middleware import (
++                    TRANSPORT_SCHEMA_VERSION,
++                    TransportRecord,
++                    run_llm_execution_middleware,
++                    transport_record_scope,
++                )
++
++                _transport_record = TransportRecord()
++
+                 def _perform_api_call(next_api_kwargs):
+-                    if agent.api_mode == "codex_responses":
+-                        next_api_kwargs = agent._get_transport().preflight_kwargs(
+-                            next_api_kwargs,
+-                            allow_stream=False,
+-                            is_github_responses=agent._is_copilot_url(),
+-                            sanitize_harmony_tokens=agent._is_codex_backend(),
+-                        )
+-                    if _use_streaming:
+-                        return agent._interruptible_streaming_api_call(
+-                            next_api_kwargs, on_first_delta=_stop_spinner
+-                        )
+-                    from agent import relay_llm
+-
+-                    return relay_llm.execute(
+-                        next_api_kwargs,
+-                        agent._interruptible_api_call,
+-                        session_id=str(agent.session_id or ""),
+-                        name=str(agent.provider or "provider"),
+-                        model_name=str(agent.model or ""),
+-                        metadata={
+-                            "api_mode": agent.api_mode,
+-                            "api_request_id": api_request_id,
+-                            "call_role": (
+-                                "delegated"
+-                                if getattr(agent, "is_subagent", False)
+-                                else "fallback"
+-                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+-                                else "primary"
+-                            ),
+-                            "retry_count": retry_count,
+-                        },
+-                        defer_logical_completion=True,
+-                    )
++                    _transport_record.mark_middleware_verified(next_api_kwargs)
++                    with transport_record_scope(_transport_record):
++                        if agent.api_mode == "codex_responses":
++                            next_api_kwargs = agent._get_transport().preflight_kwargs(
++                                next_api_kwargs,
++                                allow_stream=False,
++                                is_github_responses=agent._is_copilot_url(),
++                                sanitize_harmony_tokens=agent._is_codex_backend(),
++                            )
++                        if _use_streaming:
++                            from agent.chat_completion_helpers import (
++                                should_use_direct_api_call,
++                            )
++
++                            if should_use_direct_api_call(agent):
++                                return agent._interruptible_streaming_api_call(
++                                    next_api_kwargs,
++                                    on_first_delta=_stop_spinner,
++                                )
++                            return agent._interruptible_streaming_api_call(
++                                next_api_kwargs, on_first_delta=_stop_spinner
++                            )
++                        from agent import relay_llm
+ 
+-                from hermes_cli.middleware import run_llm_execution_middleware
++                        return relay_llm.execute(
++                            next_api_kwargs,
++                            agent._interruptible_api_call,
++                            session_id=str(agent.session_id or ""),
++                            name=str(agent.provider or "provider"),
++                            model_name=str(agent.model or ""),
++                            metadata={
++                                "api_mode": agent.api_mode,
++                                "api_request_id": api_request_id,
++                                "call_role": (
++                                    "delegated"
++                                    if getattr(agent, "is_subagent", False)
++                                    else "fallback"
++                                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
++                                    else "primary"
++                                ),
++                                "retry_count": retry_count,
++                            },
++                            defer_logical_completion=True,
++                        )
+ 
+                 _model_request_active = getattr(agent, "_model_request_active", None)
+                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
+@@ -3147,7 +3165,10 @@ def run_conversation(
+                         api_mode=agent.api_mode,
+                         api_call_count=api_call_count,
+                         middleware_trace=list(_llm_middleware_trace),
++                        transport_record=_transport_record,
++                        transport_schema_version=TRANSPORT_SCHEMA_VERSION,
+                     )
++                    _transport_record.settle()
+                 finally:
+                     if _redirect_lock is not None:
+                         with _redirect_lock:
+@@ -6698,6 +6719,8 @@ def run_conversation(
+                         assistant_content_chars=len(_assistant_text),
+                         assistant_tool_call_count=len(_assistant_tool_calls),
+                         moa_references=_moa_reference_metrics_for_hook(agent),
++                        transport_record=_transport_record,
++                        transport_schema_version=TRANSPORT_SCHEMA_VERSION,
+                     )
+             except Exception:
+                 pass
+diff --git a/agent/relay_llm.py b/agent/relay_llm.py
+index 2d8c37a..2d5c537 100644
+--- a/agent/relay_llm.py
++++ b/agent/relay_llm.py
+@@ -7,6 +7,7 @@ import contextvars
+ import inspect
+ import json
+ import logging
++from contextlib import contextmanager
+ from collections.abc import Callable, Iterator
+ from dataclasses import dataclass
+ from types import SimpleNamespace
+@@ -23,6 +24,45 @@ _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(
+ _RELAY_INTERNAL_PROVIDER_HEADERS = frozenset(
+     {"x-dynamo-parent-session-id", "x-dynamo-session-id"}
+ )
++
++
++def _capture_provider_body(body: dict[str, Any]) -> None:
++    from hermes_cli.middleware import current_transport_record
++
++    record = current_transport_record()
++    if record is not None:
++        record.capture_provider_body(body)
++
++
++@contextmanager
++def provider_body_scope(body: dict[str, Any]) -> Iterator[None]:
++    """Capture final SDK JSON kwargs, then hide the record from nested calls."""
++
++    provider_body = {key: value for key, value in body.items() if key != "timeout"}
++    _capture_provider_body(provider_body)
++    from hermes_cli.middleware import transport_record_scope
++
++    with transport_record_scope(None):
++        yield
++
++
++def call_provider_body(
++    callback: Callable[..., Any],
++    body: dict[str, Any],
++) -> Any:
++    """Invoke an SDK surface while recording only its JSON request body."""
++
++    with provider_body_scope(body):
++        return callback(**body)
++
++
++def _without_transport_record(callback: Callable[..., Any], *args: Any) -> Any:
++    from hermes_cli.middleware import transport_record_scope
++
++    with transport_record_scope(None):
++        return callback(*args)
++
++
+ @dataclass(frozen=True, slots=True)
+ class _RelayProtocol:
+     operation: str
+@@ -464,6 +504,16 @@ class ManagedLlmStream(Iterator[Any]):
+                 # Hermes-side callbacks run while the native pipeline drives
+                 # this stream; nested relay calls they make must bypass
+                 # managed execution (#77244).
++                def call() -> Any:
++                    with relay_runtime.managed_callback_guard():
++                        return callback(*args)
++
++                return _without_transport_record(call)
++
++            return callback_context.copy().run(guarded)
++
++        def run_provider_factory(callback: Callable[..., Any], *args: Any) -> Any:
++            def guarded() -> Any:
+                 with relay_runtime.managed_callback_guard():
+                     return callback(*args)
+ 
+@@ -503,15 +553,16 @@ class ManagedLlmStream(Iterator[Any]):
+         async def provider_stream(next_request: Any):
+             raw_stream = None
+             try:
+-                raw_stream = run_callback(
++                final_request = _provider_request(
++                    request,
++                    next_request,
++                    relay_request_body=relay_request_body,
++                    codec_baseline_body=codec_baseline_body,
++                    metadata=metadata,
++                )
++                raw_stream = run_provider_factory(
+                     stream_factory,
+-                    _provider_request(
+-                        request,
+-                        next_request,
+-                        relay_request_body=relay_request_body,
+-                        codec_baseline_body=codec_baseline_body,
+-                        metadata=metadata,
+-                    )
++                    final_request,
+                 )
+                 if (
+                     completed_response_predicate is not None
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index 170e131..2ee4a74 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -7,15 +7,32 @@ contract helpers here so agent-loop call sites and plugins share one vocabulary.
+ 
+ from __future__ import annotations
+ 
++import inspect
+ import logging
++from contextlib import contextmanager
++from contextvars import ContextVar
+ from copy import deepcopy
+ from dataclasses import dataclass, field
+-from typing import Any, Callable, Dict, List
++from threading import Lock
++from typing import Any, Callable, Dict, Iterator, List
+ 
+ logger = logging.getLogger(__name__)
+ 
+ OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
+ MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v2"
++TRANSPORT_SCHEMA_VERSION = "hermes.transport.v1"
++
++_TRANSPORT_PRIVATE_KEYS = frozenset(
++    {
++        "_moa_prepared_request",
++        "__bedrock_region__",
++        "__bedrock_converse__",
++    }
++)
++_CURRENT_TRANSPORT_RECORD: ContextVar["TransportRecord | None"] = ContextVar(
++    "hermes_transport_record",
++    default=None,
++)
+ 
+ TOOL_REQUEST_MIDDLEWARE = "tool_request"
+ TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
+@@ -44,6 +61,120 @@ class RequestMiddlewareResult:
+     trace: List[Dict[str, Any]] = field(default_factory=list)
+ 
+ 
++class TransportRecord:
++    """Process-private truth for one physical provider attempt."""
++
++    schema_version = TRANSPORT_SCHEMA_VERSION
++
++    def __init__(self) -> None:
++        self._lock = Lock()
++        self._middleware_verified_request: Dict[str, Any] | None = None
++        self._provider_body: Dict[str, Any] | None = None
++        self._capture_count = 0
++        self._ambiguous = False
++        self._settled = False
++
++    @property
++    def middleware_verified_request(self) -> Dict[str, Any] | None:
++        with self._lock:
++            return _safe_copy(self._middleware_verified_request)
++
++    @property
++    def provider_body(self) -> Dict[str, Any] | None:
++        with self._lock:
++            return _safe_copy(self._provider_body)
++
++    @property
++    def capture_count(self) -> int:
++        with self._lock:
++            return self._capture_count
++
++    @property
++    def ambiguous(self) -> bool:
++        with self._lock:
++            return self._ambiguous
++
++    @property
++    def settled(self) -> bool:
++        with self._lock:
++            return self._settled
++
++    def mark_middleware_verified(self, request: Any) -> None:
++        if isinstance(request, dict) and "_moa_prepared_request" in request:
++            with self._lock:
++                self._ambiguous = True
++                self._settled = False
++            return
++        snapshot = _transport_snapshot(request)
++        with self._lock:
++            if self._middleware_verified_request is not None or snapshot is None:
++                self._ambiguous = True
++                self._settled = False
++                return
++            self._middleware_verified_request = snapshot
++
++    def capture_provider_body(self, body: Any) -> None:
++        snapshot = _transport_snapshot(body)
++        with self._lock:
++            self._capture_count += 1
++            if self._capture_count != 1 or snapshot is None:
++                self._ambiguous = True
++                self._settled = False
++                return
++            self._provider_body = snapshot
++
++    def settle(self) -> None:
++        with self._lock:
++            self._settled = bool(
++                not self._ambiguous
++                and self._middleware_verified_request is not None
++                and self._provider_body is not None
++                and self._capture_count == 1
++            )
++
++
++def current_transport_record() -> TransportRecord | None:
++    return _CURRENT_TRANSPORT_RECORD.get()
++
++
++@contextmanager
++def transport_record_scope(record: TransportRecord | None) -> Iterator[None]:
++    token = _CURRENT_TRANSPORT_RECORD.set(record)
++    try:
++        yield
++    finally:
++        _CURRENT_TRANSPORT_RECORD.reset(token)
++
++
++def _transport_snapshot(request: Any) -> Dict[str, Any] | None:
++    if not isinstance(request, dict):
++        return None
++    try:
++        stripped = {
++            key: value
++            for key, value in request.items()
++            if key not in _TRANSPORT_PRIVATE_KEYS
++        }
++        if not _transport_value_supported(stripped):
++            return None
++        return deepcopy(stripped)
++    except Exception:
++        return None
++
++
++def _transport_value_supported(value: Any) -> bool:
++    if value is None or isinstance(value, (bool, int, float, str, bytes)):
++        return True
++    if isinstance(value, dict):
++        return all(
++            isinstance(key, str) and _transport_value_supported(item)
++            for key, item in value.items()
++        )
++    if isinstance(value, (list, tuple)):
++        return all(_transport_value_supported(item) for item in value)
++    return False
++
++
+ def observer_payload(**kwargs: Any) -> Dict[str, Any]:
+     kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+     return kwargs
+@@ -181,6 +312,8 @@ def run_llm_execution_middleware(
+     **context: Any,
+ ) -> Any:
+     """Run provider execution through registered LLM execution middleware."""
++    if context.get("transport_record") is not None:
++        context.setdefault("transport_schema_version", TRANSPORT_SCHEMA_VERSION)
+     callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
+     if not callbacks:
+         return next_call(request)
+@@ -325,7 +458,7 @@ def _run_execution_chain(
+         call_kwargs[payload_key] = payload
+         call_kwargs["next_call"] = next_call
+         try:
+-            return callback(**call_kwargs)
++            return _invoke_execution_callback(callback, call_kwargs)
+         except _DownstreamExecutionError as exc:
+             raise exc.original
+         except Exception as exc:
+@@ -344,6 +477,28 @@ def _run_execution_chain(
+     return call_at(0, kwargs[payload_key])
+ 
+ 
++def _invoke_execution_callback(
++    callback: Callable[..., Any],
++    call_kwargs: Dict[str, Any],
++) -> Any:
++    """Hide additive transport kwargs from pre-H5 narrow callbacks."""
++
++    try:
++        parameters = inspect.signature(callback).parameters
++    except (TypeError, ValueError):
++        return callback(**call_kwargs)
++    if any(
++        parameter.kind is inspect.Parameter.VAR_KEYWORD
++        for parameter in parameters.values()
++    ):
++        return callback(**call_kwargs)
++    compatible = dict(call_kwargs)
++    for key in ("transport_record", "transport_schema_version"):
++        if key not in parameters:
++            compatible.pop(key, None)
++    return callback(**compatible)
++
++
+ def _trace_entry(result: Dict[str, Any]) -> Dict[str, Any]:
+     entry: Dict[str, Any] = {}
+     for key in ("source", "reason", "name"):
+diff --git a/tests/agent/test_bedrock_interrupt_post_worker.py b/tests/agent/test_bedrock_interrupt_post_worker.py
+index 5b46015..cec02b8 100644
+--- a/tests/agent/test_bedrock_interrupt_post_worker.py
++++ b/tests/agent/test_bedrock_interrupt_post_worker.py
+@@ -8,12 +8,17 @@ agent._interrupt_requested still True. Without a post-worker re-check in the
+ poll loop, interruptible_streaming_api_call would return that partial response
+ and silently swallow the /stop signal.
+ """
++import sys
++import types
+ from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+ import pytest
+ 
++sys.modules.setdefault("httpx", types.ModuleType("httpx"))
++
+ from agent import chat_completion_helpers as cch
++from hermes_cli.middleware import TransportRecord, transport_record_scope
+ 
+ 
+ class _FakeAgent:
+@@ -102,8 +107,10 @@ def test_bedrock_stream_returns_normally_when_not_interrupted():
+             self.closed = True
+ 
+     provider_stream = ProviderStream()
++    provider_calls = []
+     fake_client = SimpleNamespace(
+-        converse_stream=lambda **kw: {"stream": provider_stream}
++        converse_stream=lambda **kw: provider_calls.append(kw)
++        or {"stream": provider_stream}
+     )
+ 
+     with patch("agent.bedrock_adapter._get_bedrock_runtime_client", return_value=fake_client), \
+@@ -112,7 +119,19 @@ def test_bedrock_stream_returns_normally_when_not_interrupted():
+          patch("agent.bedrock_adapter.is_stale_connection_error", return_value=False), \
+          patch("agent.bedrock_adapter.is_streaming_access_denied_error", return_value=False), \
+          patch("agent.bedrock_adapter.invalidate_runtime_client", lambda *a, **k: None):
+-        api_kwargs = {"__bedrock_region__": "us-east-1", "__bedrock_converse__": True}
+-        out = cch.interruptible_streaming_api_call(agent, api_kwargs)
++        api_kwargs = {
++            "messages": [],
++            "__bedrock_region__": "us-east-1",
++            "__bedrock_converse__": True,
++        }
++        record = TransportRecord()
++        record.mark_middleware_verified(api_kwargs)
++        with transport_record_scope(record):
++            out = cch.interruptible_streaming_api_call(agent, api_kwargs)
++        record.settle()
+         assert out is resp
+         assert provider_stream.closed is True
++        assert provider_calls == [{"messages": []}]
++        assert record.provider_body == provider_calls[0]
++        assert record.capture_count == 1
++        assert record.settled is True
+diff --git a/tests/agent/test_codex_responses_adapter.py b/tests/agent/test_codex_responses_adapter.py
+index 1ee9440..f9f7e91 100644
+--- a/tests/agent/test_codex_responses_adapter.py
++++ b/tests/agent/test_codex_responses_adapter.py
+@@ -198,6 +198,50 @@ def test_codex_api_preflight_defangs_every_outbound_text_carrier():
+     assert "<|im_start|>" in serialized
+ 
+ 
++def test_transport_truth_keeps_middleware_proof_before_harmony_preflight(
++    monkeypatch,
++):
++    from agent import relay_llm, relay_runtime
++    from hermes_cli.middleware import TransportRecord, transport_record_scope
++
++    raw = {
++        "model": "gpt-5-codex",
++        "instructions": "Inspect " + _harmony_token("start"),
++        "input": [{"role": "user", "content": _HARMONY_SOURCE_SNIPPET}],
++        "store": False,
++    }
++    provider_requests = []
++    record = TransportRecord()
++    record.mark_middleware_verified(raw)
++    normalized = _preflight_codex_api_kwargs(
++        raw,
++        sanitize_harmony_tokens=True,
++    )
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++
++    with transport_record_scope(record):
++        relay_llm.execute(
++            normalized,
++            lambda request: relay_llm.call_provider_body(
++                lambda **body: provider_requests.append(body) or {"ok": True},
++                request,
++            ),
++            session_id="session-1",
++            name="codex",
++            model_name="gpt-5-codex",
++        )
++    record.settle()
++
++    assert _harmony_token("start") in str(record.middleware_verified_request)
++    assert _harmony_token("start") not in str(record.provider_body)
++    assert record.provider_body == provider_requests[0] == normalized
++    assert record.settled is True
++
++
+ def test_normalize_codex_response_treats_summary_only_reasoning_as_incomplete():
+     """Summary-only reasoning keeps the continuation path for Codex backends.
+ 
+@@ -486,4 +530,4 @@ def _xai_reasoning_only_response(reasoning_text):
+                 summary=[SimpleNamespace(text=reasoning_text)],
+             )
+         ],
+-    )
+\ No newline at end of file
++    )
+diff --git a/tests/agent/test_relay_llm.py b/tests/agent/test_relay_llm.py
+index f091fb1..2bc70b8 100644
+--- a/tests/agent/test_relay_llm.py
++++ b/tests/agent/test_relay_llm.py
+@@ -13,6 +13,7 @@ import pytest
+ pytest.importorskip("nemo_relay")
+ 
+ from agent import relay_llm, relay_runtime
++from hermes_cli.middleware import TransportRecord, transport_record_scope
+ 
+ 
+ @pytest.fixture()
+@@ -85,6 +86,113 @@ def test_unintercepted_provider_callback_preserves_client_timeout(
+     assert provider_requests[0]["timeout"] == 1800.0
+ 
+ 
++def test_unmanaged_nonstream_captures_final_sdk_body_without_timeout(monkeypatch):
++    record = TransportRecord()
++    request = {
++        "model": "test-model",
++        "messages": [],
++        "payload": b"wire",
++        "timeout": 1800.0,
++    }
++    provider_calls = []
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++
++    record.mark_middleware_verified(request)
++    with transport_record_scope(record):
++        result = relay_llm.execute(
++            request,
++            lambda final: relay_llm.call_provider_body(
++                lambda **body: provider_calls.append(body) or {"content": "done"},
++                final,
++            ),
++            session_id="session-1",
++            name="custom",
++            model_name="test-model",
++        )
++    record.settle()
++
++    assert result == {"content": "done"}
++    assert provider_calls == [request]
++    assert record.provider_body == {
++        key: value for key, value in request.items() if key != "timeout"
++    }
++    assert record.settled is True
++
++
++@pytest.mark.asyncio
++async def test_unmanaged_async_preserves_record_until_final_provider(monkeypatch):
++    record = TransportRecord()
++    request = {"model": "test-model", "input": "hello", "timeout": 1800.0}
++    provider_calls = []
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++
++    async def provider(final):
++        with relay_llm.provider_body_scope(final):
++            await asyncio.sleep(0)
++            provider_calls.append(final)
++            return {"content": "done"}
++
++    record.mark_middleware_verified(request)
++    with transport_record_scope(record):
++        result = await relay_llm.execute_async(
++            request,
++            provider,
++            session_id="session-1",
++            name="custom",
++            model_name="test-model",
++        )
++    record.settle()
++
++    assert result == {"content": "done"}
++    assert provider_calls == [request]
++    assert record.provider_body == {
++        key: value for key, value in request.items() if key != "timeout"
++    }
++    assert record.settled is True
++
++
++def test_unmanaged_stream_captures_final_factory_body(monkeypatch):
++    record = TransportRecord()
++    request = {"model": "test-model", "messages": []}
++    factory_calls = []
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++
++    def factory(final):
++        factory_calls.append(final)
++        provider_body = {**final, "stream": True}
++        with relay_llm.provider_body_scope(provider_body):
++            return iter([{"delta": "ok"}])
++
++    record.mark_middleware_verified(request)
++    with transport_record_scope(record):
++        stream = relay_llm.stream(
++            request,
++            factory,
++            session_id="session-1",
++            name="custom",
++            model_name="test-model",
++            finalizer=lambda: {"content": "done"},
++        )
++        assert list(stream) == [{"delta": "ok"}]
++    record.settle()
++
++    assert factory_calls == [request]
++    assert record.provider_body == {**request, "stream": True}
++    assert record.settled is True
++
++
+ def test_sync_execution_uses_canonical_relay_operation_name(relay_turn, monkeypatch):
+     relay, _turn = relay_turn
+     observed_names = []
+@@ -259,6 +367,132 @@ def test_provider_request_overlays_interceptor_added_extra_body():
+     assert provider_request["extra_body"] == {"prompt_cache_retention": "24h"}
+ 
+ 
++def test_managed_nonstream_captures_relay_rewritten_final_sdk_body(
++    relay_turn, monkeypatch
++):
++    relay, _turn = relay_turn
++    original = {
++        "model": "test-model",
++        "messages": [
++            {"role": "user", "content": "hello\n\n<global-hot>old</global-hot>"}
++        ],
++        "temperature": 1.0,
++        "timeout": 1800.0,
++    }
++    provider_requests = []
++    record = TransportRecord()
++
++    def rewrite_request(name, request, annotated):
++        del name
++        content = dict(request.content)
++        content["messages"] = [{"role": "user", "content": "hello"}]
++        content["temperature"] = 0.25
++        return relay.LLMRequestInterceptOutcome(
++            relay.LLMRequest(request.headers, content),
++            annotated,
++        )
++
++    relay.intercepts.register_llm_request(
++        "hermes-transport-truth-request",
++        1,
++        False,
++        rewrite_request,
++    )
++    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
++    try:
++        record.mark_middleware_verified(original)
++        with transport_record_scope(record):
++            result = relay_llm.execute(
++                original,
++                lambda final: relay_llm.call_provider_body(
++                    lambda **body: provider_requests.append(body)
++                    or {"content": "done"},
++                    final,
++                ),
++                session_id="session-1",
++                name="custom",
++                model_name="test-model",
++                metadata={"api_mode": "chat_completions"},
++            )
++        record.settle()
++    finally:
++        relay.intercepts.deregister_llm_request(
++            "hermes-transport-truth-request"
++        )
++
++    assert result == {"content": "done"}
++    assert provider_requests == [
++        {
++            "model": "test-model",
++            "messages": [{"role": "user", "content": "hello"}],
++            "temperature": 0.25,
++            "timeout": 1800.0,
++        }
++    ]
++    assert record.middleware_verified_request == original
++    assert record.provider_body == {
++        key: value
++        for key, value in provider_requests[0].items()
++        if key != "timeout"
++    }
++    assert record.settled is True
++
++
++def test_managed_stream_captures_final_factory_body_after_relay_rewrite(
++    relay_turn, monkeypatch
++):
++    relay, _turn = relay_turn
++    original = {"model": "test-model", "messages": [], "temperature": 1.0}
++    factory_requests = []
++    record = TransportRecord()
++
++    def rewrite_request(name, request, annotated):
++        del name
++        content = {**request.content, "temperature": 0.5}
++        return relay.LLMRequestInterceptOutcome(
++            relay.LLMRequest(request.headers, content),
++            annotated,
++        )
++
++    relay.intercepts.register_llm_request(
++        "hermes-transport-truth-stream",
++        1,
++        False,
++        rewrite_request,
++    )
++    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
++    try:
++        record.mark_middleware_verified(original)
++        with transport_record_scope(record):
++            def factory(final):
++                factory_requests.append(final)
++                provider_body = {**final, "stream": True}
++                with relay_llm.provider_body_scope(provider_body):
++                    return iter([{"delta": "done"}])
++
++            stream = relay_llm.stream(
++                original,
++                factory,
++                session_id="session-1",
++                name="custom",
++                model_name="test-model",
++                finalizer=lambda: {"content": "done"},
++                metadata={"api_mode": "chat_completions"},
++            )
++            assert list(stream) == [{"delta": "done"}]
++        record.settle()
++    finally:
++        relay.intercepts.deregister_llm_request(
++            "hermes-transport-truth-stream"
++        )
++
++    assert factory_requests == [
++        {"model": "test-model", "messages": [], "temperature": 0.5}
++    ]
++    assert record.provider_body == {**factory_requests[0], "stream": True}
++    assert record.settled is True
++
++
+ def test_stream_uses_rewritten_request_and_post_intercept_chunks(relay_turn):
+     relay, turn = relay_turn
+     captured_requests = []
+@@ -466,22 +700,31 @@ async def test_async_provider_callback_preserves_caller_context(relay_turn):
+     caller_value.set("caller")
+ 
+     async def provider(_request):
+-        await asyncio.sleep(0)
+-        return {"caller_value": caller_value.get()}
+-
+-    result = await relay_llm.execute_async(
+-        {"model": "test-model", "messages": []},
+-        provider,
+-        session_id="session-1",
+-        name="test-provider",
+-        model_name="test-model",
+-        metadata={
+-            "api_mode": "custom",
+-            "api_request_id": "request-async-context",
+-        },
+-    )
++        with relay_llm.provider_body_scope(_request):
++            await asyncio.sleep(0)
++            return {"caller_value": caller_value.get()}
++
++    request = {"model": "test-model", "messages": []}
++    record = TransportRecord()
++    record.mark_middleware_verified(request)
++    with transport_record_scope(record):
++        result = await relay_llm.execute_async(
++            request,
++            provider,
++            session_id="session-1",
++            name="test-provider",
++            model_name="test-model",
++            metadata={
++                "api_mode": "custom",
++                "api_request_id": "request-async-context",
++            },
++        )
++    record.settle()
+ 
+     assert result == {"caller_value": "caller"}
++    assert record.provider_body == request
++    assert record.capture_count == 1
++    assert record.settled is True
+ 
+ 
+ 
+diff --git a/tests/agent/test_transport_truth.py b/tests/agent/test_transport_truth.py
+new file mode 100644
+index 0000000..03b8fe9
+--- /dev/null
++++ b/tests/agent/test_transport_truth.py
+@@ -0,0 +1,599 @@
++"""Vertical transport-truth coverage through the real conversation loop."""
++
++from __future__ import annotations
++
++import sys
++from types import ModuleType
++from types import SimpleNamespace
++
++from agent import relay_llm, relay_runtime
++from hermes_cli import lifecycle, middleware, plugins
++from run_agent import AIAgent
++
++
++def _response(text: str = "done") -> SimpleNamespace:
++    return SimpleNamespace(
++        id="response-1",
++        model="test-model",
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(
++                    role="assistant",
++                    content=text,
++                    tool_calls=None,
++                ),
++                finish_reason="stop",
++            )
++        ],
++        usage=SimpleNamespace(
++            prompt_tokens=1,
++            completion_tokens=1,
++            total_tokens=2,
++        ),
++    )
++
++
++def _agent(monkeypatch) -> AIAgent:
++    from agent import context_compressor, model_metadata
++
++    monkeypatch.setattr(
++        AIAgent,
++        "_create_openai_client",
++        lambda *_args, **_kwargs: SimpleNamespace(),
++    )
++    monkeypatch.setattr(
++        model_metadata,
++        "get_model_context_length",
++        lambda *_args, **_kwargs: 128_000,
++    )
++    monkeypatch.setattr(
++        context_compressor,
++        "get_model_context_length",
++        lambda *_args, **_kwargs: 128_000,
++    )
++    agent = AIAgent(
++        api_key="test-key",
++        base_url="http://127.0.0.1:1/v1",
++        provider="openai-compat",
++        model="test-model",
++        max_iterations=1,
++        enabled_toolsets=[],
++        quiet_mode=True,
++        skip_context_files=True,
++        skip_memory=True,
++        save_trajectories=False,
++        platform="subagent",
++    )
++    agent._api_max_retries = 1
++    agent._build_api_kwargs = lambda messages: {
++        "model": agent.model,
++        "messages": messages,
++    }
++    agent._try_recover_primary_transport = lambda *_args, **_kwargs: False
++    agent._try_activate_fallback = lambda *_args, **_kwargs: False
++    agent._has_pending_fallback = lambda: False
++    monkeypatch.setitem(sys.modules, "httpx", ModuleType("httpx"))
++    return agent
++
++
++def _install_callbacks(monkeypatch, execution_callback, post_callback):
++    monkeypatch.setattr(
++        middleware,
++        "_get_middleware_callbacks",
++        lambda kind: [execution_callback]
++        if kind == middleware.LLM_EXECUTION_MIDDLEWARE
++        else [],
++    )
++    monkeypatch.setattr(
++        middleware,
++        "_has_middleware",
++        lambda kind: kind == middleware.LLM_EXECUTION_MIDDLEWARE,
++    )
++    monkeypatch.setattr(
++        lifecycle,
++        "has_hook",
++        lambda name: name == "post_api_request",
++    )
++    monkeypatch.setattr(
++        lifecycle,
++        "invoke_hook",
++        lambda name, **kwargs: post_callback(
++            telemetry_schema_version="hermes.observer.v1",
++            **kwargs,
++        )
++        if name == "post_api_request"
++        else [],
++    )
++    monkeypatch.setattr(plugins, "invoke_hook", lambda *_args, **_kwargs: [])
++
++
++def test_direct_stream_fallback_settles_only_before_post_and_calls_provider_once(
++    monkeypatch,
++):
++    agent = _agent(monkeypatch)
++    provider_requests = []
++    execution_observations = []
++    post_observations = []
++
++    def provider(request, *, on_first_delta=None):
++        del on_first_delta
++        with relay_llm.provider_body_scope(request):
++            provider_requests.append(request)
++            return _response()
++
++    def execution(
++        *,
++        request,
++        next_call,
++        middleware_schema_version,
++        transport_schema_version,
++        transport_record,
++        **_kwargs,
++    ):
++        result = next_call(request)
++        execution_observations.append(
++            (
++                middleware_schema_version,
++                transport_schema_version,
++                transport_record,
++                transport_record.provider_body,
++                transport_record.settled,
++            )
++        )
++        return result
++
++    def post(
++        *,
++        transport_schema_version,
++        transport_record,
++        telemetry_schema_version=None,
++        **_kwargs,
++    ):
++        post_observations.append(
++            (
++                transport_schema_version,
++                transport_record,
++                transport_record.provider_body,
++                transport_record.settled,
++                telemetry_schema_version,
++            )
++        )
++
++    _install_callbacks(monkeypatch, execution, post)
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++    agent._interruptible_streaming_api_call = provider
++
++    result = agent.run_conversation(
++        "hello",
++        conversation_history=[],
++        task_id="task-transport",
++    )
++
++    assert result["final_response"] == "done"
++    assert len(provider_requests) == 1
++    assert len(execution_observations) == 1
++    assert len(post_observations) == 1
++    execution_schema, transport_schema, execution_record, captured, settled = (
++        execution_observations[0]
++    )
++    assert execution_schema == "hermes.middleware.v2"
++    assert transport_schema == "hermes.transport.v1"
++    assert captured == provider_requests[0]
++    assert settled is False
++    assert post_observations[0] == (
++        "hermes.transport.v1",
++        execution_record,
++        provider_requests[0],
++        True,
++        "hermes.observer.v1",
++    )
++
++
++def test_provider_error_never_settles_or_fires_post(monkeypatch):
++    agent = _agent(monkeypatch)
++    execution_records = []
++    post_records = []
++    provider_calls = []
++
++    def provider(request, *, on_first_delta=None):
++        del on_first_delta
++        with relay_llm.provider_body_scope(request):
++            provider_calls.append(request)
++            raise RuntimeError("provider failed")
++
++    def execution(*, request, next_call, transport_record, **_kwargs):
++        execution_records.append(transport_record)
++        return next_call(request)
++
++    _install_callbacks(
++        monkeypatch,
++        execution,
++        lambda **kwargs: post_records.append(kwargs["transport_record"]),
++    )
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++    agent._interruptible_streaming_api_call = provider
++
++    result = agent.run_conversation(
++        "hello",
++        conversation_history=[],
++        task_id="task-transport-error",
++    )
++
++    assert result["completed"] is False
++    assert len(provider_calls) == 1
++    assert len(execution_records) == 1
++    assert execution_records[0].provider_body == provider_calls[0]
++    assert execution_records[0].settled is False
++    assert post_records == []
++
++
++def test_disable_streaming_records_final_openai_sdk_body_without_timeout(
++    monkeypatch,
++):
++    agent = _agent(monkeypatch)
++    agent.platform = "cli"
++    agent._disable_streaming = True
++    agent._compute_non_stream_stale_timeout = lambda _request: float("inf")
++    agent._build_api_kwargs = lambda messages: {
++        "model": agent.model,
++        "messages": messages,
++        "timeout": 1800.0,
++    }
++    sdk_calls = []
++    execution_records = []
++    client = SimpleNamespace(
++        chat=SimpleNamespace(
++            completions=SimpleNamespace(
++                create=lambda **kwargs: sdk_calls.append(kwargs) or _response()
++            )
++        )
++    )
++    agent._create_request_openai_client = lambda **_kwargs: client
++    agent._close_request_openai_client = lambda *_args, **_kwargs: None
++    agent._abort_request_openai_client = lambda *_args, **_kwargs: None
++
++    def execution(*, request, next_call, transport_record, **_kwargs):
++        result = next_call(request)
++        execution_records.append(transport_record)
++        return result
++
++    _install_callbacks(monkeypatch, execution, lambda **_kwargs: None)
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++
++    result = agent.run_conversation(
++        "hello",
++        conversation_history=[],
++        task_id="task-nonstream-transport",
++    )
++
++    assert result["final_response"] == "done"
++    assert len(sdk_calls) == 1
++    assert len(execution_records) == 1
++    assert sdk_calls[0]["timeout"] == 1800.0
++    assert execution_records[0].provider_body == {
++        key: value for key, value in sdk_calls[0].items() if key != "timeout"
++    }
++    assert execution_records[0].capture_count == 1
++    assert execution_records[0].settled is True
++
++
++def test_anthropic_nonstream_records_late_sanitized_sdk_body(monkeypatch):
++    from agent.anthropic_adapter import create_anthropic_message
++
++    sdk_calls = []
++    final_message = SimpleNamespace(content=[SimpleNamespace(type="text", text="done")])
++    client = SimpleNamespace(
++        messages=SimpleNamespace(
++            create=lambda **kwargs: sdk_calls.append(kwargs) or final_message,
++        )
++    )
++    request = {
++        "model": "claude-test",
++        "max_tokens": 128,
++        "messages": [{"role": "user", "content": "hello"}],
++        "instructions": "responses-only",
++        "input": [],
++        "store": True,
++        "parallel_tool_calls": True,
++        "timeout": 1800.0,
++    }
++    record = middleware.TransportRecord()
++    record.mark_middleware_verified(request)
++
++    with middleware.transport_record_scope(record):
++        result = create_anthropic_message(
++            client,
++            request,
++            prefer_stream=False,
++        )
++    record.settle()
++
++    assert result is final_message
++    assert len(sdk_calls) == 1
++    assert not {
++        "instructions",
++        "input",
++        "store",
++        "parallel_tool_calls",
++    }.intersection(sdk_calls[0])
++    assert sdk_calls[0]["timeout"] == 1800.0
++    assert record.provider_body == {
++        key: value for key, value in sdk_calls[0].items() if key != "timeout"
++    }
++    assert record.capture_count == 1
++    assert record.settled is True
++
++
++def test_bedrock_nonstream_records_final_converse_body(monkeypatch):
++    from agent import bedrock_adapter
++    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
++
++    sdk_calls = []
++    raw_response = {"output": {"message": {"role": "assistant", "content": []}}}
++    client = SimpleNamespace(
++        converse=lambda **kwargs: sdk_calls.append(kwargs) or raw_response,
++    )
++    monkeypatch.setattr(
++        bedrock_adapter,
++        "_get_bedrock_runtime_client",
++        lambda _region: client,
++    )
++    monkeypatch.setattr(
++        bedrock_adapter,
++        "normalize_converse_response",
++        lambda response: response,
++    )
++    request = {
++        "modelId": "anthropic.claude-test",
++        "messages": [],
++        "inferenceConfig": {"maxTokens": 128},
++        "__bedrock_region__": "us-east-1",
++        "__bedrock_converse__": True,
++    }
++    record = middleware.TransportRecord()
++    record.mark_middleware_verified(request)
++
++    with middleware.transport_record_scope(record):
++        result = _dispatch_nonstreaming_api_request(
++            SimpleNamespace(api_mode="bedrock_converse", provider="bedrock"),
++            dict(request),
++            make_client=lambda *_args, **_kwargs: None,
++        )
++    record.settle()
++
++    assert result is raw_response
++    assert sdk_calls == [
++        {
++            "modelId": "anthropic.claude-test",
++            "messages": [],
++            "inferenceConfig": {"maxTokens": 128},
++        }
++    ]
++    assert record.provider_body == sdk_calls[0]
++    assert record.capture_count == 1
++    assert record.settled is True
++
++
++def test_openai_stream_records_final_sdk_kwargs_not_client_timeout(monkeypatch):
++    from agent import chat_completion_helpers as cch
++
++    agent = _agent(monkeypatch)
++    agent.platform = "cli"
++    agent.api_mode = "chat_completions"
++    provider_calls = []
++
++    class Timeout:
++        def __init__(self, **kwargs):
++            self.kwargs = kwargs
++
++    class TransportError(Exception):
++        pass
++
++    httpx = ModuleType("httpx")
++    httpx.Timeout = Timeout
++    for name in (
++        "ReadTimeout",
++        "ConnectTimeout",
++        "PoolTimeout",
++        "ConnectError",
++        "RemoteProtocolError",
++    ):
++        setattr(httpx, name, TransportError)
++    monkeypatch.setitem(sys.modules, "httpx", httpx)
++    client = SimpleNamespace(
++        chat=SimpleNamespace(
++            completions=SimpleNamespace(
++                create=lambda **kwargs: provider_calls.append(kwargs)
++                or _response()
++            )
++        )
++    )
++    monkeypatch.setattr(
++        agent,
++        "_create_request_openai_client",
++        lambda **_kwargs: client,
++    )
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++    request = {"model": "test-model", "messages": []}
++    record = middleware.TransportRecord()
++    record.mark_middleware_verified(request)
++
++    with middleware.transport_record_scope(record):
++        response = cch.interruptible_streaming_api_call(agent, request)
++    record.settle()
++
++    assert response.choices[0].message.content == "done"
++    assert len(provider_calls) == 1
++    assert isinstance(provider_calls[0]["timeout"], Timeout)
++    assert provider_calls[0]["stream"] is True
++    assert provider_calls[0]["stream_options"] == {"include_usage": True}
++    assert record.provider_body == {
++        key: value for key, value in provider_calls[0].items() if key != "timeout"
++    }
++    assert record.capture_count == 1
++    assert record.settled is True
++
++
++def test_anthropic_stream_records_final_sanitized_sdk_kwargs(monkeypatch):
++    from agent import chat_completion_helpers as cch
++
++    agent = _agent(monkeypatch)
++    agent.platform = "cli"
++    agent.api_mode = "anthropic_messages"
++    agent.provider = "anthropic"
++    provider_calls = []
++    final_message = SimpleNamespace(
++        id="message-1",
++        model="claude-test",
++        content=[SimpleNamespace(type="text", text="done")],
++        stop_reason="end_turn",
++        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
++    )
++
++    class RawStream:
++        response = None
++
++        def __iter__(self):
++            return iter([SimpleNamespace(type="ping")])
++
++        def get_final_message(self):
++            return final_message
++
++        def close(self):
++            return None
++
++    class Manager:
++        def __init__(self):
++            self.stream = RawStream()
++
++        def __enter__(self):
++            return self.stream
++
++        def __exit__(self, *_args):
++            return None
++
++    def open_stream(**kwargs):
++        provider_calls.append(kwargs)
++        return Manager()
++
++    client = SimpleNamespace(messages=SimpleNamespace(stream=open_stream))
++    monkeypatch.setattr(
++        agent,
++        "_create_request_anthropic_client",
++        lambda **_kwargs: client,
++    )
++    monkeypatch.setattr(
++        agent,
++        "_close_request_anthropic_client",
++        lambda *_args, **_kwargs: None,
++    )
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++    request = {
++        "model": "claude-test",
++        "max_tokens": 128,
++        "messages": [{"role": "user", "content": "hello"}],
++    }
++    record = middleware.TransportRecord()
++    record.mark_middleware_verified(request)
++
++    with middleware.transport_record_scope(record):
++        response = cch.interruptible_streaming_api_call(agent, request)
++    record.settle()
++
++    assert response is final_message
++    assert provider_calls == [request]
++    assert record.provider_body == provider_calls[0]
++    assert record.capture_count == 1
++    assert record.settled is True
++
++
++def test_codex_stream_records_final_sanitized_responses_kwargs(monkeypatch):
++    class TransportError(Exception):
++        pass
++
++    httpx = ModuleType("httpx")
++    for name in ("RemoteProtocolError", "ReadTimeout", "ConnectError"):
++        setattr(httpx, name, TransportError)
++    monkeypatch.setitem(sys.modules, "httpx", httpx)
++    openai = ModuleType("openai")
++    openai.APIConnectionError = TransportError
++    monkeypatch.setitem(sys.modules, "openai", openai)
++
++    from agent import codex_runtime, relay_llm
++
++    class StopAfterSdkCall(RuntimeError):
++        pass
++
++    provider_calls = []
++    client = SimpleNamespace(
++        responses=SimpleNamespace(
++            create=lambda **kwargs: provider_calls.append(kwargs) or object()
++        )
++    )
++    agent = SimpleNamespace(
++        _interrupt_requested=False,
++        _current_api_request_id="request-id",
++        _fallback_index=0,
++        _is_codex_backend=lambda: True,
++        is_subagent=False,
++        model="gpt-5.6-sol",
++        provider="openai-codex",
++        session_id="session-1",
++    )
++
++    def stop_after_factory(request, factory, **_kwargs):
++        factory(request)
++        raise StopAfterSdkCall
++
++    monkeypatch.setattr(relay_llm, "stream", stop_after_factory)
++    request = {
++        "model": "gpt-5.6-sol",
++        "input": "hello",
++        "prompt_cache_retention": "24h",
++        "timeout": 1800.0,
++    }
++    record = middleware.TransportRecord()
++    record.mark_middleware_verified(request)
++
++    with middleware.transport_record_scope(record):
++        try:
++            codex_runtime.run_codex_stream(agent, request, client=client)
++        except StopAfterSdkCall:
++            pass
++        else:  # pragma: no cover - defensive
++            raise AssertionError("expected relay stop after SDK call")
++
++    assert provider_calls == [
++        {
++            "model": "gpt-5.6-sol",
++            "input": "hello",
++            "timeout": 1800.0,
++            "stream": True,
++        }
++    ]
++    assert record.provider_body == {
++        "model": "gpt-5.6-sol",
++        "input": "hello",
++        "stream": True,
++    }
++    assert record.capture_count == 1
+diff --git a/tests/test_middleware.py b/tests/test_middleware.py
+index 63f275f..40613b1 100644
+--- a/tests/test_middleware.py
++++ b/tests/test_middleware.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import asyncio
+ import copy
+ 
+ from hermes_cli import middleware
+@@ -210,3 +211,318 @@ def test_execution_chain_still_calls_each_wrapper_and_provider_once(monkeypatch)
+ 
+     assert result == {"first": True, "second": True}
+     assert calls == ["first", "second", "provider", "second-call-blocked"]
++
++
++def test_transport_record_preserves_bytes_and_strips_only_host_private_keys():
++    record = middleware.TransportRecord()
++    middleware_request = {
++        "messages": [{"role": "user", "content": b"before"}],
++        "__bedrock_region__": "us-east-1",
++        "__bedrock_converse__": True,
++    }
++    provider_body = {
++        "messages": [{"role": "user", "content": b"after"}],
++    }
++
++    record.mark_middleware_verified(middleware_request)
++    record.capture_provider_body(provider_body)
++    record.settle()
++
++    assert record.schema_version == "hermes.transport.v1"
++    assert record.middleware_verified_request == {
++        "messages": [{"role": "user", "content": b"before"}]
++    }
++    assert record.provider_body == {
++        "messages": [{"role": "user", "content": b"after"}]
++    }
++    assert record.capture_count == 1
++    assert record.settled is True
++    assert record.ambiguous is False
++
++    provider_body["messages"][0]["content"] = b"mutated"
++    assert record.provider_body["messages"][0]["content"] == b"after"
++
++
++def test_transport_record_rejects_private_objects_outside_explicit_boundary():
++    record = middleware.TransportRecord()
++    request = {"messages": [], "http_client": object()}
++
++    record.mark_middleware_verified(request)
++    record.capture_provider_body(request)
++    record.settle()
++
++    assert record.ambiguous is True
++    assert record.settled is False
++    assert record.middleware_verified_request is None
++    assert record.provider_body is None
++
++
++def test_transport_record_multiple_physical_captures_fail_closed():
++    record = middleware.TransportRecord()
++    request = {"messages": [{"role": "user", "content": "hello"}]}
++    record.mark_middleware_verified(request)
++    record.capture_provider_body(request)
++    record.settle()
++    assert record.settled is True
++
++    record.capture_provider_body(request)
++
++    assert record.capture_count == 2
++    assert record.ambiguous is True
++    assert record.settled is False
++
++
++def test_transport_capture_failure_never_blocks_provider(monkeypatch):
++    from agent import relay_llm, relay_runtime
++
++    record = middleware.TransportRecord()
++    request = {"messages": [], "private_client": object()}
++    provider_calls = []
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++    record.mark_middleware_verified(request)
++
++    with middleware.transport_record_scope(record):
++        first = relay_llm.execute(
++            request,
++            lambda final: relay_llm.call_provider_body(
++                lambda **body: provider_calls.append(body) or "first",
++                final,
++            ),
++            session_id="session-1",
++            name="custom",
++            model_name="test-model",
++        )
++        second = relay_llm.execute(
++            {"messages": []},
++            lambda final: relay_llm.call_provider_body(
++                lambda **body: provider_calls.append(body) or "second",
++                final,
++            ),
++            session_id="session-1",
++            name="custom",
++            model_name="test-model",
++        )
++    record.settle()
++
++    assert (first, second) == ("first", "second")
++    assert len(provider_calls) == 2
++    assert record.capture_count == 2
++    assert record.ambiguous is True
++    assert record.settled is False
++
++
++def test_moa_prepared_request_is_explicitly_unsupported_transport_truth(monkeypatch):
++    from agent import relay_llm, relay_runtime
++
++    record = middleware.TransportRecord()
++    outer = {
++        "messages": [],
++        "_moa_prepared_request": {"private": object()},
++    }
++    inner = {"messages": [{"role": "user", "content": "advisor"}]}
++    inner_calls = []
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++    record.mark_middleware_verified(outer)
++
++    def facade(**_request):
++        return relay_llm.execute(
++            inner,
++            lambda final: relay_llm.call_provider_body(
++                lambda **body: inner_calls.append(body) or "done",
++                final,
++            ),
++            session_id="session-1",
++            name="advisor",
++            model_name="advisor-model",
++        )
++
++    with middleware.transport_record_scope(record):
++        assert (
++            relay_llm.execute(
++                outer,
++                lambda final: relay_llm.call_provider_body(facade, final),
++                session_id="session-1",
++                name="moa",
++                model_name="preset",
++            )
++            == "done"
++        )
++    record.settle()
++
++    assert inner_calls == [inner]
++    assert record.capture_count == 1
++    assert record.provider_body == {"messages": []}
++    assert record.ambiguous is True
++    assert record.settled is False
++
++
++def test_execution_callback_receives_transport_record_and_schema(monkeypatch):
++    record = middleware.TransportRecord()
++    calls = []
++
++    def wrapper(
++        *,
++        request,
++        next_call,
++        middleware_schema_version,
++        transport_schema_version,
++        transport_record,
++        **_kwargs,
++    ):
++        calls.append(
++            (
++                middleware_schema_version,
++                transport_schema_version,
++                transport_record,
++            )
++        )
++        result = next_call(request)
++        assert transport_record.provider_body == request
++        assert transport_record.settled is False
++        return result
++
++    def provider(request):
++        calls.append("provider")
++        record.mark_middleware_verified(request)
++        with middleware.transport_record_scope(record):
++            from agent.relay_llm import _capture_provider_body
++
++            _capture_provider_body(request)
++        return "ok"
++
++    monkeypatch.setattr(
++        middleware,
++        "_get_middleware_callbacks",
++        lambda kind: [wrapper]
++        if kind == middleware.LLM_EXECUTION_MIDDLEWARE
++        else [],
++    )
++
++    assert (
++        middleware.run_llm_execution_middleware(
++            {"messages": []},
++            provider,
++            transport_record=record,
++        )
++        == "ok"
++    )
++    assert calls == [
++        ("hermes.middleware.v2", "hermes.transport.v1", record),
++        "provider",
++    ]
++
++
++def test_pre_transport_narrow_execution_callback_still_wraps_provider(monkeypatch):
++    calls = []
++
++    def narrow(
++        *,
++        request,
++        original_request,
++        next_call,
++        telemetry_schema_version,
++        middleware_schema_version,
++    ):
++        assert original_request == request
++        assert telemetry_schema_version == "hermes.observer.v1"
++        calls.append(("narrow", middleware_schema_version))
++        return next_call(request)
++
++    monkeypatch.setattr(
++        middleware,
++        "_get_middleware_callbacks",
++        lambda kind: [narrow]
++        if kind == middleware.LLM_EXECUTION_MIDDLEWARE
++        else [],
++    )
++    record = middleware.TransportRecord()
++
++    result = middleware.run_llm_execution_middleware(
++        {"messages": []},
++        lambda request: calls.append(("provider", request)) or "ok",
++        transport_record=record,
++    )
++
++    assert result == "ok"
++    assert calls == [
++        ("narrow", "hermes.middleware.v2"),
++        ("provider", {"messages": []}),
++    ]
++
++
++def test_provider_body_scope_strips_client_timeout_and_clears_nested_context():
++    from agent import relay_llm
++
++    record = middleware.TransportRecord()
++    request = {"messages": [{"role": "user", "content": b"hello"}]}
++    body = {**request, "stream": True, "timeout": object()}
++    record.mark_middleware_verified(request)
++
++    with middleware.transport_record_scope(record):
++        with relay_llm.provider_body_scope(body):
++            assert middleware.current_transport_record() is None
++    record.settle()
++
++    assert record.provider_body == {**request, "stream": True}
++    assert record.settled is True
++
++
++def test_transport_context_isolated_across_concurrent_sessions():
++    from agent import relay_llm
++
++    async def capture(session_id):
++        record = middleware.TransportRecord()
++        request = {"messages": [{"role": "user", "content": session_id}]}
++        record.mark_middleware_verified(request)
++        with middleware.transport_record_scope(record):
++            await asyncio.sleep(0)
++            with relay_llm.provider_body_scope(request):
++                await asyncio.sleep(0)
++        record.settle()
++        return record
++
++    async def run():
++        return await asyncio.gather(capture("one"), capture("two"))
++
++    first, second = asyncio.run(run())
++
++    assert first.provider_body["messages"][0]["content"] == "one"
++    assert second.provider_body["messages"][0]["content"] == "two"
++    assert first.settled is second.settled is True
++
++
++def test_stream_current_running_loop_captures_factory_body(monkeypatch):
++    from agent import relay_llm, relay_runtime
++
++    request = {"model": "test-model", "messages": []}
++    record = middleware.TransportRecord()
++    record.mark_middleware_verified(request)
++    monkeypatch.setattr(relay_runtime, "active_turn", lambda: object())
++
++    async def run():
++        def factory(final):
++            body = {**final, "stream": True}
++            with relay_llm.provider_body_scope(body):
++                return "raw-stream"
++
++        with middleware.transport_record_scope(record):
++            return relay_llm.stream_current(
++                request,
++                factory,
++                name="provider",
++                model_name="test-model",
++                finalizer=lambda: None,
++            )
++
++    assert asyncio.run(run()) == "raw-stream"
++    record.settle()
++    assert record.provider_body == {**request, "stream": True}
++    assert record.settled is True
+-- 
+2.50.1 (Apple Git-155)
+
