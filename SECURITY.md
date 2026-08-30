@@ -69,12 +69,14 @@ a checkpoint or delivery receipt.
 
 ## Host patch
 
-The plugin requires the eight ordered generic host seams in `patches/`: finish
+The plugin distribution records ten ordered generic host seams in `patches/`:
+finish
 reason exposure, sequential request middleware, profile-scoped services,
 bounded SessionDB time-window reads, provider-body transport truth, closed
 finish-state normalization, final provider-body budget controls, and verified
-wakeup provenance. Review and apply them to the documented compatible Hermes
-base before installation. Plugin registration fails visibly when a required
+wakeup provenance, followed by manifest-v2 installer alignment and joint
+Doctor support. Review and apply them to the documented compatible Hermes base
+before installation. Plugin registration fails visibly when a required runtime
 schema or API is absent.
 
 Report vulnerabilities through a private GitHub security advisory. Do not put

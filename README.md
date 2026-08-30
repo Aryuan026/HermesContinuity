@@ -95,17 +95,24 @@ The reviewed host baseline and additive host seams are:
   `hermes.transport.v3`:
   `7a5c6ca23b544d73fb37a3a1c7d8b08d1a82938c`;
 - verified durable wakeup provenance:
-  `7c183e81832c81e29f6d095a15bb7c8cd080ee5c`.
+  `7c183e81832c81e29f6d095a15bb7c8cd080ee5c`;
+- installer manifest-v2 alignment:
+  `113b4ab5285f92a1013c6a494eb33260a7f70140`;
+- joint plugin Doctor:
+  `969cf5bdbc3a110e475c02ed8e4ee84f64be32ed`.
 
-Apply the eight ordered patches in [`patches/`](patches/) to the compatible
-Hermes core before registration. They are generic host capabilities, not
-plugin-specific monkey patches. Registration fails visibly if any required
-schema or API is absent.
+Apply the ten ordered patches in [`patches/`](patches/) to the compatible
+Hermes core. The first eight are runtime prerequisites; the final two align
+the official installer with manifest v2 and let Doctor load dependency sets in
+one initialized temporary profile. They are generic host capabilities, not
+plugin-specific monkey patches. Registration fails visibly if a required
+runtime schema or API is absent.
 
 The order is: `plugin-llm-finish-reason`, `request-middleware-v2`,
 `plugin-service-registry`, `bounded-session-message-reads`,
 `provider-transport-truth`, `closed-finish-state-truth`,
-`final-provider-budget-controls`, then `verified-wakeup-provenance`.
+`final-provider-budget-controls`, `verified-wakeup-provenance`,
+`installer-manifest-v2`, then `joint-plugin-doctor`.
 
 ## Test
 

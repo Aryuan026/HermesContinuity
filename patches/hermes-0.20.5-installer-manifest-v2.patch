@@ -1,0 +1,237 @@
+From 113b4ab5285f92a1013c6a494eb33260a7f70140 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 20:08:08 +0800
+Subject: [PATCH] fix(plugins): align installer manifest support
+
+---
+ hermes_cli/plugins_cmd.py                     |  16 +-
+ tests/test_plugin_install_manifest_version.py | 172 ++++++++++++++++++
+ 2 files changed, 180 insertions(+), 8 deletions(-)
+ create mode 100644 tests/test_plugin_install_manifest_version.py
+
+diff --git a/hermes_cli/plugins_cmd.py b/hermes_cli/plugins_cmd.py
+index 912d932..e57c820 100644
+--- a/hermes_cli/plugins_cmd.py
++++ b/hermes_cli/plugins_cmd.py
+@@ -139,12 +139,6 @@ def _scan_plugin_tree(plugin_dir: Path, identifier: str, *, force: bool, scan_de
+     return result
+ 
+ 
+-# Minimum manifest version this installer understands.
+-# Plugins may declare ``manifest_version: 1`` in plugin.yaml;
+-# future breaking changes to the manifest schema bump this.
+-_SUPPORTED_MANIFEST_VERSION = 1
+-
+-
+ def _plugins_dir() -> Path:
+     """Return the user plugins directory, creating it if needed."""
+     plugins = get_hermes_home() / "plugins"
+@@ -807,6 +801,12 @@ def _install_plugin_core(
+ 
+         mv = manifest.get("manifest_version")
+         if mv is not None:
++            # The runtime parser is the manifest authority.  Import lazily so
++            # the install command does not pull the plugin runtime in merely
++            # to parse its own module, and do not let a second version constant
++            # drift behind the loader again.
++            from hermes_cli.plugins import SUPPORTED_MANIFEST_VERSION
++
+             try:
+                 mv_int = int(mv)
+             except (ValueError, TypeError):
+@@ -814,12 +814,12 @@ def _install_plugin_core(
+                     f"Plugin '{plugin_name}' has invalid manifest_version "
+                     f"'{mv}' (expected an integer).",
+                 ) from None
+-            if mv_int > _SUPPORTED_MANIFEST_VERSION:
++            if mv_int > SUPPORTED_MANIFEST_VERSION:
+                 from hermes_cli.config import recommended_update_command
+ 
+                 raise PluginOperationError(
+                     f"Plugin '{plugin_name}' requires manifest_version {mv}, "
+-                    f"but this installer only supports up to {_SUPPORTED_MANIFEST_VERSION}. "
++                    f"but this installer only supports up to {SUPPORTED_MANIFEST_VERSION}. "
+                     f"Run {recommended_update_command()} to update Hermes.",
+                 ) from None
+ 
+diff --git a/tests/test_plugin_install_manifest_version.py b/tests/test_plugin_install_manifest_version.py
+new file mode 100644
+index 0000000..3ba9a6b
+--- /dev/null
++++ b/tests/test_plugin_install_manifest_version.py
+@@ -0,0 +1,172 @@
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import types
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from hermes_cli import plugins_cmd
++
++
++def _git(cwd: Path, *args: str) -> str:
++    return subprocess.run(
++        ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
++        cwd=cwd,
++        check=True,
++        capture_output=True,
++        text=True,
++    ).stdout.strip()
++
++
++def _plugin_repo(root: Path, *, name: str, manifest_version: int) -> tuple[Path, str]:
++    repo = root / name
++    repo.mkdir(parents=True)
++    _git(repo, "init", "-q", "-b", "main")
++    (repo / "plugin.yaml").write_text(
++        "\n".join(
++            [
++                f"manifest_version: {manifest_version}",
++                f"name: {name}",
++                "version: 1.0.0",
++                "description: installer contract fixture",
++                "provides_tools: []",
++                "provides_hooks: []",
++                "",
++            ]
++        ),
++        encoding="utf-8",
++    )
++    (repo / "__init__.py").write_text(
++        "def register(ctx):\n    pass\n",
++        encoding="utf-8",
++    )
++    _git(repo, "add", ".")
++    _git(repo, "commit", "-qm", "fixture")
++    return repo, _git(repo, "rev-parse", "HEAD")
++
++
++def _rich_console_modules() -> dict[str, types.ModuleType]:
++    rich = types.ModuleType("rich")
++    console = types.ModuleType("rich.console")
++
++    class Console:
++        def print(self, *_args, **_kwargs) -> None:
++            return None
++
++    console.Console = Console
++    rich.console = console
++    return {"rich": rich, "rich.console": console}
++
++
++@unittest.skipIf(shutil.which("git") is None, "needs git")
++class PluginInstallerManifestVersionTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self._temporary = tempfile.TemporaryDirectory()
++        self.root = Path(self._temporary.name)
++
++    def tearDown(self) -> None:
++        self._temporary.cleanup()
++
++    def test_cli_core_exact_ref_accepts_runtime_manifest_version_and_stays_disabled(
++        self,
++    ) -> None:
++        repo, revision = _plugin_repo(
++            self.root / "source", name="manifest-v2-cli", manifest_version=2
++        )
++        home = self.root / "home-cli"
++        with (
++            patch.dict(os.environ, {"HERMES_HOME": str(home)}),
++            patch.dict(sys.modules, _rich_console_modules()),
++            patch.object(plugins_cmd, "_scan_plugin_tree", return_value=None),
++        ):
++            target, _manifest, name = plugins_cmd._install_plugin_core(
++                repo.as_uri(),
++                force=False,
++                ref=revision,
++            )
++
++            self.assertEqual(name, "manifest-v2-cli")
++            self.assertEqual(_git(target, "rev-parse", "HEAD"), revision)
++            metadata = json.loads(
++                (home / "plugins" / ".install-metadata.json").read_text(
++                    encoding="utf-8"
++                )
++            )
++            self.assertEqual(metadata[name]["revision"], revision)
++            self.assertIs(metadata[name]["pinned"], True)
++            self.assertEqual(plugins_cmd._get_enabled_set(), set())
++
++    def test_dashboard_accepts_the_same_runtime_manifest_version_disabled(self) -> None:
++        repo, revision = _plugin_repo(
++            self.root / "source", name="manifest-v2-dashboard", manifest_version=2
++        )
++        home = self.root / "home-dashboard"
++        with (
++            patch.dict(os.environ, {"HERMES_HOME": str(home)}),
++            patch.dict(sys.modules, _rich_console_modules()),
++            patch.object(plugins_cmd, "_scan_plugin_tree", return_value=None),
++        ):
++            result = plugins_cmd.dashboard_install_plugin(
++                repo.as_uri(),
++                force=False,
++                enable=False,
++            )
++
++            self.assertIs(result["ok"], True)
++            self.assertIs(result["enabled"], False)
++            self.assertEqual(
++                _git(
++                    home / "plugins" / "manifest-v2-dashboard",
++                    "rev-parse",
++                    "HEAD",
++                ),
++                revision,
++            )
++            self.assertEqual(plugins_cmd._get_enabled_set(), set())
++
++    def test_installer_rejects_manifest_newer_than_runtime(self) -> None:
++        repo, _revision = _plugin_repo(
++            self.root / "source", name="manifest-v3", manifest_version=3
++        )
++        home = self.root / "home-v3"
++        with (
++            patch.dict(os.environ, {"HERMES_HOME": str(home)}),
++            patch.object(plugins_cmd, "_scan_plugin_tree", return_value=None),
++            self.assertRaisesRegex(
++                plugins_cmd.PluginOperationError,
++                "supports up to 2",
++            ),
++        ):
++            plugins_cmd._install_plugin_core(repo.as_uri(), force=False)
++
++        self.assertFalse((home / "plugins" / "manifest-v3").exists())
++
++    def test_cli_dispatch_preserves_exact_ref_and_disabled_default(self) -> None:
++        revision = "a" * 40
++        args = SimpleNamespace(
++            plugins_action="install",
++            identifier="owner/plugin",
++            force=False,
++            enable=False,
++            no_enable=True,
++            ref=revision,
++        )
++        with patch.object(plugins_cmd, "cmd_install") as install:
++            plugins_cmd.plugins_command(args)
++        install.assert_called_once_with(
++            "owner/plugin",
++            force=False,
++            enable=False,
++            ref=revision,
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.50.1 (Apple Git-155)
+

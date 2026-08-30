@@ -27,7 +27,11 @@ The Hermes compatibility lineage is:
   `hermes.transport.v3`:
   `7a5c6ca23b544d73fb37a3a1c7d8b08d1a82938c`;
 - verified durable wakeup provenance:
-  `7c183e81832c81e29f6d095a15bb7c8cd080ee5c`.
+  `7c183e81832c81e29f6d095a15bb7c8cd080ee5c`;
+- installer manifest-v2 alignment:
+  `113b4ab5285f92a1013c6a494eb33260a7f70140`;
+- joint plugin Doctor:
+  `969cf5bdbc3a110e475c02ed8e4ee84f64be32ed`.
 
 The exported patch SHA-256 values, in application order, are:
 
@@ -39,6 +43,8 @@ The exported patch SHA-256 values, in application order, are:
 6. `338105b9aaaebd99a6ce267044818495951ec9e46293f98ee61cf3f62cce9a19`
 7. `70d2362cbb15b4e8adce356762e1d7c23e705f3bf5e1ca0a901268ff8109f49b`
 8. `6b17af93fe29aa1b4fd7ac789dacc3443747e381a1c8bbf1329862e3027b37cb`
+9. `f8130812abc94488149be8e196473333465842f01028a0ab30ebdda983a49e4c`
+10. `99b4847dc3af412f6a0696735021d8ee0a33f6364bab93c426c12f36332e2cfb`
 
 ## Extraction matrix
 
@@ -55,6 +61,7 @@ The exported patch SHA-256 values, in application order, are:
 | Adapt | Asherie mouth preflight/transport integration around Thread Continuity | `request_projection.py`, `runtime.py`, `__init__.py` | Replaced Home/mobile/public-gateway carriers with a Hermes request-only projection, execution-stage proof, post-API CAS, and plugin registration. This is host integration, not a rewrite of the retained compiler. |
 | Adapt | Hermes PluginLlm result boundary | `patches/hermes-0.20.5-plugin-llm-finish-reason.patch` | Adds generic finish-reason exposure needed to reject incomplete summaries. It is a Hermes core prerequisite, not plugin-owned monkey-patching. |
 | Adapt | Hermes request middleware, service registry, bounded SessionDB read, transport truth, closed finish-state truth, final-body budget filtering, and wakeup provenance | the seven subsequent ordered patches under `patches/` | Adds generic host composition, profile-local peer services, physically bounded canonical reads, final provider-body evidence/filtering, provider-complete finish normalization, and an unforgeable durable wakeup sidecar. These seams contain no Continuity algorithm. |
+| Adapt | Hermes plugin installation and Doctor lifecycle | `patches/hermes-0.20.5-installer-manifest-v2.patch`, `patches/hermes-0.20.5-joint-plugin-doctor.patch` | Reuses the runtime manifest-version authority in CLI/dashboard installation and lets Doctor initialize one temporary profile and load companion plugins in declared dependency order. These are generic lifecycle seams, not Continuity exceptions. |
 | Adapt | Asherie cross-mouth recent-source ownership | `hermes_adapter.py`: `ContinuityCanonicalSourceService` | Replaced Home cache/window ownership with a neutral, read-only, profile-local canonical service over complete Hermes dialogue groups. v2 adds a closed Hermes source classification instead of disguising all origins as donor `home_gateway`. The service exposes no Global Hot material schema and persists no bodies. |
 | Do not port | `ConversationCacheStore` JSONL buckets, append/capture paths, recent/time-window query and ranking, query scoring, filesystem repair ledgers, and cache search/storage | none | Hermes `state.db` remains the only transcript archive; original sentences remain searchable through native `session_search`. |
 | Do not port | `thread_continuity_gateway.py` Home/mobile/public-gateway preflight, transport reconciliation, `runtime_admin`, and capture-surface ownership | none | Those contracts belong to AsherieSystem surfaces and are not valid Hermes plugin APIs. |
