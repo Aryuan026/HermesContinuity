@@ -6,6 +6,12 @@
   `ddfb1e9aeb7c6f7797912e959a0970c621875c83`.
 - Hermes adapter: implemented against canonical `SessionDB` reads with raw-row
   collision audit and a generated-checkpoint/body-free-receipt store.
+- Real-history compatibility preflight: the full Tencent QQ source projected
+  302 complete visible groups / 471 messages in 0.79 seconds without exposing
+  message bodies. Known `session_meta` and API-only scaffold rows are excluded;
+  host-equivalent consecutive user merging and typed assistant continuations
+  preserve the remaining visible role runs. This is body-free read-only
+  source evidence, not conversational behavior proof.
 - Request runtime: implemented for request projection, execution proof, and
   final provider-body proof, and `post_api_request` checkpoint CAS.
 - Canonical source service: implemented as the profile-local
@@ -76,8 +82,9 @@
 - Long-history boundary: checkpoint v2 and the main continuity source read are
   still O(total session history). A stable Hermes prefix-proof seam and compact
   checkpoint v3 remain required before formal long-lived-profile use.
-- Runtime status: not installed, not enabled, not deployed, and not validated
-  in a live Hermes conversation.
+- Runtime installation and target canary truth are intentionally owned by the
+  exact external assembly receipt rather than inferred from this source tree.
 
 The current review gate is H11's ownership-acceptance correction and public
-real-host patch replay. No installation or deployment is authorized here.
+real-host patch replay. Target installation, canary authorization, and runtime
+evidence are recorded by the external assembly rather than this source tree.

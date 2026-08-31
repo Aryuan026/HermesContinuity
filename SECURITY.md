@@ -22,6 +22,10 @@ revisions.
   without minting an `api_request_error` receipt.
 - `api_content` may be audited for collision detection but is never used as
   continuity body material.
+- Hermes `session_meta`, hidden provider scaffolds, and clean-content-empty
+  provider sidecars are excluded from source material. An inbound empty row
+  with a platform message identity remains ambiguous rather than being
+  silently discarded.
 - The canonical-window service may return canonical message bodies only in its
   synchronous in-process response. Its trace and delivery receipts never
   persist those canonical bodies, and the checkpoint store persists only a

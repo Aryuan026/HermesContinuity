@@ -375,6 +375,132 @@ class HermesSourceProjectionTests(unittest.TestCase):
         self.assertEqual(proactive["status"], "ambiguous")
         self.assertEqual(proactive["error"], "proactive_event_unverified")
 
+    def test_host_session_metadata_is_excluded_from_canonical_dialogue(self) -> None:
+        metadata = row(
+            1,
+            "session_meta",
+            '{"host_control":"not dialogue"}',
+            50.0,
+            active=0,
+            compacted=1,
+        )
+        source = HermesSessionAdapter(
+            FakeSessionDB([metadata, *dialogue_rows(2, 100.0, "live")])
+        ).read_source("session-1")
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(len(source["groups"]), 1)
+        self.assertNotIn("host_control", repr(source))
+
+    def test_nonvisible_provider_scaffolds_never_become_dialogue(self) -> None:
+        rows = [
+            row(1, "user", "visible question", 100.0),
+            row(
+                2,
+                "assistant",
+                "tool request",
+                101.0,
+                tool_calls=[{"id": "call-1", "type": "function"}],
+                finish_reason="tool_calls",
+            ),
+            row(
+                3,
+                "user",
+                "",
+                102.0,
+                api_content="provider-only continuation",
+            ),
+            row(4, "assistant", "visible answer", 103.0, finish_reason="stop"),
+            row(
+                5,
+                "assistant",
+                "",
+                104.0,
+                api_content="neutral interruption placeholder",
+                display_kind="hidden",
+            ),
+        ]
+        source = HermesSessionAdapter(FakeSessionDB(rows)).read_source("session-1")
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(len(source["groups"]), 1)
+        self.assertNotIn("provider-only continuation", repr(source))
+        self.assertNotIn("neutral interruption placeholder", repr(source))
+
+        inbound_empty = HermesSessionAdapter(
+            FakeSessionDB(
+                [
+                    row(
+                        1,
+                        "user",
+                        "",
+                        100.0,
+                        api_content="provider-only continuation",
+                        platform_message_id="inbound-1",
+                    ),
+                    row(2, "assistant", "answer", 101.0),
+                ]
+            )
+        ).read_source("session-1")
+        self.assertEqual(inbound_empty["status"], "ambiguous")
+        self.assertEqual(inbound_empty["error"], "source_visible_content_invalid")
+
+    def test_host_role_runs_preserve_visible_text_as_closed_groups(self) -> None:
+        source = HermesSessionAdapter(
+            FakeSessionDB(
+                [
+                    row(1, "user", "first user message", 100.0),
+                    row(2, "user", "second user message", 101.0),
+                    row(3, "assistant", "first answer", 102.0, finish_reason="stop"),
+                    row(
+                        4,
+                        "assistant",
+                        "follow-up answer",
+                        103.0,
+                        finish_reason="stop",
+                    ),
+                ]
+            )
+        ).read_source("session-1")
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(
+            [group["group_kind"] for group in source["groups"]],
+            ["dialogue_turn", "proactive_assistant_event"],
+        )
+        self.assertEqual(
+            source["groups"][0]["messages"][0]["content"],
+            "first user message\n\nsecond user message",
+        )
+        self.assertEqual(
+            source["groups"][1]["messages"][0]["content"],
+            "follow-up answer",
+        )
+
+        unmergeable = HermesSessionAdapter(
+            FakeSessionDB(
+                [
+                    row(
+                        1,
+                        "user",
+                        [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "https://example.invalid/a.png"},
+                            }
+                        ],
+                        100.0,
+                    ),
+                    row(2, "user", "second user message", 101.0),
+                    row(3, "assistant", "answer", 102.0),
+                ]
+            )
+        ).read_source("session-1")
+        self.assertEqual(unmergeable["status"], "ambiguous")
+        self.assertEqual(
+            unmergeable["error"], "consecutive_user_content_unmergeable"
+        )
+
     def test_compacted_prefix_is_contiguous_whole_groups_only(self) -> None:
         compacted = dialogue_rows(1, 100.0, "old")
         for message in compacted:

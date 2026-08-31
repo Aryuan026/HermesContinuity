@@ -6,7 +6,8 @@ Hermes remains the owner of canonical transcript storage, original-sentence
 retrieval, native `session_search`, and context compression. Hermes Continuity
 owns only:
 
-- a read-only projection from `SessionDB` into complete dialogue groups;
+- a read-only projection from `SessionDB` into complete visible interaction
+  groups;
 - bounded checkpoint and recent-bridge construction;
 - request-only bridge projection and physical-delivery proof; and
 - a profile-local canonical-window service for trusted peer plugins; and

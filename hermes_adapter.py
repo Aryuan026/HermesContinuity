@@ -143,6 +143,20 @@ def _is_compaction_summary(row: Mapping[str, Any]) -> bool:
     return text.startswith(_SUMMARY_PREFIXES)
 
 
+def _is_nonvisible_provider_scaffold(row: Mapping[str, Any], role: str) -> bool:
+    """Recognize host-owned API-only rows that never entered the transcript."""
+
+    api_content = row.get("api_content")
+    if (
+        _content_to_text(row.get("content"))
+        or not isinstance(api_content, str)
+        or not api_content.strip()
+        or row.get("platform_message_id")
+    ):
+        return False
+    return str(row.get("display_kind") or "").strip() == "hidden" or role == "user"
+
+
 def _source_evidence(row: Mapping[str, Any]) -> Dict[str, str]:
     metadata = row.get("display_metadata")
     metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
@@ -447,14 +461,21 @@ def _project_canonical_source(
     groups: List[Dict[str, Any]] = []
     group_compacted: List[bool] = []
     lineage_proofs: List[Dict[str, str]] = []
-    pending: Dict[str, Any] | None = None
+    pending_users: List[Dict[str, Any]] = []
     group_occurrences: Dict[str, int] = defaultdict(int)
     for row in prepared:
         role = row["_continuity_role"]
-        if _is_compaction_summary(row) or role in {"system", "developer", "tool"}:
+        if _is_compaction_summary(row) or role in {
+            "system",
+            "developer",
+            "tool",
+            "session_meta",
+        }:
             continue
         if role not in {"user", "assistant"}:
             return _failed_source("ambiguous", "source_role_invalid")
+        if _is_nonvisible_provider_scaffold(row, role):
+            continue
         if role == "assistant":
             finish_reason = str(row.get("finish_reason") or "").strip().lower()
             if (
@@ -466,41 +487,48 @@ def _project_canonical_source(
         if not _content_to_text(row.get("content")):
             return _failed_source("ambiguous", "source_visible_content_invalid")
         if role == "user":
-            if pending is not None:
-                return _failed_source("ambiguous", "incomplete_non_tail_turn")
-            pending = row
+            pending_users.append(row)
             continue
-        if pending is None:
+        if not pending_users and not groups:
             return _failed_source("ambiguous", "proactive_event_unverified")
 
-        user_id = pending["_continuity_message_id"]
         assistant_id = row["_continuity_message_id"]
-        group_base = _json_text([session_id, user_id, assistant_id])
-        group_occurrence = group_occurrences[group_base]
-        group_occurrences[group_base] += 1
-        group_id = "hcg_" + _sha256(
-            {
-                "schema": "hermes_continuity_group_identity.v1",
-                "session_id": session_id,
-                "message_ids": [user_id, assistant_id],
-                "occurrence": group_occurrence,
-            }
-        )
-        effective_event_at = _timestamp_text(row.get("timestamp"))
-        user_hash = _content_hash(pending.get("content"))
         assistant_hash = _content_hash(row.get("content"))
-        group = {
-            "group_kind": "dialogue_turn",
-            "source_prefix_id": group_id,
-            "logical_turn_id": group_id,
-            "record_id": group_id,
-            "effective_event_at": effective_event_at,
-            "message_ids": [user_id, assistant_id],
-            "messages": [
+        effective_event_at = _timestamp_text(row.get("timestamp"))
+        persisted_rows = [*pending_users, row]
+        if pending_users:
+            user_contents = [pending.get("content") for pending in pending_users]
+            if len(user_contents) == 1:
+                user_content = user_contents[0]
+                user_id = pending_users[0]["_continuity_message_id"]
+            elif all(isinstance(content, str) for content in user_contents):
+                user_content = "\n\n".join(user_contents)
+                user_id = "hcm_" + _sha256(
+                    {
+                        "schema": "hermes_continuity_merged_user_identity.v1",
+                        "session_id": session_id,
+                        "message_ids": [
+                            pending["_continuity_message_id"]
+                            for pending in pending_users
+                        ],
+                        "content_hash": _content_hash(user_content),
+                    }
+                )
+            else:
+                return _failed_source(
+                    "ambiguous", "consecutive_user_content_unmergeable"
+                )
+            evidence = _source_evidence(pending_users[-1])
+            if any(_source_evidence(pending) != evidence for pending in pending_users):
+                return _failed_source("ambiguous", "source_evidence_ambiguous")
+            user_hash = _content_hash(user_content)
+            group_kind = "dialogue_turn"
+            message_ids = [user_id, assistant_id]
+            messages = [
                 {
                     "role": "user",
                     "message_id": user_id,
-                    "content": pending.get("content"),
+                    "content": user_content,
                     "content_hash": user_hash,
                 },
                 {
@@ -509,35 +537,62 @@ def _project_canonical_source(
                     "content": row.get("content"),
                     "content_hash": assistant_hash,
                 },
-            ],
+            ]
+            visible_key = [
+                effective_event_at,
+                ["user", user_hash],
+                ["assistant", assistant_hash],
+            ]
+        else:
+            evidence = _source_evidence(row)
+            group_kind = "proactive_assistant_event"
+            message_ids = [assistant_id]
+            messages = [
+                {
+                    "role": "assistant",
+                    "message_id": assistant_id,
+                    "content": row.get("content"),
+                    "content_hash": assistant_hash,
+                }
+            ]
+            visible_key = [effective_event_at, ["assistant", assistant_hash]]
+
+        group_base = _json_text([session_id, group_kind, message_ids])
+        group_occurrence = group_occurrences[group_base]
+        group_occurrences[group_base] += 1
+        group_id = "hcg_" + _sha256(
+            {
+                "schema": "hermes_continuity_group_identity.v1",
+                "session_id": session_id,
+                "group_kind": group_kind,
+                "message_ids": message_ids,
+                "occurrence": group_occurrence,
+            }
+        )
+        group = {
+            "group_kind": group_kind,
+            "source_prefix_id": group_id,
+            "logical_turn_id": group_id,
+            "record_id": group_id,
+            "effective_event_at": effective_event_at,
+            "message_ids": message_ids,
+            "messages": messages,
         }
         groups.append(group)
         group_compacted.append(
-            not _active(pending)
-            and _compacted(pending)
-            and not _active(row)
-            and _compacted(row)
+            all(not _active(message) and _compacted(message) for message in persisted_rows)
         )
         if include_lineage_proofs:
             lineage_proofs.append(
                 {
-                    "visible_key": _sha256(
-                        [
-                            effective_event_at,
-                            ["user", user_hash],
-                            ["assistant", assistant_hash],
-                        ]
-                    ),
+                    "visible_key": _sha256(visible_key),
                     "persisted_signature": _sha256(
-                        [
-                            _lineage_row_signature(pending),
-                            _lineage_row_signature(row),
-                        ]
+                        [_lineage_row_signature(message) for message in persisted_rows]
                     ),
-                    "source_evidence": _source_evidence(pending),
+                    "source_evidence": evidence,
                 }
             )
-        pending = None
+        pending_users = []
         if max_groups is not None and len(groups) > max_groups:
             return _failed_source("overflow", "source_group_limit_exceeded")
 
@@ -562,7 +617,7 @@ def _project_canonical_source(
             "full_prefix": full_prefix,
             "canonical_message_count": len(canonical),
             "returned_groups": len(groups),
-            "tail_user_incomplete": pending is not None,
+            "tail_user_incomplete": bool(pending_users),
             "compacted_prefix_group_ids": compacted_prefix_ids,
         },
     }

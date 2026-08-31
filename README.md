@@ -4,9 +4,9 @@ Hermes Continuity gives a Hermes conversation a bounded rolling bridge across
 context compression. It reads Hermes's canonical session history, builds an
 exact-source checkpoint, and inserts only the recent bridge into the current
 provider request. It also exposes a profile-local, read-only canonical-window
-service so a separate Global Hot plugin can assemble recent complete dialogue
-from other Hermes mouths without reading `state.db` or this plugin's metadata
-schema directly.
+service so a separate Global Hot plugin can assemble recent complete visible
+interaction groups from other Hermes mouths without reading `state.db` or this
+plugin's metadata schema directly.
 
 The first policy is intentionally conservative:
 
@@ -53,10 +53,14 @@ created. Registration/store initialization rejects Hermes canonical tables,
 foreign owners, and unclaimed nonempty SQLite schema rather than mixing stores.
 
 The `canonical-source.v2` service uses bounded physical reads, follows
-compression lineages from ancestor to tip, returns only complete
-user/final-assistant groups, and blocks the whole window on ambiguous source
-history. Every group carries one closed source class: `human`, `scheduled`,
-`internal`, `delegated`, `tool`, or `unknown`. Wakeups qualify as scheduled
+compression lineages from ancestor to tip, and blocks the whole window on
+ambiguous source history. Consecutive plain-text user rows are merged with the
+same double-newline rule as Hermes's provider replay; the first following
+assistant closes that dialogue group, and later visible assistant rows become
+typed proactive-assistant groups. API-only scaffolds and host metadata never
+become source material, while an unverified assistant at the start of a full
+session still fails closed. Every group carries one closed source class:
+`human`, `scheduled`, `internal`, `delegated`, `tool`, or `unknown`. Wakeups qualify as scheduled
 only when the durable user row carries host-proven wakeup provenance; an
 arbitrary platform label is not enough. Response bodies exist only in the
 synchronous in-process response; service traces and receipts remain body-free.
