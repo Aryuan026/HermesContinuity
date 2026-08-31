@@ -22,10 +22,14 @@ from unittest.mock import patch
 
 
 CONTINUITY_ROOT = Path(__file__).resolve().parents[1]
-HERMES_ROOT = Path(os.environ.get("HERMES_SOURCE_ROOT", ""))
-GLOBAL_HOT_ROOT = Path(os.environ.get("HERMES_GLOBAL_HOT_ROOT", ""))
+HERMES_ROOT_VALUE = os.environ.get("HERMES_SOURCE_ROOT", "").strip()
+GLOBAL_HOT_ROOT_VALUE = os.environ.get("HERMES_GLOBAL_HOT_ROOT", "").strip()
+HERMES_ROOT = Path(HERMES_ROOT_VALUE)
+GLOBAL_HOT_ROOT = Path(GLOBAL_HOT_ROOT_VALUE)
 HOST_AVAILABLE = (
-    (HERMES_ROOT / "agent" / "conversation_loop.py").is_file()
+    bool(HERMES_ROOT_VALUE)
+    and bool(GLOBAL_HOT_ROOT_VALUE)
+    and (HERMES_ROOT / "agent" / "conversation_loop.py").is_file()
     and (GLOBAL_HOT_ROOT / "plugin.yaml").is_file()
 )
 

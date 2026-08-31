@@ -43,7 +43,7 @@ def _require_compatible_host(ctx: Any) -> None:
     except ImportError as exc:
         raise RuntimeError(
             "Hermes Continuity requires hermes.middleware.v2 and "
-            "hermes.transport.v3"
+            "hermes.transport.v3 with hermes.request_overlay.v2"
         ) from exc
 
     if "finish_reason" not in {field.name for field in fields(PluginLlmCompleteResult)}:
@@ -57,8 +57,8 @@ def _require_compatible_host(ctx: Any) -> None:
         raise RuntimeError("Hermes Continuity requires hermes.middleware.v2")
     if TRANSPORT_SCHEMA_VERSION != "hermes.transport.v3":
         raise RuntimeError("Hermes Continuity requires hermes.transport.v3")
-    if REQUEST_OVERLAY_SCHEMA_VERSION != "hermes.request_overlay.v1":
-        raise RuntimeError("Hermes Continuity requires hermes.request_overlay.v1")
+    if REQUEST_OVERLAY_SCHEMA_VERSION != "hermes.request_overlay.v2":
+        raise RuntimeError("Hermes Continuity requires hermes.request_overlay.v2")
 
 
 def register(ctx: Any) -> None:

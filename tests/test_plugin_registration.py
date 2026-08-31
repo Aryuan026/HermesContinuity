@@ -120,12 +120,17 @@ class PluginRegistrationTests(unittest.TestCase):
         middleware = types.ModuleType("hermes_cli.middleware")
         middleware.MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v2"
         middleware.TRANSPORT_SCHEMA_VERSION = "hermes.transport.v3"
+        request_overlay = types.ModuleType("hermes_cli.request_overlay")
+        request_overlay.REQUEST_OVERLAY_SCHEMA_VERSION = (
+            "hermes.request_overlay.v2"
+        )
         return {
             "agent": agent,
             "agent.plugin_llm": plugin_llm,
             "hermes_state": hermes_state,
             "hermes_cli": hermes_cli,
             "hermes_cli.middleware": middleware,
+            "hermes_cli.request_overlay": request_overlay,
         }
 
     def test_registers_only_request_execution_and_settlement_boundaries(self):
@@ -257,6 +262,17 @@ class PluginRegistrationTests(unittest.TestCase):
         )
         with patch.dict(sys.modules, modules):
             with self.assertRaisesRegex(RuntimeError, "hermes.transport.v3"):
+                plugin.register(self.ctx)
+
+        self.assertEqual(FakeSessionDB.instances, [])
+
+    def test_request_overlay_v1_fails_before_db_open(self):
+        modules = self._modules(CompatibleResult)
+        modules["hermes_cli.request_overlay"].REQUEST_OVERLAY_SCHEMA_VERSION = (
+            "hermes.request_overlay.v1"
+        )
+        with patch.dict(sys.modules, modules):
+            with self.assertRaisesRegex(RuntimeError, "hermes.request_overlay.v2"):
                 plugin.register(self.ctx)
 
         self.assertEqual(FakeSessionDB.instances, [])

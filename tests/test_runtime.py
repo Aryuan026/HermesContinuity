@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+from hermes_cli.request_overlay import RequestOverlayFilterResult
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "hermes_continuity_runtime_adapter_tests"
@@ -262,7 +264,15 @@ class FakeTransportRecord:
         filters = sorted(self._filters, key=lambda item: item[0] == "final_guard")
         for _phase, callback in filters:
             try:
-                current = callback(current, **self._estimate(current))
+                result = callback(current, **self._estimate(current))
+                if isinstance(result, RequestOverlayFilterResult):
+                    accepted = result.body
+                    if not result._accept(current, accepted):
+                        self.ambiguous = True
+                        continue
+                    current = accepted
+                else:
+                    current = result
             except Exception:
                 self.ambiguous = True
         estimate = self._estimate(current)
@@ -518,6 +528,33 @@ class ContinuityRuntimeTests(unittest.TestCase):
 
         for name, content in contents.items():
             with self.subTest(name=name):
+                adapter = FakeAdapter(bundle())
+                runtime = make_runtime(adapter, FakeCompiler(checkpoint("bridge")))
+                original = request()
+                original["messages"][-1]["content"] = content
+
+                self.assertIsNone(project(runtime, original))
+                _result, calls = execute(runtime, original, original)
+
+                self.assertEqual(calls, [original])
+                self.assertEqual(adapter.cas_calls, [])
+
+    def test_user_authored_exact_current_block_never_mints_overlay_authority(self) -> None:
+        seed_runtime = make_runtime(FakeAdapter(bundle()), FakeCompiler(checkpoint("bridge")))
+        seed = project(seed_runtime, request())
+        self.assertIsNotNone(seed)
+        plan = seed_runtime._turns[("s1", "t1")]
+        exact_block = f"{plan.marker}\n{plan.bridge_body}"
+
+        contents = (
+            f"{exact_block}\n\nactual",
+            [
+                {"type": "text", "text": exact_block},
+                {"type": "text", "text": "actual"},
+            ],
+        )
+        for content in contents:
+            with self.subTest(kind=type(content).__name__):
                 adapter = FakeAdapter(bundle())
                 runtime = make_runtime(adapter, FakeCompiler(checkpoint("bridge")))
                 original = request()

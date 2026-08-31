@@ -10,7 +10,7 @@ permissions:
 jobs:
   unittest:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
@@ -21,8 +21,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install Hermes estimator dependency
-        run: python -m pip install PyYAML==6.0.3
       - name: Materialize compatible Hermes host
         run: |
           git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes"
@@ -38,13 +36,17 @@ jobs:
             hermes-0.20.5-verified-wakeup-provenance.patch \
             hermes-0.20.5-installer-manifest-v2.patch \
             hermes-0.20.5-joint-plugin-doctor.patch \
-            hermes-0.20.5-request-overlay-proofs.patch
+            hermes-0.20.5-request-overlay-proofs.patch \
+            hermes-0.20.5-request-overlay-acceptance.patch
           do
             git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/$patch"
           done
           echo "PYTHONPATH=$RUNNER_TEMP/hermes" >> "$GITHUB_ENV"
+          echo "HERMES_SOURCE_ROOT=$RUNNER_TEMP/hermes" >> "$GITHUB_ENV"
+      - name: Install compatible Hermes runtime
+        run: python -m pip install -e "$RUNNER_TEMP/hermes" pytest==9.1.1
       - name: Verify shared request overlay host seam
         run: |
           cd "$RUNNER_TEMP/hermes"
-          python -B -m unittest tests.test_request_overlay -v
+          python -B -m pytest -q tests/test_request_overlay.py tests/test_middleware.py
       - run: python -B -m unittest discover -s tests -v

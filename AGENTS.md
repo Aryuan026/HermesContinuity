@@ -15,7 +15,7 @@ Preserve these owner and provenance boundaries:
   AsherieSystem revision
   `ddfb1e9aeb7c6f7797912e959a0970c621875c83`.
 - Keep the Hermes baseline explicit: upstream `fcbd1076`, owner overlay
-  `c7c36f36`, and ordered generic seams `201fe77` through `ccd7bf3`.
+  `c7c36f36`, and ordered generic seams `201fe77` through `5a680e5`.
 - Do not weaken physical request verification or move checkpoint CAS before
   `post_api_request`.
 - Verify delivery against `hermes.transport.v3` final `provider_body`, not the

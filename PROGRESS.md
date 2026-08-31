@@ -13,10 +13,11 @@
   compression-lineage union, complete dialogue groups, closed source classes,
   consumer-bound class filtering, explicit custom-frontend source ownership,
   and body-free policy-exclusion trace.
-- Host prerequisites: eleven ordered generic patches are recorded under
+- Host prerequisites: twelve ordered generic patches are recorded under
   `patches/`; the final compatible Hermes core commit is
-  `ccd7bf350ca54a44b7351904e079f5ffdb64eec0` (`hermes.transport.v3`,
-  manifest-v2 installer, joint Doctor, and shared request overlays).
+  `5a680e5e38625fb3275b4bf6973a40d089ec11a7` (`hermes.transport.v3`,
+  manifest-v2 installer, joint Doctor, and shared request-overlay v2 host
+  acceptance).
 - Host verification: closed finish-state matrix 537 passed / 6 skipped;
   final-body budget targeted 169/169 and associated 306/306; verified wakeup
   provenance 5/5 over the real loopback API path. These are local exact-tree
@@ -49,10 +50,13 @@
   live in the generic Hermes host seam. Continuity's duplicate projector and
   its mirror test file are removed; execution proof remains strict while the
   final SDK guard can compose with another owner that has already removed its
-  own block. The exact host suite is 202/202 after this consolidation.
-  The public-shaped plugin suite is 187 pass / 15 expected real-host skips;
-  public CI also replays all eleven patches and runs the 17 shared-overlay host
-  tests before the plugin matrix.
+  own block. The v2 overlay contract additionally forbids byte-derived
+  ownership reminting, commits budget dispositions only after host acceptance,
+  and records final-body estimates even when no filter is registered. The
+  exact host plus paired Global Hot suite is 205/205 after this correction.
+  Public CI replays all twelve patches, installs the materialized host, exports
+  `HERMES_SOURCE_ROOT`, and runs the shared-overlay plus real-host plugin tests
+  before the Python 3.11/3.12 matrix completes.
 - Plugin lifecycle proof: exact public candidates `698fd4d` and `9f01f61`
   installed through the official CLI into a disposable profile with full
   commit pins and remained disabled; Continuity passed native Doctor, Global
@@ -75,6 +79,5 @@
 - Runtime status: not installed, not enabled, not deployed, and not validated
   in a live Hermes conversation.
 
-The next review should assess H11's shared ownership boundary, the deleted
-plugin copies, and public patch replay. No installation or deployment is
-authorized here.
+The current review gate is H11's ownership-acceptance correction and public
+real-host patch replay. No installation or deployment is authorized here.

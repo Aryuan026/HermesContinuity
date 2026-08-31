@@ -106,21 +106,25 @@ The reviewed host baseline and additive host seams are:
 - joint plugin Doctor:
   `969cf5bdbc3a110e475c02ed8e4ee84f64be32ed`;
 - shared request overlay ownership, scoped proof, and final-budget disposition:
-  `ccd7bf350ca54a44b7351904e079f5ffdb64eec0`.
+  `ccd7bf350ca54a44b7351904e079f5ffdb64eec0`;
+- host-accepted overlay dispositions, zero-filter provider-body estimates, and
+  no byte-derived ownership reminting:
+  `5a680e5e38625fb3275b4bf6973a40d089ec11a7`.
 
-Apply the eleven ordered patches in [`patches/`](patches/) to the compatible
+Apply the twelve ordered patches in [`patches/`](patches/) to the compatible
 Hermes core. The first eight are runtime prerequisites, the next two align
 the official installer with manifest v2 and let Doctor load dependency sets in
-one initialized temporary profile, and the last owns generic request-overlay
-carrier/proof behavior. They are generic host capabilities, not plugin-specific
-monkey patches. Registration fails visibly if a required runtime schema or API
-is absent.
+one initialized temporary profile, and the final two own generic
+request-overlay carrier/proof behavior and host acceptance. They are generic
+host capabilities, not plugin-specific monkey patches. Registration fails
+visibly if a required runtime schema or API is absent.
 
 The order is: `plugin-llm-finish-reason`, `request-middleware-v2`,
 `plugin-service-registry`, `bounded-session-message-reads`,
 `provider-transport-truth`, `closed-finish-state-truth`,
 `final-provider-budget-controls`, `verified-wakeup-provenance`,
-`installer-manifest-v2`, `joint-plugin-doctor`, then `request-overlay-proofs`.
+`installer-manifest-v2`, `joint-plugin-doctor`, `request-overlay-proofs`, then
+`request-overlay-acceptance`.
 
 ## Test
 
@@ -141,13 +145,13 @@ HERMES_SOURCE_ROOT=/path/to/hermes \
 python -B -m unittest discover -s tests -v
 ```
 
-All committed fixtures are synthetic. Public GitHub Actions now replays all
-eleven patches from pure upstream `fcbd1076`, runs the shared-overlay host
-tests, then runs the plugin's Python 3.11/3.12 unit suite against that
-materialized host. Transport, gateway, SessionDB, and dual-plugin entrypoint
-counts recorded in `PROGRESS.md` remain separate local exact-tree integration
-evidence; they are not implied by a Green public workflow. Those tests require
-`HERMES_SOURCE_ROOT` and, where named, `HERMES_GLOBAL_HOT_ROOT`.
+All committed fixtures are synthetic. Public GitHub Actions replays all twelve
+patches from pure upstream `fcbd1076`, installs that materialized host, exports
+`HERMES_SOURCE_ROOT`, runs the shared-overlay host tests, and then runs the
+plugin's Python 3.11/3.12 suite with its real-host tests enabled. The
+dual-plugin `AIAgent.run_conversation` entrypoint still requires a Global Hot
+tree and is exercised by Global Hot's paired workflow rather than this
+single-repository workflow.
 
 ## Current status
 
