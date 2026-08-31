@@ -30,6 +30,14 @@
   wrapper-consumed compiler, bridge, request projection, provider request, and
   settlement output for raw, retirement-only, and summarized fixtures. The
   final-guard test still covers both execution-middleware registration orders.
+- Checkpoint-v1 retirement candidate: body-free census receipt
+  `HermesPrivateAssembly@0a7e0c648ff37c16025ec874c3508640716e8793`
+  found zero top-level `thread_continuity_checkpoint.v1` rows and zero malformed
+  checkpoint JSON across the known local and Tencent owner-managed estate. The
+  corresponding top-level builder, normalizer, migration projection, and
+  legacy physical-owner relation are removed in this review candidate;
+  unexpected top-level v1 now fails closed without projection or migration.
+  Checkpoint v2 and the nested retirement/recent-bridge v1 schemas remain.
 - Plugin lifecycle proof: exact public candidates `698fd4d` and `9f01f61`
   installed through the official CLI into a disposable profile with full
   commit pins and remained disabled; Continuity passed native Doctor, Global
@@ -52,6 +60,6 @@
 - Runtime status: not installed, not enabled, not deployed, and not validated
   in a live Hermes conversation.
 
-The next review should assess practical installation, patch replay, upgrade and
-rollback behavior, then record the corrected exact revisions. No installation
-or deployment is authorized here.
+The next review should assess this checkpoint-v1 removal, then continue with
+the fixed profile-realm path and H11 boundaries. No installation or deployment
+is authorized here.

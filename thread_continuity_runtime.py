@@ -5,6 +5,8 @@ import json
 from typing import Any, Callable, Dict, List, Mapping
 
 from .context_compactor import (
+    THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA,
+    SUMMARY_CONSTRUCTION_TOKEN_LIMIT,
     accept_summary_attempt,
     accept_summary_chunk_attempt,
     build_thread_continuity_checkpoint_from_attempts,
@@ -12,7 +14,6 @@ from .context_compactor import (
     plan_next_summary_chunk_attempt,
     plan_thread_continuity_fold,
     render_thread_continuity_checkpoint_message,
-    SUMMARY_CONSTRUCTION_TOKEN_LIMIT,
     thread_continuity_bridge_projection,
     thread_continuity_retirement_source_group_ids,
     validate_thread_continuity_input,
@@ -180,6 +181,8 @@ async def compile_thread_continuity_turn(
         if previous is None or type(state.get("revision")) is not int or state["revision"] < 1:
             return fail("continuity_state_unavailable")
         revision = state["revision"]
+        if str(previous.get("schema") or "") != THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
+            return fail("continuity_checkpoint_unsupported")
     elif continuity_status != "absent":
         return fail("continuity_state_unavailable")
     trace.update(

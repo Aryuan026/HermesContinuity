@@ -722,7 +722,7 @@ class ContinuityRuntime:
         selected = candidate if candidate is not None else self._old_checkpoint(bundle)
         bridge = thread_continuity_bridge_projection(selected)
         raw_bridge_body = str(bridge.get("body") or "")
-        if str(bridge.get("status") or "") not in {"ready", "legacy_unverified"}:
+        if str(bridge.get("status") or "") != "ready":
             raw_bridge_body = ""
         bridge_body = (
             f"{raw_bridge_body.rstrip()}\n{CONTINUITY_END_BOUNDARY}"

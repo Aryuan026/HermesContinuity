@@ -19,7 +19,9 @@ if PACKAGE not in sys.modules:
 context_compactor = importlib.import_module(f"{PACKAGE}.context_compactor")
 accept_summary_chunk_attempt = context_compactor.accept_summary_chunk_attempt
 accept_summary_attempt = context_compactor.accept_summary_attempt
-build_thread_continuity_checkpoint = context_compactor.build_thread_continuity_checkpoint
+build_thread_continuity_checkpoint_v2 = (
+    context_compactor.build_thread_continuity_checkpoint_v2
+)
 build_thread_continuity_checkpoint_from_attempts = (
     context_compactor.build_thread_continuity_checkpoint_from_attempts
 )
@@ -38,6 +40,9 @@ render_thread_continuity_checkpoint_message = (
 )
 thread_continuity_prefix_fingerprint = (
     context_compactor.thread_continuity_prefix_fingerprint
+)
+thread_continuity_retirement_source_group_ids = (
+    context_compactor.thread_continuity_retirement_source_group_ids
 )
 validate_thread_continuity_input = context_compactor.validate_thread_continuity_input
 
@@ -119,6 +124,31 @@ def estimate_messages(messages: list[dict]) -> int:
     return total
 
 
+def v2_checkpoint_fixture(
+    *,
+    previous_state: dict | None,
+    source_groups: list[dict],
+    covered_source_group_ids: list[str],
+    summary_text: str,
+) -> dict:
+    reference_at = max(
+        str(row.get("effective_event_at") or "") for row in source_groups
+    )
+    return build_thread_continuity_checkpoint_v2(
+        previous_state=previous_state,
+        source_groups=source_groups,
+        retired_source_group_ids=covered_source_group_ids,
+        bridge_source_group_ids=covered_source_group_ids,
+        bridge_text=summary_text,
+        bridge_policy={
+            "reference_at": reference_at,
+            "recent_horizon_hours": 72,
+            "source_token_limit": 24_000,
+            "output_token_limit": 2_048,
+        },
+    )
+
+
 def fold_plan(
     rows: list[dict],
     *,
@@ -175,7 +205,7 @@ def summary_owner(
     fixed_non_message: int = 0,
     previous: dict | None = None,
 ) -> tuple[dict, dict]:
-    previous_ids = list(dict((previous or {}).get("covered_through") or {}).get("source_prefix_ids") or [])
+    previous_ids = thread_continuity_retirement_source_group_ids(previous)
     minimum = previous_ids or [row["source_prefix_id"] for row in rows]
     for size in range(1, window + 1, 10):
         current = {"role": "user", "message_id": "u-current", "content": "当" * size}
@@ -343,23 +373,25 @@ class ThreadContinuityIdentityTests(unittest.TestCase):
             ["user", "assistant", "assistant", "user", "assistant"],
         )
 
-        checkpoint = build_thread_continuity_checkpoint(
+        checkpoint = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows,
             covered_source_group_ids=["dialogue-1", "proactive-1", "dialogue-2"],
             summary_text="accepted summary",
         )
         self.assertEqual(
-            checkpoint["covered_through"]["source_prefix_ids"],
+            checkpoint["retirement_cursor"]["source_prefix_ids"],
             ["dialogue-1", "proactive-1", "dialogue-2"],
         )
-        self.assertEqual(len(checkpoint["covered_through"]["source_group_fingerprints"]), 3)
+        self.assertEqual(
+            len(checkpoint["retirement_cursor"]["source_group_fingerprints"]), 3
+        )
 
         changed = copy.deepcopy(rows)
         changed[1] = group("proactive-1", "后来出现的用户", "主动原话" * 100)
         with self.assertRaisesRegex(ValueError, "thread_continuity_checkpoint_invalid"):
             normalize_thread_continuity_checkpoint(checkpoint, source_groups=changed)
-        rebuilt = build_thread_continuity_checkpoint(
+        rebuilt = v2_checkpoint_fixture(
             previous_state=checkpoint,
             source_groups=changed,
             covered_source_group_ids=["dialogue-1", "proactive-1", "dialogue-2"],
@@ -429,14 +461,14 @@ class ThreadContinuityIdentityTests(unittest.TestCase):
 
     def test_opaque_revision_binds_ordered_prefix_summary_and_predecessor(self) -> None:
         rows = [group("g-1", "一", "答一"), group("g-2", "二", "答二")]
-        first = build_thread_continuity_checkpoint(
+        first = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows[:1],
             covered_source_group_ids=["g-1"],
             summary_text="第一版摘要",
         )
         self.assertRegex(first["revision_id"], r"^tcr_[0-9a-f]{64}$")
-        second = build_thread_continuity_checkpoint(
+        second = v2_checkpoint_fixture(
             previous_state=first,
             source_groups=rows,
             covered_source_group_ids=["g-1", "g-2"],
@@ -450,8 +482,8 @@ class ThreadContinuityIdentityTests(unittest.TestCase):
             second,
         )
 
-        with self.assertRaisesRegex(ValueError, "covered_prefix_regression"):
-            build_thread_continuity_checkpoint(
+        with self.assertRaisesRegex(ValueError, "retirement_cursor_regression"):
+            v2_checkpoint_fixture(
                 previous_state=second,
                 source_groups=rows,
                 covered_source_group_ids=["g-1"],
@@ -460,7 +492,7 @@ class ThreadContinuityIdentityTests(unittest.TestCase):
 
     def test_late_repair_reorder_or_substitution_rebuilds_from_canonical_source(self) -> None:
         rows = [group("g-1", "原始", "回答"), group("g-2", "后续", "回答")]
-        checkpoint = build_thread_continuity_checkpoint(
+        checkpoint = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows,
             covered_source_group_ids=["g-1"],
@@ -472,7 +504,7 @@ class ThreadContinuityIdentityTests(unittest.TestCase):
             [rows[1], rows[0]],
         )
         for changed in variants:
-            rebuilt = build_thread_continuity_checkpoint(
+            rebuilt = v2_checkpoint_fixture(
                 previous_state=checkpoint,
                 source_groups=changed,
                 covered_source_group_ids=[changed[0]["source_prefix_id"]],
@@ -483,7 +515,7 @@ class ThreadContinuityIdentityTests(unittest.TestCase):
 
     def test_checkpoint_tampering_fails_closed(self) -> None:
         rows = [group("g-1", "用户", "回答")]
-        state = build_thread_continuity_checkpoint(
+        state = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows,
             covered_source_group_ids=["g-1"],
@@ -491,12 +523,18 @@ class ThreadContinuityIdentityTests(unittest.TestCase):
         )
         tampered_rows = (
             {**state, "revision_id": "tcr_" + "0" * 64},
-            {**state, "summary_sha256": "0" * 64},
+            {
+                **state,
+                "recent_bridge": {
+                    **state["recent_bridge"],
+                    "body_sha256": "0" * 64,
+                },
+            },
             {**state, "source_fingerprint": "0" * 64},
             {
                 **state,
-                "covered_through": {
-                    **state["covered_through"],
+                "retirement_cursor": {
+                    **state["retirement_cursor"],
                     "source_group_fingerprints": ["0" * 64],
                 },
             },
@@ -506,7 +544,7 @@ class ThreadContinuityIdentityTests(unittest.TestCase):
                 normalize_thread_continuity_checkpoint(tampered, source_groups=rows)
 
         two_rows = [*rows, group("g-2", "用户二", "回答二")]
-        two_covered = build_thread_continuity_checkpoint(
+        two_covered = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=two_rows,
             covered_source_group_ids=["g-1", "g-2"],
@@ -524,7 +562,7 @@ class ThreadContinuityIdentityTests(unittest.TestCase):
 
     def test_checkpoint_renderer_has_one_validated_system_message_owner(self) -> None:
         rows = [group("g-1", "用户", "回答")]
-        checkpoint = build_thread_continuity_checkpoint(
+        checkpoint = v2_checkpoint_fixture(
             previous_state=None, source_groups=rows,
             covered_source_group_ids=["g-1"], summary_text="可递送摘要",
         )
@@ -534,7 +572,13 @@ class ThreadContinuityIdentityTests(unittest.TestCase):
         self.assertEqual(rendered["role"], "system")
         self.assertIn(checkpoint["revision_id"], rendered["content"])
         self.assertTrue(rendered["content"].endswith("可递送摘要"))
-        forged = {**checkpoint, "summary_text": "伪摘要"}
+        forged = {
+            **checkpoint,
+            "recent_bridge": {
+                **checkpoint["recent_bridge"],
+                "body": "伪摘要",
+            },
+        }
         with self.assertRaises(ValueError):
             render_thread_continuity_checkpoint_message(forged, source_groups=rows)
 
@@ -596,13 +640,19 @@ class ThreadContinuityPlannerTests(unittest.TestCase):
     def test_previous_summary_infeasible_requires_canonical_rebuild(self) -> None:
         old = [group("g-old", "旧", "旧回答")]
         rows = old + [group("g-new", "新" * 2400, "答" * 2400)]
-        previous = build_thread_continuity_checkpoint(
+        previous = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=old,
             covered_source_group_ids=["g-old"],
             summary_text="旧摘要",
         )
-        forged = {**previous, "summary_text": "伪造不同正文"}
+        forged = {
+            **previous,
+            "recent_bridge": {
+                **previous["recent_bridge"],
+                "body": "伪造不同正文",
+            },
+        }
         plan = fold_plan(rows, previous=forged)
         fresh = fold_plan(rows)
         self.assertEqual((plan["status"], plan["continuity_mode"]), ("fold_required", "rebuild"))
@@ -611,7 +661,7 @@ class ThreadContinuityPlannerTests(unittest.TestCase):
         self.assertEqual(plan["raw_suffix_group_ids"], fresh["raw_suffix_group_ids"])
         self.assertEqual(plan["fold_plan_id"], fresh["fold_plan_id"])
 
-        huge_previous = build_thread_continuity_checkpoint(
+        huge_previous = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=old,
             covered_source_group_ids=["g-old"],
@@ -686,7 +736,7 @@ class ThreadContinuityPlannerTests(unittest.TestCase):
 
     def test_incremental_replan_emits_full_canonical_minimum_prefix(self) -> None:
         rows = [group(f"g-{index}", "用" * 900, "答" * 900) for index in range(3)]
-        previous = build_thread_continuity_checkpoint(
+        previous = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows[:1],
             covered_source_group_ids=["g-0"],
@@ -741,7 +791,7 @@ class ThreadContinuityPlannerTests(unittest.TestCase):
         self.assertRegex(rebuild["fold_plan_id"], r"^tcfp_[0-9a-f]{64}$")
         self.assertEqual(validate_owner_plan(rebuild, rows), rebuild)
 
-        checkpoint = build_thread_continuity_checkpoint(
+        checkpoint = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows[:1],
             covered_source_group_ids=["g-0"],
@@ -1026,7 +1076,7 @@ class ThreadContinuitySummaryBatchTests(unittest.TestCase):
 
     def test_incremental_carry_and_oversized_carry_switch_to_rebuild(self) -> None:
         rows = [group("g-1", "一" * 400, "答一" * 400), group("g-2", "二" * 400, "答二" * 400)]
-        checkpoint = build_thread_continuity_checkpoint(
+        checkpoint = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows[:1],
             covered_source_group_ids=["g-1"],
@@ -1079,7 +1129,7 @@ class ThreadContinuitySummaryBatchTests(unittest.TestCase):
         self.assertEqual(incremental_checkpoint["lineage_status"], "continued")
         self.assertEqual(incremental_checkpoint["predecessor_revision_id"], checkpoint["revision_id"])
 
-        large_checkpoint = build_thread_continuity_checkpoint(
+        large_checkpoint = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows[:1],
             covered_source_group_ids=["g-1"],
@@ -1176,7 +1226,13 @@ class ThreadContinuitySummaryBatchTests(unittest.TestCase):
             "fold_plan_invalid",
         )
 
-        forged_checkpoint = {**checkpoint, "summary_text": "伪造不同正文"}
+        forged_checkpoint = {
+            **checkpoint,
+            "recent_bridge": {
+                **checkpoint["recent_bridge"],
+                "body": "伪造不同正文",
+            },
+        }
         canonical_owner, canonical_current = summary_owner(rows, previous=forged_checkpoint)
         fresh_owner = fold_plan(
             rows,
@@ -1494,7 +1550,7 @@ class ThreadContinuityPhysicalOwnerSidecarTests(unittest.TestCase):
 
     def test_existing_checkpoint_is_reference_only_with_zero_alias_omission_authority(self) -> None:
         rows = [group("g-1", "同一条历史正文", "历史回答")]
-        checkpoint = build_thread_continuity_checkpoint(
+        checkpoint = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows,
             covered_source_group_ids=["g-1"],
@@ -1508,8 +1564,10 @@ class ThreadContinuityPhysicalOwnerSidecarTests(unittest.TestCase):
             if row["carrier_kind"] == "checkpoint"
         ]
         self.assertEqual(len(checkpoint_rows), 1)
-        self.assertEqual(checkpoint_rows[0]["checkpoint_kind"], "legacy_bridge")
-        self.assertEqual(checkpoint_rows[0]["relation"], "legacy_bridge_unverified")
+        self.assertEqual(checkpoint_rows[0]["checkpoint_kind"], "recent_bridge")
+        self.assertEqual(
+            checkpoint_rows[0]["relation"], "represented_in_recent_bridge"
+        )
         self.assertEqual(checkpoint_rows[0]["source_group_aliases"], [])
         self.assertEqual(checkpoint_rows[0]["source_message_aliases"], [])
 
@@ -1800,13 +1858,19 @@ class ThreadContinuitySummaryChunkTests(unittest.TestCase):
             "chunk_owner_invalid",
         )
 
-        checkpoint = build_thread_continuity_checkpoint(
+        checkpoint = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows,
             covered_source_group_ids=["huge"],
             summary_text="旧摘要",
         )
-        forged_checkpoint = {**checkpoint, "summary_text": "篡改摘要"}
+        forged_checkpoint = {
+            **checkpoint,
+            "recent_bridge": {
+                **checkpoint["recent_bridge"],
+                "body": "篡改摘要",
+            },
+        }
         recovered_owner, recovered_current = summary_owner(
             rows, window=280, reserve=40, previous=forged_checkpoint
         )

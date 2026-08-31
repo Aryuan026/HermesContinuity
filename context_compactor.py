@@ -126,7 +126,6 @@ def _normalize(text: str) -> str:
     return text
 
 
-THREAD_CONTINUITY_CHECKPOINT_SCHEMA = "thread_continuity_checkpoint.v1"
 THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA = "thread_continuity_checkpoint.v2"
 THREAD_CONTINUITY_RETIREMENT_CURSOR_SCHEMA = "thread_continuity_retirement_cursor.v1"
 THREAD_CONTINUITY_RECENT_BRIDGE_SCHEMA = "thread_continuity_recent_bridge.v1"
@@ -185,10 +184,9 @@ def thread_continuity_retirement_source_group_ids(
     checkpoint: Mapping[str, Any] | None,
 ) -> List[str]:
     row = dict(checkpoint or {})
-    if str(row.get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
-        cursor = row.get("retirement_cursor")
-    else:
-        cursor = row.get("covered_through")
+    if str(row.get("schema") or "") != THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
+        return []
+    cursor = row.get("retirement_cursor")
     return [
         str(value or "").strip()
         for value in list(dict(cursor or {}).get("source_prefix_ids") or [])
@@ -221,12 +219,11 @@ def thread_continuity_bridge_projection(
             "source_token_limit": bridge.get("source_token_limit"),
             "output_token_limit": bridge.get("output_token_limit"),
         }
-    body = str(row.get("summary_text") or "")
     return {
-        "status": "legacy_unverified" if body else "empty",
-        "relation": "legacy_unverified" if body else "no_visible_representation",
-        "body": body,
-        "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        "status": "empty",
+        "relation": "no_visible_representation",
+        "body": "",
+        "body_sha256": hashlib.sha256(b"").hexdigest(),
         "represented_source_group_ids": [],
         "source_group_fingerprints": [],
         "source_slice_fingerprint": "",
@@ -473,23 +470,12 @@ def _thread_continuity_currentness_plan(
             "excluded_by_token_count": 0,
         }
     previous_bridge = thread_continuity_bridge_projection(previous)
-    previous_schema = str(dict(previous or {}).get("schema") or "")
     bridge_refresh_required = bool(
         previous
         and (
-            (
-                reference_at is not None
-                and previous_schema == THREAD_CONTINUITY_CHECKPOINT_SCHEMA
-                and previous_bridge["status"] == "legacy_unverified"
-            )
-            or (
-                previous_schema == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA
-                and (
-                    previous_bridge["status"] != selected["status"]
-                    or list(previous_bridge["represented_source_group_ids"])
-                    != list(selected["source_group_ids"])
-                )
-            )
+            previous_bridge["status"] != selected["status"]
+            or list(previous_bridge["represented_source_group_ids"])
+            != list(selected["source_group_ids"])
         )
     )
     return {
@@ -576,12 +562,7 @@ def _project_thread_continuity_physical_owner_sidecar(
             )
         )
         index += 1
-    checkpoint_kind = (
-        "legacy_bridge"
-        if (plan.get("status"), plan.get("reason")) == ("no_fold", "within_budget")
-        and plan.get("previous_bridge_status") == "legacy_unverified"
-        else "recent_bridge"
-    )
+    checkpoint_kind = "recent_bridge"
     for message in checkpoint_messages:
         rows.append(
             _physical_owner_row(
@@ -617,11 +598,7 @@ def _project_thread_continuity_physical_owner_sidecar(
                         ),
                     }
                 ),
-                relation=(
-                    "legacy_bridge_unverified"
-                    if checkpoint_kind == "legacy_bridge"
-                    else "represented_in_recent_bridge"
-                ),
+                relation="represented_in_recent_bridge",
             )
         )
         index += 1
@@ -799,9 +776,7 @@ def _physical_owner_sidecar_payload_valid(
                 False,
                 False,
                 row.get("source_fingerprint"),
-                "legacy_bridge_unverified"
-                if checkpoint_kind == "legacy_bridge"
-                else "represented_in_recent_bridge",
+                "represented_in_recent_bridge",
             ),
             "raw": ("none", True, True, row.get("source_fingerprint"), "same_canonical_body"),
             "current": ("none", False, True, row.get("source_fingerprint"), "same_canonical_body"),
@@ -812,7 +787,7 @@ def _physical_owner_sidecar_payload_valid(
             checkpoint_kind != expected_checkpoint
             or (
                 carrier == "checkpoint"
-                and checkpoint_kind not in {"legacy_bridge", "recent_bridge"}
+                and checkpoint_kind != "recent_bridge"
             )
             or bool(group_aliases) is not requires_group
             or bool(message_aliases) is not requires_message
@@ -984,197 +959,6 @@ def thread_continuity_prefix_fingerprint(groups: List[Dict[str, Any]]) -> str:
     ).hexdigest()
 
 
-def _revision_id(
-    predecessor_revision_id: str,
-    covered_ids: List[str],
-    covered_fingerprints: List[str],
-    summary_sha256: str,
-) -> str:
-    binding = [
-        predecessor_revision_id,
-        [[source_id, fingerprint] for source_id, fingerprint in zip(covered_ids, covered_fingerprints)],
-        summary_sha256,
-    ]
-    digest = hashlib.sha256(
-        json.dumps(binding, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return f"tcr_{digest}"
-
-
-def _state_revision_identity_valid(state: Mapping[str, Any]) -> bool:
-    covered = state.get("covered_through") if isinstance(state.get("covered_through"), Mapping) else {}
-    covered_ids = [str(value or "").strip() for value in list(covered.get("source_prefix_ids") or [])]
-    covered_fingerprints = [
-        str(value or "").strip() for value in list(covered.get("source_group_fingerprints") or [])
-    ]
-    expected = _revision_id(
-        str(state.get("predecessor_revision_id") or "").strip(),
-        covered_ids,
-        covered_fingerprints,
-        str(state.get("summary_sha256") or "").strip(),
-    )
-    return bool(
-        covered_ids
-        and len(covered_ids) == len(covered_fingerprints)
-        and str(state.get("revision_id") or "").strip() == expected
-    )
-
-
-def _build_thread_continuity_checkpoint(
-    *,
-    previous_state: Mapping[str, Any] | None,
-    source_groups: List[Dict[str, Any]],
-    covered_source_group_ids: List[str],
-    summary_text: Any,
-    owner_rebuild: bool = False,
-) -> Dict[str, Any]:
-    normalized = normalize_complete_thread_groups(source_groups)
-    if not normalized["complete"]:
-        raise ValueError("thread_continuity_source_incomplete")
-    groups = list(normalized["groups"])
-    available_ids = [group["source_prefix_id"] for group in groups]
-    covered_ids = [str(value or "").strip() for value in covered_source_group_ids]
-    if not covered_ids or covered_ids != available_ids[: len(covered_ids)]:
-        raise ValueError("thread_continuity_covered_prefix_invalid")
-    if not isinstance(summary_text, str) or not _normalize(summary_text):
-        raise ValueError("thread_continuity_summary_invalid")
-    summary = _normalize(summary_text)
-    try:
-        previous_revision = int(dict(previous_state or {}).get("revision") or 0)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("thread_continuity_predecessor_invalid") from exc
-    if previous_revision < 0:
-        raise ValueError("thread_continuity_predecessor_invalid")
-    previous = dict(previous_state or {})
-    lineage_valid = False
-    if previous:
-        try:
-            normalize_thread_continuity_checkpoint(previous, source_groups=groups)
-            previous_source_ids = [str(value or "").strip() for value in list(previous.get("source_group_ids") or [])]
-            lineage_valid = previous_source_ids == available_ids[: len(previous_source_ids)]
-        except ValueError:
-            lineage_valid = False
-    previous_covered = [
-        str(value or "").strip()
-        for value in list(dict(previous.get("covered_through") or {}).get("source_prefix_ids") or [])
-    ] if lineage_valid else []
-    if lineage_valid and covered_ids[: len(previous_covered)] != previous_covered:
-        raise ValueError("thread_continuity_covered_prefix_regression")
-    lineage_status = "continued" if previous and lineage_valid else "rebuilt" if previous else "initial"
-    if owner_rebuild and previous and lineage_valid:
-        lineage_status = "rebuilt"
-    summary_hash = hashlib.sha256(summary.encode("utf-8")).hexdigest()
-    covered_groups = groups[: len(covered_ids)]
-    covered_fingerprints = [_group_fingerprint(group) for group in covered_groups]
-    prefix_fingerprint = thread_continuity_prefix_fingerprint(covered_groups)
-    predecessor_revision_id = (
-        str(previous.get("revision_id") or "").strip() if lineage_status == "continued" else ""
-    )
-    checkpoint = {
-        "schema": THREAD_CONTINUITY_CHECKPOINT_SCHEMA,
-        "revision": previous_revision + 1,
-        "predecessor_revision": previous_revision,
-        "source_group_ids": available_ids,
-        "source_fingerprint": thread_continuity_prefix_fingerprint(groups),
-        "revision_id": _revision_id(
-            predecessor_revision_id, covered_ids, covered_fingerprints, summary_hash
-        ),
-        "predecessor_revision_id": predecessor_revision_id,
-        "lineage_status": lineage_status,
-        "summary_text": summary,
-        "summary_sha256": summary_hash,
-        "covered_through": {
-            "source_prefix_ids": covered_ids,
-            "source_group_fingerprints": covered_fingerprints,
-            "prefix_fingerprint": prefix_fingerprint,
-        },
-    }
-    return normalize_thread_continuity_checkpoint(
-        checkpoint, source_groups=groups, previous_state=previous_state if lineage_valid else None
-    )
-
-
-def build_thread_continuity_checkpoint(
-    *, previous_state: Mapping[str, Any] | None, source_groups: List[Dict[str, Any]],
-    covered_source_group_ids: List[str], summary_text: Any,
-) -> Dict[str, Any]:
-    return _build_thread_continuity_checkpoint(
-        previous_state=previous_state, source_groups=source_groups,
-        covered_source_group_ids=covered_source_group_ids, summary_text=summary_text,
-    )
-
-
-def _normalize_thread_continuity_checkpoint_v1(
-    state: Mapping[str, Any],
-    *,
-    source_groups: List[Dict[str, Any]],
-    previous_state: Mapping[str, Any] | None = None,
-) -> Dict[str, Any]:
-    normalized = normalize_complete_thread_groups(source_groups)
-    if not normalized["complete"]:
-        raise ValueError("thread_continuity_source_incomplete")
-    row = dict(state or {})
-    if str(row.get("schema") or "") != THREAD_CONTINUITY_CHECKPOINT_SCHEMA:
-        raise ValueError("thread_continuity_checkpoint_invalid")
-    summary_value = row.get("summary_text")
-    if not isinstance(summary_value, str) or not _normalize(summary_value):
-        raise ValueError("thread_continuity_checkpoint_invalid")
-    summary = _normalize(summary_value)
-    summary_hash = hashlib.sha256(summary.encode("utf-8")).hexdigest()
-    covered = dict(row.get("covered_through") or {}) if isinstance(row.get("covered_through"), Mapping) else {}
-    covered_ids = [str(value or "").strip() for value in list(covered.get("source_prefix_ids") or [])]
-    covered_fingerprints = [
-        str(value or "").strip() for value in list(covered.get("source_group_fingerprints") or [])
-    ]
-    groups = list(normalized["groups"])
-    available_ids = [group["source_prefix_id"] for group in groups]
-    source_ids = [str(value or "").strip() for value in list(row.get("source_group_ids") or [])]
-    source_groups = groups[: len(source_ids)]
-    expected_covered_fingerprints = [_group_fingerprint(group) for group in groups[: len(covered_ids)]]
-    if (
-        type(row.get("revision")) is not int
-        or type(row.get("predecessor_revision")) is not int
-        or row["revision"] < 1
-        or row["predecessor_revision"] != row["revision"] - 1
-        or not source_ids
-        or source_ids != available_ids[: len(source_ids)]
-        or str(row.get("source_fingerprint") or "").strip()
-        != thread_continuity_prefix_fingerprint(source_groups)
-        or not covered_ids
-        or covered_ids != source_ids[: len(covered_ids)]
-        or covered_fingerprints != expected_covered_fingerprints
-        or str(covered.get("prefix_fingerprint") or "").strip()
-        != thread_continuity_prefix_fingerprint(groups[: len(covered_ids)])
-        or str(row.get("summary_sha256") or "").strip() != summary_hash
-        or not _state_revision_identity_valid(row)
-    ):
-        raise ValueError("thread_continuity_checkpoint_invalid")
-    lineage_status = str(row.get("lineage_status") or "").strip()
-    predecessor_id = str(row.get("predecessor_revision_id") or "").strip()
-    if lineage_status == "continued":
-        if not predecessor_id:
-            raise ValueError("thread_continuity_lineage_invalid")
-        if previous_state is not None:
-            previous = _normalize_thread_continuity_checkpoint_v1(
-                previous_state, source_groups=groups
-            )
-            previous_covered = dict(previous.get("covered_through") or {})
-            previous_ids = [
-                str(value or "").strip()
-                for value in list(previous_covered.get("source_prefix_ids") or [])
-            ]
-            if (
-                predecessor_id != str(previous.get("revision_id") or "").strip()
-                or covered_ids[: len(previous_ids)] != previous_ids
-                or row["predecessor_revision"] != previous["revision"]
-            ):
-                raise ValueError("thread_continuity_lineage_invalid")
-    elif lineage_status not in {"initial", "rebuilt"} or predecessor_id:
-        raise ValueError("thread_continuity_lineage_invalid")
-    row["summary_text"] = summary
-    return row
-
-
 def _v2_revision_id(
     predecessor_revision_id: str,
     retirement_cursor: Mapping[str, Any],
@@ -1303,16 +1087,9 @@ def normalize_thread_continuity_checkpoint(
     source_groups: List[Dict[str, Any]],
     previous_state: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    schema = str(dict(state or {}).get("schema") or "")
-    if schema == THREAD_CONTINUITY_CHECKPOINT_SCHEMA:
-        return _normalize_thread_continuity_checkpoint_v1(
-            state, source_groups=source_groups, previous_state=previous_state
-        )
-    if schema == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
-        return _normalize_thread_continuity_checkpoint_v2(
-            state, source_groups=source_groups, previous_state=previous_state
-        )
-    raise ValueError("thread_continuity_checkpoint_invalid")
+    return _normalize_thread_continuity_checkpoint_v2(
+        state, source_groups=source_groups, previous_state=previous_state
+    )
 
 
 def build_thread_continuity_checkpoint_v2(
@@ -1456,9 +1233,7 @@ def render_thread_continuity_checkpoint_message(
         return {}
     marker = _thread_continuity_checkpoint_marker(
         row["revision_id"], row["revision"], bridge["body_sha256"],
-    )
-    if str(row.get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
-        marker = marker.replace("Home Thread Continuity", "Home Recent Continuity")
+    ).replace("Home Thread Continuity", "Home Recent Continuity")
     return {"role": "system", "content": f"{marker}\n{bridge['body']}"}
 
 

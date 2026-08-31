@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
 import os
 import sys
@@ -35,15 +36,30 @@ if HERMES_AVAILABLE:
     from hermes_cli.plugins import get_plugin_manager  # noqa: E402
 
 
-OLD_CHECKPOINT = {
-    "schema": "thread_continuity_checkpoint.v1",
-    "summary_text": "old bridge",
-}
-CANDIDATE = {
-    "schema": "thread_continuity_checkpoint.v1",
-    "summary_text": "candidate bridge",
-    "source_group_ids": ["g1"],
-}
+def _checkpoint(revision: int, body: str) -> dict:
+    body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return {
+        "schema": "thread_continuity_checkpoint.v2",
+        "revision": revision,
+        "recent_bridge": {
+            "schema": "thread_continuity_recent_bridge.v1",
+            "status": "ready",
+            "relation": "represented_in_recent_bridge",
+            "source_group_ids": ["g1"],
+            "source_group_fingerprints": ["f" * 64],
+            "source_slice_fingerprint": "e" * 64,
+            "reference_at": "2026-08-30T00:00:00+00:00",
+            "recent_horizon_hours": 72,
+            "source_token_limit": 24_000,
+            "output_token_limit": 2_048,
+            "body": body,
+            "body_sha256": body_sha256,
+        },
+    }
+
+
+OLD_CHECKPOINT = _checkpoint(1, "old bridge")
+CANDIDATE = _checkpoint(2, "candidate bridge")
 
 
 class _Metadata:

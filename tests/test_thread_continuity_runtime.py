@@ -21,7 +21,6 @@ context_compactor = importlib.import_module(f"{PACKAGE}.context_compactor")
 thread_continuity_runtime = importlib.import_module(
     f"{PACKAGE}.thread_continuity_runtime"
 )
-build_thread_continuity_checkpoint = context_compactor.build_thread_continuity_checkpoint
 build_thread_continuity_checkpoint_v2 = (
     context_compactor.build_thread_continuity_checkpoint_v2
 )
@@ -114,6 +113,31 @@ def estimate_messages(messages: list[dict]) -> int:
             total += 2
         total += _estimate_tokens_from_content(message.get("content", ""))
     return total
+
+
+def v2_checkpoint_fixture(
+    *,
+    previous_state: dict | None,
+    source_groups: list[dict],
+    covered_source_group_ids: list[str],
+    summary_text: str,
+) -> dict:
+    reference_at = max(
+        str(row.get("effective_event_at") or "") for row in source_groups
+    )
+    return build_thread_continuity_checkpoint_v2(
+        previous_state=previous_state,
+        source_groups=source_groups,
+        retired_source_group_ids=covered_source_group_ids,
+        bridge_source_group_ids=covered_source_group_ids,
+        bridge_text=summary_text,
+        bridge_policy={
+            "reference_at": reference_at,
+            "recent_horizon_hours": 72,
+            "source_token_limit": 24_000,
+            "output_token_limit": 2_048,
+        },
+    )
 
 
 def project_cache(stage: str, result: object, *, provider_returned: bool) -> dict:
@@ -351,7 +375,9 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("day-0 recent bridge body", physical)
         self.assertNotIn("day-0 user body", physical)
 
-    async def test_v1_bridge_migrates_through_live_compiler(self) -> None:
+    async def test_unexpected_top_level_v1_fails_closed_without_projection_or_migration(
+        self,
+    ) -> None:
         rows = [
             group(
                 "g-day-0",
@@ -360,12 +386,12 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 event_at="2026-08-10T00:00:00Z",
             )
         ]
-        previous = build_thread_continuity_checkpoint(
-            previous_state=None,
-            source_groups=rows,
-            covered_source_group_ids=["g-day-0"],
-            summary_text="legacy lifetime body must never become canonical evidence",
-        )
+        previous = {
+            "schema": "thread_continuity_checkpoint.v1",
+            "revision": 1,
+            "summary_text": "legacy lifetime body must never become canonical evidence",
+            "covered_through": {"source_prefix_ids": ["g-day-0"]},
+        }
         compiled, provider = await compile_turn(
             rows,
             {"role": "user", "message_id": "u-current", "content": "tiny"},
@@ -377,12 +403,13 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(provider.calls, [])
-        checkpoint = compiled["checkpoint_candidate"]
-        self.assertEqual(checkpoint["schema"], "thread_continuity_checkpoint.v2")
-        self.assertEqual(checkpoint["recent_bridge"]["status"], "empty")
-        physical = repr(compiled["physical_provider_messages"])
-        self.assertNotIn("legacy lifetime body", physical)
-        self.assertNotIn("day-0 canonical user", physical)
+        self.assertEqual(
+            (compiled["status"], compiled["trace"]["reason"]),
+            ("fallback", "continuity_checkpoint_unsupported"),
+        )
+        self.assertEqual(provider.calls, [])
+        self.assertIsNone(compiled["checkpoint_candidate"])
+        self.assertEqual(compiled["physical_provider_messages"], [])
 
     async def test_expired_raw_prefix_retires_through_live_compiler(self) -> None:
         rows = [
@@ -572,7 +599,7 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
             for index in range(826)
         ]
-        previous = build_thread_continuity_checkpoint(
+        previous = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows[:399],
             covered_source_group_ids=[f"g-{index}" for index in range(399)],
@@ -741,13 +768,13 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             group("g-old", "旧用户", "旧回答"),
             group("g-near", "近场用户", "近场回答"),
         ]
-        corrupt = build_thread_continuity_checkpoint(
+        corrupt = v2_checkpoint_fixture(
             previous_state=None,
             source_groups=rows,
             covered_source_group_ids=["g-old"],
             summary_text="旧摘要",
         )
-        corrupt["summary_sha256"] = "f" * 64
+        corrupt["recent_bridge"]["body_sha256"] = "f" * 64
 
         result, provider = await compile_turn(
             rows,
@@ -776,7 +803,7 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             group("g-3", "u3", "a3"),
             proactive_group("g-4", "a4"),
         ]
-        previous = build_thread_continuity_checkpoint(
+        previous = v2_checkpoint_fixture(
             previous_state=None, source_groups=rows[:2],
             covered_source_group_ids=["g-0", "g-1"],
             summary_text="旧摘要" * 400,
@@ -950,7 +977,7 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_incremental_and_huge_previous_rebuild_lineage(self) -> None:
         rows = [group("g-old", "旧", "旧答"), group("g-new", "新" * 200, "新答" * 200)]
-        previous = build_thread_continuity_checkpoint(
+        previous = v2_checkpoint_fixture(
             previous_state=None, source_groups=rows[:1],
             covered_source_group_ids=["g-old"], summary_text="旧摘要",
         )
@@ -960,7 +987,7 @@ class ThreadContinuityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(incremental["checkpoint_candidate"]["lineage_status"], "continued")
         self.assertEqual(incremental["checkpoint_candidate"]["predecessor_revision_id"], previous["revision_id"])
 
-        huge_previous = build_thread_continuity_checkpoint(
+        huge_previous = v2_checkpoint_fixture(
             previous_state=None, source_groups=rows[:1],
             covered_source_group_ids=["g-old"], summary_text="旧摘要" * 2000,
         )
