@@ -15,7 +15,7 @@ Preserve these owner and provenance boundaries:
   AsherieSystem revision
   `ddfb1e9aeb7c6f7797912e959a0970c621875c83`.
 - Keep the Hermes baseline explicit: upstream `fcbd1076`, owner overlay
-  `c7c36f36`, and ordered generic seams `201fe77` through `969cf5b`.
+  `c7c36f36`, and ordered generic seams `201fe77` through `ccd7bf3`.
 - Do not weaken physical request verification or move checkpoint CAS before
   `post_api_request`.
 - Verify delivery against `hermes.transport.v3` final `provider_body`, not the
@@ -29,9 +29,9 @@ Preserve these owner and provenance boundaries:
   reviewed.
 - Keep MoA checkpoint publication disabled while its final provider body is
   transport-ambiguous.
-- Runtime dependencies remain standard-library-only. Test with
-  `python -B -m unittest discover -s tests -v`; use `HERMES_SOURCE_ROOT` for the
-  optional real `SessionDB` integration.
+- Runtime dependencies remain standard-library-only beyond the compatible
+  Hermes host. Test with that host on `PYTHONPATH`; use `HERMES_SOURCE_ROOT` for
+  the optional real `SessionDB` integration.
 - Never commit real owner/channel IDs, private paths, secrets, config, logs,
   databases, SQLite sidecars, or conversation fixtures.
 - Do not describe the plugin as published, installed, enabled, deployed, or

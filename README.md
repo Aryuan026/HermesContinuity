@@ -104,26 +104,31 @@ The reviewed host baseline and additive host seams are:
 - installer manifest-v2 alignment:
   `113b4ab5285f92a1013c6a494eb33260a7f70140`;
 - joint plugin Doctor:
-  `969cf5bdbc3a110e475c02ed8e4ee84f64be32ed`.
+  `969cf5bdbc3a110e475c02ed8e4ee84f64be32ed`;
+- shared request overlay ownership, scoped proof, and final-budget disposition:
+  `ccd7bf350ca54a44b7351904e079f5ffdb64eec0`.
 
-Apply the ten ordered patches in [`patches/`](patches/) to the compatible
-Hermes core. The first eight are runtime prerequisites; the final two align
+Apply the eleven ordered patches in [`patches/`](patches/) to the compatible
+Hermes core. The first eight are runtime prerequisites, the next two align
 the official installer with manifest v2 and let Doctor load dependency sets in
-one initialized temporary profile. They are generic host capabilities, not
-plugin-specific monkey patches. Registration fails visibly if a required
-runtime schema or API is absent.
+one initialized temporary profile, and the last owns generic request-overlay
+carrier/proof behavior. They are generic host capabilities, not plugin-specific
+monkey patches. Registration fails visibly if a required runtime schema or API
+is absent.
 
 The order is: `plugin-llm-finish-reason`, `request-middleware-v2`,
 `plugin-service-registry`, `bounded-session-message-reads`,
 `provider-transport-truth`, `closed-finish-state-truth`,
 `final-provider-budget-controls`, `verified-wakeup-provenance`,
-`installer-manifest-v2`, then `joint-plugin-doctor`.
+`installer-manifest-v2`, `joint-plugin-doctor`, then `request-overlay-proofs`.
 
 ## Test
 
-The default suite uses only the Python standard library:
+The default suite uses the Python standard library plus the shared overlay
+module from the compatible Hermes tree:
 
 ```bash
+PYTHONPATH=/path/to/patched/hermes \
 python -B -m unittest discover -s tests -v
 ```
 
@@ -136,12 +141,13 @@ HERMES_SOURCE_ROOT=/path/to/hermes \
 python -B -m unittest discover -s tests -v
 ```
 
-All committed fixtures are synthetic. Public GitHub Actions runs only the
-standard-library Python 3.11/3.12 unit suite. Compatible-Hermes, transport,
-gateway, and dual-middleware counts recorded in `PROGRESS.md` are separately
-run local exact-revision integration evidence; they are not implied by a Green
-public workflow. Optional real-Hermes integration requires
-`HERMES_SOURCE_ROOT`.
+All committed fixtures are synthetic. Public GitHub Actions now replays all
+eleven patches from pure upstream `fcbd1076`, runs the shared-overlay host
+tests, then runs the plugin's Python 3.11/3.12 unit suite against that
+materialized host. Transport, gateway, SessionDB, and dual-plugin entrypoint
+counts recorded in `PROGRESS.md` remain separate local exact-tree integration
+evidence; they are not implied by a Green public workflow. Those tests require
+`HERMES_SOURCE_ROOT` and, where named, `HERMES_GLOBAL_HOT_ROOT`.
 
 ## Current status
 

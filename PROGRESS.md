@@ -13,10 +13,10 @@
   compression-lineage union, complete dialogue groups, closed source classes,
   consumer-bound class filtering, explicit custom-frontend source ownership,
   and body-free policy-exclusion trace.
-- Host prerequisites: ten ordered generic patches are recorded under
+- Host prerequisites: eleven ordered generic patches are recorded under
   `patches/`; the final compatible Hermes core commit is
-  `969cf5bdbc3a110e475c02ed8e4ee84f64be32ed` (`hermes.transport.v3`,
-  manifest-v2 installer, and joint Doctor).
+  `ccd7bf350ca54a44b7351904e079f5ffdb64eec0` (`hermes.transport.v3`,
+  manifest-v2 installer, joint Doctor, and shared request overlays).
 - Host verification: closed finish-state matrix 537 passed / 6 skipped;
   final-body budget targeted 169/169 and associated 306/306; verified wakeup
   provenance 5/5 over the real loopback API path. These are local exact-tree
@@ -44,6 +44,15 @@
   settings are removed. A real two-profile `PluginManager` test keeps the two
   read-only SessionDB handles and receipt stores separate after ambient profile
   overrides are reset; the complete compatible-Hermes suite remains 221/221.
+- Shared-overlay candidate: provider carrier selection, exact projection,
+  scoped removal, canonical request hashing, and final-budget dispositions now
+  live in the generic Hermes host seam. Continuity's duplicate projector and
+  its mirror test file are removed; execution proof remains strict while the
+  final SDK guard can compose with another owner that has already removed its
+  own block. The exact host suite is 202/202 after this consolidation.
+  The public-shaped plugin suite is 187 pass / 15 expected real-host skips;
+  public CI also replays all eleven patches and runs the 17 shared-overlay host
+  tests before the plugin matrix.
 - Plugin lifecycle proof: exact public candidates `698fd4d` and `9f01f61`
   installed through the official CLI into a disposable profile with full
   commit pins and remained disabled; Continuity passed native Doctor, Global
@@ -66,6 +75,6 @@
 - Runtime status: not installed, not enabled, not deployed, and not validated
   in a live Hermes conversation.
 
-The next review should assess the fixed profile realm and removed path settings,
-then continue with H11 boundaries. No installation or deployment is authorized
-here.
+The next review should assess H11's shared ownership boundary, the deleted
+plugin copies, and public patch replay. No installation or deployment is
+authorized here.

@@ -21,4 +21,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Materialize compatible Hermes host
+        run: |
+          git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes"
+          git -C "$RUNNER_TEMP/hermes" checkout fcbd1076a93841fa88855acce810e342a5b78101
+          for patch in \
+            hermes-0.20.5-plugin-llm-finish-reason.patch \
+            hermes-0.20.5-request-middleware-v2.patch \
+            hermes-0.20.5-plugin-service-registry.patch \
+            hermes-0.20.5-bounded-session-message-reads.patch \
+            hermes-0.20.5-provider-transport-truth.patch \
+            hermes-0.20.5-closed-finish-state-truth.patch \
+            hermes-0.20.5-final-provider-budget-controls.patch \
+            hermes-0.20.5-verified-wakeup-provenance.patch \
+            hermes-0.20.5-installer-manifest-v2.patch \
+            hermes-0.20.5-joint-plugin-doctor.patch \
+            hermes-0.20.5-request-overlay-proofs.patch
+          do
+            git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/$patch"
+          done
+          echo "PYTHONPATH=$RUNNER_TEMP/hermes" >> "$GITHUB_ENV"
+      - name: Verify shared request overlay host seam
+        run: |
+          cd "$RUNNER_TEMP/hermes"
+          python -B -m unittest tests.test_request_overlay -v
       - run: python -B -m unittest discover -s tests -v

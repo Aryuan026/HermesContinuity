@@ -40,7 +40,7 @@ provider, or a replacement compressor.
 - Leave `codex_app_server` unchanged in v1.
 - Leave MoA prepared requests unchanged and unpublished until Hermes can expose
   an unambiguous final provider body for that path.
-- Require all ten generic Hermes host seams documented in `README.md`.
+- Require all eleven generic Hermes host seams documented in `README.md`.
 - Keep attempts that miss both post/error hooks under a strict count cap and
   TTL. Expiry revokes settlement authority. Execution may remove an expired
   carrier only while it still holds the exact bound proof; if another entry

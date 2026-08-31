@@ -600,54 +600,6 @@ class ContinuityRuntimeTests(unittest.TestCase):
         self.assertEqual(calls[0]["messages"][-1]["content"][-1], hot_block)
         self.assertEqual(len(adapter.cas_calls), 1)
 
-    def test_large_carrier_proof_hashes_only_the_bound_adjacent_material(self) -> None:
-        carriers = {
-            "one-megabyte-string": "x" * 1_000_000,
-            "ten-thousand-parts": [
-                {"type": "input_text", "text": f"part-{index}"}
-                for index in range(10_000)
-            ],
-        }
-        for name, content in carriers.items():
-            with self.subTest(name=name):
-                adapter = FakeAdapter(bundle())
-                compiler = FakeCompiler(checkpoint("bridge"))
-                runtime = ContinuityRuntime(
-                    adapter,
-                    FakeLlm(),
-                    compiler=compiler,
-                    estimator=lambda messages: max(1, len(repr(messages)) // 4),
-                    clock=lambda: "2026-08-30T00:00:00+00:00",
-                )
-                original = request()
-                original["messages"][-1]["content"] = content
-                projected = project(
-                    runtime,
-                    original,
-                    context_window_tokens=2_000_000,
-                )
-                calls = 0
-                content_sha256 = runtime._content_sha256
-
-                def counted(value):
-                    nonlocal calls
-                    calls += 1
-                    return content_sha256(value)
-
-                runtime._content_sha256 = counted
-                _result, provider_calls = execute(
-                    runtime,
-                    projected["request"],
-                    original,
-                    context_window_tokens=2_000_000,
-                )
-
-                self.assertEqual(len(provider_calls), 1)
-                self.assertIn("bridge", repr(provider_calls[0]))
-                # execution proof, final-body filter, and captured-body proof
-                # each hash one deterministic adjacent slice; none scans.
-                self.assertLessEqual(calls, 3)
-
     def test_codex_sanitize_stages_the_provider_bound_request_hash(self) -> None:
         adapter = FakeAdapter(bundle())
         compiler = FakeCompiler(checkpoint("bridge"))
