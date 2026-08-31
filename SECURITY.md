@@ -6,8 +6,11 @@ revisions.
 
 ## Data boundaries
 
-- Hermes `state.db` is opened through `SessionDB(read_only=True)` and remains
-  the canonical transcript owner.
+- The active Hermes profile's `state.db` is opened through
+  `SessionDB(read_only=True)` and remains the canonical transcript owner.
+- Continuity metadata is fixed under the same profile's Hermes-owned
+  `plugin-data/<host-owned-plugin-namespace>/` directory. Neither database
+  path is configurable by the plugin.
 - The plugin does not copy canonical messages, create FTS/search storage, or
   register a search tool. Exact historical sentences remain retrievable through
   Hermes native `session_search`.
@@ -57,11 +60,11 @@ fail closed.
 
 The checkpoint update and its delivery receipt commit in one metadata-database
 transaction. Source rereads occur before that transaction, so a long source
-scan cannot hold the metadata write lock. Plugin registration rejects a
-metadata path that resolves to Hermes `state.db`, including symlink/hardlink
-aliases. Before any Continuity table is created, the metadata store also
-rejects Hermes canonical tables, a foreign/malformed owner, and unclaimed
-nonempty SQLite schema; a valid store carries one single-plugin owner claim.
+scan cannot hold the metadata write lock. The fixed canonical and metadata
+paths are derived from the same active profile rather than caller input.
+Before any Continuity table is created, the metadata store rejects Hermes
+canonical tables, a foreign/malformed owner, and unclaimed nonempty SQLite
+schema; a valid store carries one single-plugin owner claim.
 
 `api_mode=codex_app_server` is deliberately unsupported in v1 and receives no
 projection. MoA prepared requests remain transport-ambiguous and cannot publish

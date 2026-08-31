@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import fields
-from pathlib import Path
 from typing import Any
 
 from .hermes_adapter import (
@@ -12,28 +11,6 @@ from .hermes_adapter import (
     HermesSessionAdapter,
 )
 from .runtime import ContinuityRuntime
-
-
-def _path_setting(ctx: Any, key: str, fallback: Path | None = None) -> Path | None:
-    value = str(ctx.get_config(key, default="") or "").strip()
-    if value:
-        return Path(value).expanduser()
-    return fallback
-
-
-def _same_database(left: str | Path, right: str | Path) -> bool:
-    left_path = Path(left).expanduser()
-    right_path = Path(right).expanduser()
-    try:
-        if left_path.resolve(strict=False) == right_path.resolve(strict=False):
-            return True
-        return bool(
-            left_path.exists()
-            and right_path.exists()
-            and left_path.samefile(right_path)
-        )
-    except (OSError, RuntimeError):
-        return False
 
 
 def _string_list_setting(ctx: Any, key: str) -> list[str]:
@@ -90,7 +67,10 @@ def register(ctx: Any) -> None:
     additional_human_sources = _string_list_setting(
         ctx, "additional_human_sources"
     )
-    session_db_path = _path_setting(ctx, "state_db")
+    # Hermes owns this layout: <profile>/plugin-data/<plugin namespace>.
+    plugin_data_dir = ctx.state.data_dir
+    profile_home = plugin_data_dir.parent.parent
+    session_db_path = profile_home / "state.db"
     session_db = SessionDB(db_path=session_db_path, read_only=True)
     # Register resource cleanup at acquisition time. The host disposes its
     # ownership ledger in reverse order, so the service registered last below
@@ -102,19 +82,7 @@ def register(ctx: Any) -> None:
             "Hermes Continuity requires "
             "SessionDB.get_messages_time_window()"
         )
-    metadata_path = _path_setting(
-        ctx,
-        "metadata_db",
-        Path(ctx.state.data_dir) / "continuity.sqlite3",
-    )
-    state_path = getattr(session_db, "db_path", None)
-    if metadata_path is None or (
-        state_path is not None and _same_database(state_path, metadata_path)
-    ):
-        session_db.close()
-        raise RuntimeError(
-            "Hermes Continuity metadata_db must not alias Hermes state.db"
-        )
+    metadata_path = plugin_data_dir / "continuity.sqlite3"
     try:
         metadata_store = ContinuityMetadataStore(metadata_path)
     except Exception:

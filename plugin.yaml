@@ -11,14 +11,6 @@ provides_hooks:
   - post_api_request
   - api_request_error
 config_schema:
-  state_db:
-    type: str
-    default: ""
-    description: Optional Hermes state.db path; empty uses the active profile database
-  metadata_db:
-    type: str
-    default: ""
-    description: Optional checkpoint database path; empty uses profile-scoped plugin data
   additional_human_sources:
     type: list
     default: []

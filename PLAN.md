@@ -46,8 +46,10 @@ provider, or a replacement compressor.
   carrier only while it still holds the exact bound proof; if another entry
   point has already swept that proof, it preserves the request unchanged
   rather than guessing that user-authored text is plugin-owned.
-- Reject `metadata_db` aliases of `state.db`, Hermes canonical schema, metadata
-  files claimed by a different plugin owner, and unclaimed nonempty SQLite.
+- Bind the read-only canonical handle to the active profile's `state.db` and
+  metadata to that profile's Hermes-owned plugin-data realm. Reject Hermes
+  canonical schema, files claimed by a different plugin owner, and unclaimed
+  nonempty SQLite rather than accepting path overrides.
 
 ## Long-history gate
 

@@ -38,6 +38,12 @@
   legacy physical-owner relation are removed in this review candidate;
   unexpected top-level v1 now fails closed without projection or migration.
   Checkpoint v2 and the nested retirement/recent-bridge v1 schemas remain.
+- Fixed profile-realm candidate: canonical reads are pinned to the active
+  profile's `state.db`, Continuity metadata is pinned to that profile's
+  host-owned plugin-data namespace, and the obsolete `state_db` / `metadata_db`
+  settings are removed. A real two-profile `PluginManager` test keeps the two
+  read-only SessionDB handles and receipt stores separate after ambient profile
+  overrides are reset; the complete compatible-Hermes suite remains 221/221.
 - Plugin lifecycle proof: exact public candidates `698fd4d` and `9f01f61`
   installed through the official CLI into a disposable profile with full
   commit pins and remained disabled; Continuity passed native Doctor, Global
@@ -60,6 +66,6 @@
 - Runtime status: not installed, not enabled, not deployed, and not validated
   in a live Hermes conversation.
 
-The next review should assess this checkpoint-v1 removal, then continue with
-the fixed profile-realm path and H11 boundaries. No installation or deployment
-is authorized here.
+The next review should assess the fixed profile realm and removed path settings,
+then continue with H11 boundaries. No installation or deployment is authorized
+here.

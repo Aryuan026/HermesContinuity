@@ -36,6 +36,11 @@ For each supported request, the plugin:
    body has physically reached the provider path.
 
 Checkpoints and receipts live in a separate plugin-data SQLite database.
+Both database paths are fixed by the active Hermes profile: canonical reads
+use that profile's `state.db`, while Continuity metadata uses
+`plugin-data/<host-owned-plugin-namespace>/continuity.sqlite3`. Neither path is
+a plugin setting, so one profile cannot be configured to borrow another
+profile's transcript or checkpoint realm.
 Checkpoint v2 stores the generated rolling-bridge body together with source
 IDs, fingerprints, hashes, and revision state. It does not copy canonical
 transcript sentences. Delivery receipts and public traces contain only IDs,
