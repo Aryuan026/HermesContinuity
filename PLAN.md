@@ -22,6 +22,9 @@ provider, or a replacement compressor.
 ## Current implementation gate
 
 - Preserve the extracted Thread Continuity algorithms and authority carriers.
+- Target the accepted Hermes Agent 0.21.0 host commit
+  `13900108780ae712059075200b243aa049c634cf` and tree
+  `5e82789d9984f8c338c09bdd0ebb31794af1f0dc`.
 - Adapt source ownership to Hermes `SessionDB` without using row IDs as stable
   message identity.
 - Keep the recent bridge bounded at 72 hours / 24,000 source tokens / 2,048
@@ -35,13 +38,19 @@ provider, or a replacement compressor.
   filter before the SDK call.
 - Keep canonical-window scans physically bounded, compression-lineage aware,
   and atomic on ambiguous or incomplete source reads.
+- Consume only the host-owned H13 group classifier for source authority.
+  Missing/pre-H13 proof remains `unknown`; tool/interim rows and superseded
+  physical generations remain proof obligations of their complete group;
+  proof conflicts fail closed only for that group.
 - Let trusted consumers request a closed source-class subset. Exclude clearly
   disallowed classes before returning bodies without turning policy exclusion
   into source ambiguity; bind the policy into the source revision.
 - Leave `codex_app_server` unchanged in v1.
 - Leave MoA prepared requests unchanged and unpublished until Hermes can expose
   an unambiguous final provider body for that path.
-- Require all twelve generic Hermes host seams documented in `README.md`.
+- Require the 0.21 host seams documented in `README.md`. The twelve retained
+  0.20.5 patches are predecessor provenance and are not an installation route
+  for this revision.
 - Keep attempts that miss both post/error hooks under a strict count cap and
   TTL. Expiry revokes settlement authority. Execution may remove an expired
   carrier only while it still holds the exact bound proof; if another entry
@@ -64,19 +73,23 @@ service, but cannot honestly replace this full-prefix contract.
 
 ## Release gates
 
-1. Keep the full standard-library suite Green and pass the opt-in real-host
+1. Keep the full suite Green and pass the opt-in real-host
    entrypoint proof: actual plugin discovery, `AIAgent.run_conversation`, final
    provider body, post/error settlement, SQLite readback, and manager
    unload/reload.
-2. Replace the obsolete repository history before public push.
-3. Push the reviewed revision for external web review.
-4. Address external findings and record the exact reviewed revision.
-5. Only then perform a reversible disabled installation in the target Hermes
-   profile.
+2. Prove real Lean compaction preserves complete H13-classified groups and
+   excludes synthetic summary material after a read-only database reopen.
+3. Push the Wave 5 Continuity revision for independent external review.
+4. Land the accepted 0.21 host patch replay and public workflow only in the
+   assembly landing wave, after Continuity and Global Hot are separately
+   accepted.
+5. Only after that assembly review perform a reversible disabled installation
+   in the target Hermes profile.
 6. Enable and run synthetic/live canaries only under a separate deployment
    authorization.
 
-Gates 1-3 completed on 2026-08-30. External review returned required changes;
-their implementation and repeat review are the current gate. The long-history
-gate above must also close before formal deployment. Installation, enablement,
-deployment, and live behavior remain outside this block.
+The accepted 0.20.5 build remains the live control. The current gate is the
+Continuity-only Wave 5 source candidate and its external review; Wave 6,
+Global Hot changes, installation, enablement, deployment, and live behavior
+remain outside this block. The long-history gate above must still close before
+formal long-lived-profile use.

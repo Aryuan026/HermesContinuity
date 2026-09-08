@@ -13,6 +13,15 @@ import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from agent.message_origin import (
+    CLI_USER,
+    CRON_AGENT,
+    GATEWAY_INTERNAL,
+    SUBAGENT,
+    build_message_origin_proof,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +56,7 @@ def row(
     api_content: str | None = None,
     display_kind: str | None = None,
     display_metadata: dict | None = None,
+    origin_proof: object = None,
 ) -> dict:
     return {
         "id": row_id,
@@ -72,6 +82,7 @@ def row(
         "api_content": api_content,
         "display_kind": display_kind,
         "display_metadata": display_metadata,
+        "origin_proof": copy.deepcopy(origin_proof),
     }
 
 
@@ -127,6 +138,42 @@ class FakeSessionDB:
             return copy.deepcopy(sorted(winners.values(), key=lambda message: message["id"]))
         return copy.deepcopy([message for message in self.rows if message["active"] == 1])
 
+    def get_messages_time_window(
+        self,
+        session_id: str,
+        *,
+        start_timestamp: float,
+        end_timestamp: float,
+        include_inactive: bool = False,
+        include_compacted: bool = False,
+        max_physical_rows: int,
+    ) -> dict:
+        rows = self.get_messages(
+            session_id,
+            include_inactive=include_inactive,
+            include_compacted=include_compacted,
+        )
+        rows = [
+            item
+            for item in rows
+            if start_timestamp <= float(item["timestamp"]) <= end_timestamp
+        ]
+        if len(rows) > max_physical_rows:
+            return {
+                "messages": [],
+                "scan_complete": False,
+                "overflow": True,
+                "physical_row_count": max_physical_rows + 1,
+                "max_physical_rows": max_physical_rows,
+            }
+        return {
+            "messages": rows,
+            "scan_complete": True,
+            "overflow": False,
+            "physical_row_count": len(rows),
+            "max_physical_rows": max_physical_rows,
+        }
+
 
 def dialogue_rows(start_id: int, timestamp: float, text: str) -> list[dict]:
     return [
@@ -159,6 +206,22 @@ def checkpoint(source: dict, previous: dict | None = None) -> dict:
 
 
 class HermesSourceProjectionTests(unittest.TestCase):
+    def test_winning_row_origin_rewrite_between_views_fails_closed(self) -> None:
+        human = build_message_origin_proof(CLI_USER)
+        scheduled = build_message_origin_proof(CRON_AGENT)
+        canonical = row(1, "user", "same", 100.0, origin_proof=human)
+        raw = {**canonical, "origin_proof": scheduled}
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "canonical_view_winner_mismatch",
+        ):
+            hermes_adapter._audit_canonical_view(
+                "session-1",
+                [canonical],
+                [raw],
+            )
+
     def test_same_text_with_distinct_timestamps_remains_distinct(self) -> None:
         rows = dialogue_rows(1, 100.0, "same") + dialogue_rows(3, 200.0, "same")
         source = HermesSessionAdapter(FakeSessionDB(rows)).read_source("session-1")
@@ -631,6 +694,260 @@ class FakeBoundedWindowDB:
 
 
 class RecentLineageSourceTests(unittest.TestCase):
+    def test_h13_classifies_whole_groups_without_session_or_display_inference(self) -> None:
+        human = build_message_origin_proof(CLI_USER)
+        scheduled = build_message_origin_proof(CRON_AGENT)
+        internal = build_message_origin_proof(GATEWAY_INTERNAL)
+        delegated = build_message_origin_proof(SUBAGENT)
+        human_rows = dialogue_rows(1, 100.0, "visible cron-like text")
+        scheduled_rows = dialogue_rows(3, 200.0, "ordinary visible text")
+        internal_rows = dialogue_rows(5, 300.0, "internal event")
+        delegated_rows = dialogue_rows(7, 400.0, "delegated event")
+        for item in human_rows:
+            item.update(
+                session_id="mixed",
+                origin_proof=human,
+                display_kind="internal_notification",
+                display_metadata={"internal_kind": "wakeup"},
+            )
+        for item in scheduled_rows:
+            item.update(session_id="mixed", origin_proof=scheduled)
+        for item in internal_rows:
+            item.update(session_id="mixed", origin_proof=internal)
+        for item in delegated_rows:
+            item.update(session_id="mixed", origin_proof=delegated)
+
+        source = HermesSessionAdapter(
+            FakeBoundedWindowDB(
+                {
+                    "mixed": [
+                        *human_rows,
+                        *scheduled_rows,
+                        *internal_rows,
+                        *delegated_rows,
+                    ]
+                }
+            )
+        ).read_recent_lineage_source(
+            ["mixed"],
+            start_timestamp=90.0,
+            end_timestamp=500.0,
+            max_physical_rows=12,
+            max_groups=8,
+        )
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(
+            [proof["source_class"] for proof in source["_group_source_evidence"]],
+            ["human", "scheduled", "internal", "delegated"],
+        )
+        self.assertTrue(
+            all(
+                proof["origin_status"] == "verified"
+                for proof in source["_group_source_evidence"]
+            )
+        )
+
+    def test_origin_boundary_drops_interrupted_user_without_merging_next_turn(self) -> None:
+        scheduled = build_message_origin_proof(CRON_AGENT)
+        human = build_message_origin_proof(CLI_USER)
+        rows = [
+            row(1, "user", "interrupted wake", 100.0, origin_proof=scheduled),
+            row(2, "user", "human question", 101.0, origin_proof=human),
+            row(3, "assistant", "human answer", 102.0, origin_proof=human),
+        ]
+        for item in rows:
+            item["session_id"] = "mixed"
+
+        source = HermesSessionAdapter(
+            FakeBoundedWindowDB({"mixed": rows})
+        ).read_recent_lineage_source(
+            ["mixed"],
+            start_timestamp=90.0,
+            end_timestamp=200.0,
+            max_physical_rows=8,
+            max_groups=8,
+        )
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(len(source["groups"]), 1)
+        self.assertEqual(
+            source["groups"][0]["messages"][0]["content"], "human question"
+        )
+        self.assertEqual(
+            source["_group_source_evidence"][0]["source_class"], "human"
+        )
+
+    def test_tool_and_interim_rows_are_group_origin_obligations(self) -> None:
+        human = build_message_origin_proof(CLI_USER)
+        scheduled = build_message_origin_proof(CRON_AGENT)
+        rows = [
+            row(1, "user", "question", 100.0, origin_proof=human),
+            row(
+                2,
+                "assistant",
+                "",
+                101.0,
+                tool_calls=[{"id": "call-1"}],
+                finish_reason="tool_calls",
+                origin_proof=human,
+            ),
+            row(
+                3,
+                "tool",
+                "tool result",
+                102.0,
+                tool_call_id="call-1",
+                origin_proof=scheduled,
+            ),
+            row(4, "assistant", "answer", 103.0, finish_reason="stop", origin_proof=human),
+        ]
+        for item in rows:
+            item["session_id"] = "mixed"
+
+        source = HermesSessionAdapter(
+            FakeBoundedWindowDB({"mixed": rows})
+        ).read_recent_lineage_source(
+            ["mixed"],
+            start_timestamp=90.0,
+            end_timestamp=200.0,
+            max_physical_rows=8,
+            max_groups=8,
+        )
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(len(source["groups"]), 1)
+        self.assertEqual(
+            source["_group_source_evidence"],
+            [
+                {
+                    "source_class": "unknown",
+                    "origin_status": "conflict",
+                    "origin_proof_sha256": "",
+                }
+            ],
+        )
+
+    def test_superseded_origin_conflict_fails_only_matching_group(self) -> None:
+        human = build_message_origin_proof(CLI_USER)
+        scheduled = build_message_origin_proof(CRON_AGENT)
+        original = dialogue_rows(1, 100.0, "conflicted")
+        for item in original:
+            item.update(
+                session_id="mixed",
+                active=0,
+                compacted=0,
+                origin_proof=scheduled,
+            )
+        live = [
+            {
+                **item,
+                "id": item["id"] + 2,
+                "active": 1,
+                "compacted": 0,
+                "origin_proof": human,
+            }
+            for item in original
+        ]
+        good = dialogue_rows(5, 200.0, "good")
+        for item in good:
+            item.update(session_id="mixed", origin_proof=human)
+
+        source = HermesSessionAdapter(
+            FakeBoundedWindowDB({"mixed": [*original, *live, *good]})
+        ).read_recent_lineage_source(
+            ["mixed"],
+            start_timestamp=90.0,
+            end_timestamp=300.0,
+            max_physical_rows=12,
+            max_groups=8,
+        )
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(len(source["groups"]), 2)
+        self.assertEqual(
+            [proof["source_class"] for proof in source["_group_source_evidence"]],
+            ["unknown", "human"],
+        )
+        self.assertEqual(
+            [proof["origin_status"] for proof in source["_group_source_evidence"]],
+            ["conflict", "verified"],
+        )
+
+    def test_cross_lineage_origin_conflict_is_local_to_the_cloned_group(self) -> None:
+        human = build_message_origin_proof(CLI_USER)
+        scheduled = build_message_origin_proof(CRON_AGENT)
+        root = dialogue_rows(1, 100.0, "clone")
+        for item in root:
+            item.update(
+                session_id="root",
+                active=0,
+                compacted=1,
+                origin_proof=scheduled,
+            )
+        clone = [
+            {
+                **item,
+                "id": item["id"] + 10,
+                "session_id": "tip",
+                "active": 1,
+                "compacted": 0,
+                "origin_proof": human,
+            }
+            for item in root
+        ]
+        good = dialogue_rows(20, 200.0, "tip-only")
+        for item in good:
+            item.update(session_id="tip", origin_proof=human)
+
+        source = HermesSessionAdapter(
+            FakeBoundedWindowDB({"root": root, "tip": [*clone, *good]})
+        ).read_recent_lineage_source(
+            ["root", "tip"],
+            start_timestamp=90.0,
+            end_timestamp=300.0,
+            max_physical_rows=12,
+            max_groups=8,
+        )
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(
+            [proof["source_class"] for proof in source["_group_source_evidence"]],
+            ["unknown", "human"],
+        )
+        self.assertEqual(
+            [proof["origin_status"] for proof in source["_group_source_evidence"]],
+            ["conflict", "verified"],
+        )
+
+    def test_pre_h13_complete_group_remains_visible_but_unclassified(self) -> None:
+        rows = dialogue_rows(1, 100.0, "legacy qq")
+        for item in rows:
+            item.update(session_id="legacy")
+
+        source = HermesSessionAdapter(
+            FakeBoundedWindowDB({"legacy": rows})
+        ).read_recent_lineage_source(
+            ["legacy"],
+            start_timestamp=90.0,
+            end_timestamp=200.0,
+            max_physical_rows=4,
+            max_groups=4,
+        )
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(source["groups"][0]["messages"][0]["content"], "legacy qq")
+        self.assertEqual(
+            source["_group_source_evidence"],
+            [
+                {
+                    "source_class": "unknown",
+                    "origin_status": "missing",
+                    "origin_proof_sha256": "",
+                }
+            ],
+        )
+
     def test_ancestor_to_tip_union_collapses_exact_compaction_clones(self) -> None:
         root_rows = dialogue_rows(1, 100.0, "ancestor")
         for item in root_rows:
@@ -750,6 +1067,158 @@ class RecentLineageSourceTests(unittest.TestCase):
 
 
 class HermesSessionDBIntegrationTests(unittest.TestCase):
+    def test_real_lean_compaction_read_only_reopen_preserves_h13_group_authority(
+        self,
+    ) -> None:
+        source_root = os.environ.get("HERMES_SOURCE_ROOT", "").strip()
+        if not source_root:
+            self.skipTest("set HERMES_SOURCE_ROOT to run against a Hermes checkout")
+        sys.path.insert(0, source_root)
+        try:
+            from agent.context_compressor import ContextCompressor
+            from hermes_state import SessionDB
+
+            human = build_message_origin_proof(CLI_USER)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "state.db"
+                session_db = SessionDB(db_path)
+                session_db.create_session("lean", source="qqbot")
+                transcript = [{"role": "system", "content": "system"}]
+                base = time.time() - 120
+                for index in range(30):
+                    transcript.append(
+                        {
+                            "role": "user",
+                            "content": f"question-{index} " + "x" * 400,
+                        }
+                    )
+                    if index == 10:
+                        transcript.extend(
+                            [
+                                {
+                                    "role": "assistant",
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "lean-tool-call",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "test_lookup",
+                                                "arguments": "{}",
+                                            },
+                                        }
+                                    ],
+                                    "finish_reason": "tool_calls",
+                                },
+                                {
+                                    "role": "tool",
+                                    "content": "lean tool result",
+                                    "tool_name": "test_lookup",
+                                    "tool_call_id": "lean-tool-call",
+                                },
+                            ]
+                        )
+                    transcript.append(
+                        {
+                            "role": "assistant",
+                            "content": f"answer-{index} " + "y" * 400,
+                            "finish_reason": "stop",
+                        }
+                    )
+                for index, message in enumerate(transcript):
+                    session_db.append_message(
+                        "lean",
+                        message["role"],
+                        message["content"],
+                        timestamp=base + index,
+                        origin_proof=(human if message["role"] != "system" else None),
+                        tool_calls=message.get("tool_calls"),
+                        tool_call_id=message.get("tool_call_id"),
+                        tool_name=message.get("tool_name"),
+                        finish_reason=message.get("finish_reason"),
+                    )
+
+                with patch(
+                    "agent.context_compressor.get_model_context_length",
+                    return_value=100_000,
+                ):
+                    compressor = ContextCompressor(
+                        model="test-model",
+                        threshold_percent=0.85,
+                        protect_first_n=1,
+                        protect_last_n=1,
+                        quiet_mode=True,
+                        config_context_length=100_000,
+                    )
+                response = MagicMock()
+                response.choices[0].message.content = (
+                    "## Active Task\nsynthetic lean summary"
+                )
+                response.choices[0].finish_reason = "stop"
+                with patch(
+                    "agent.context_compressor.call_llm", return_value=response
+                ):
+                    compacted = compressor.compress(
+                        session_db.get_messages_as_conversation("lean"),
+                        current_tokens=100_000,
+                        force=True,
+                    )
+                tail_count = sum(
+                    1
+                    for message in compacted
+                    if isinstance(message, dict)
+                    and message.pop("_compaction_tail", None)
+                )
+                session_db.archive_and_compact(
+                    "lean", compacted, tail_count=tail_count
+                )
+                session_db.close()
+
+                reopened = SessionDB(db_path, read_only=True)
+                try:
+                    adapter = HermesSessionAdapter(reopened)
+                    full_source = adapter.read_source("lean")
+                    source = adapter.read_recent_lineage_source(
+                        ["lean"],
+                        start_timestamp=base - 1,
+                        end_timestamp=base + len(transcript) + 1,
+                        max_physical_rows=256,
+                        max_groups=64,
+                    )
+                finally:
+                    reopened.close()
+
+                self.assertEqual(source["status"], "ready")
+                self.assertEqual(full_source["status"], "ready")
+                self.assertEqual(
+                    [
+                        group["messages"][0]["content"].split(" ", 1)[0]
+                        for group in full_source["groups"]
+                    ],
+                    [f"question-{index}" for index in range(30)],
+                )
+                self.assertEqual(len(source["groups"]), 30)
+                self.assertEqual(
+                    [
+                        group["messages"][0]["content"].split(" ", 1)[0]
+                        for group in source["groups"]
+                    ],
+                    [f"question-{index}" for index in range(30)],
+                )
+                self.assertTrue(
+                    all(
+                        evidence["source_class"] == "human"
+                        and evidence["origin_status"] == "verified"
+                        for evidence in source["_group_source_evidence"]
+                    )
+                )
+                self.assertNotIn("synthetic lean summary", repr(source["groups"]))
+                self.assertNotIn(
+                    "synthetic lean summary", repr(full_source["groups"])
+                )
+        finally:
+            sys.path.remove(source_root)
+
     def test_real_archive_and_compact_keeps_logical_turn_order(self) -> None:
         source_root = os.environ.get("HERMES_SOURCE_ROOT", "").strip()
         if not source_root:

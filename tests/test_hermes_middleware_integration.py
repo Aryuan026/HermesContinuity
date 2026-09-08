@@ -24,6 +24,7 @@ HERMES_ROOT = Path(os.environ.get("HERMES_SOURCE_ROOT", ""))
 HERMES_AVAILABLE = (HERMES_ROOT / "hermes_cli" / "middleware.py").is_file()
 if HERMES_AVAILABLE:
     sys.path.insert(0, str(HERMES_ROOT))
+    from agent import relay_llm  # noqa: E402
     from hermes_cli.middleware import (  # noqa: E402
         LLM_EXECUTION_MIDDLEWARE,
         LLM_REQUEST_MIDDLEWARE,
@@ -31,6 +32,7 @@ if HERMES_AVAILABLE:
         TransportRecord,
         apply_llm_request_middleware,
         run_llm_execution_middleware,
+        transport_record_scope,
     )
     from hermes_cli.lifecycle import invoke_hook  # noqa: E402
     from hermes_cli.plugins import get_plugin_manager  # noqa: E402
@@ -228,10 +230,14 @@ class HermesMiddlewareIntegrationTests(unittest.TestCase):
                 if provider_transform is not None
                 else request
             )
-            if "_moa_prepared_request" not in provider_body:
-                provider_body = record.filter_provider_body(provider_body)
-            record.capture_provider_body(provider_body)
-            return provider(provider_body)
+            if "_moa_prepared_request" in provider_body:
+                record.mark_provider_body_unsupported()
+                return provider(provider_body)
+            with transport_record_scope(record):
+                return relay_llm.call_provider_body(
+                    lambda **body: provider(body),
+                    provider_body,
+                )
 
         response = run_llm_execution_middleware(
             projected.payload,

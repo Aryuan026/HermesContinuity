@@ -30,10 +30,13 @@ revisions.
   synchronous in-process response. Its trace and delivery receipts never
   persist those canonical bodies, and the checkpoint store persists only a
   separately generated rolling bridge rather than the service response.
-- Canonical-window v2 classifies every complete group into a closed source
-  class. Dynamic/unknown sources stay `unknown`; internal, delegated, and tool
-  origins cannot become `human` merely by choosing a platform-looking label.
-  Wakeup classification requires durable host provenance.
+- Canonical-window v2 classifies every complete group only through Hermes's
+  host-owned H13 classifier. Dynamic, missing, and pre-H13 proof stays
+  `unknown`; session source/title, display metadata, message text, transport
+  shell, and plugin configuration grant no authority. Tool and interim
+  assistant rows are not returned as visible source bodies, but they and every
+  matching superseded physical generation remain proof obligations of the
+  complete group. Invalid/conflicting proof makes only that group `unknown`.
 - Real conversation fixtures, runtime databases and sidecars, configuration,
   logs, credentials, owner/channel identifiers, and private paths must not be
   committed.
@@ -74,18 +77,13 @@ schema; a valid store carries one single-plugin owner claim.
 projection. MoA prepared requests remain transport-ambiguous and cannot publish
 a checkpoint or delivery receipt.
 
-## Host patch
+## Host compatibility
 
-The plugin distribution records twelve ordered generic host seams in `patches/`:
-finish
-reason exposure, sequential request middleware, profile-scoped services,
-bounded SessionDB time-window reads, provider-body transport truth, closed
-finish-state normalization, final provider-body budget controls, and verified
-wakeup provenance, followed by manifest-v2 installer alignment and joint
-Doctor support, then shared request-overlay ownership/proof and host-accepted
-overlay disposition. Review and apply them to the documented compatible Hermes
-base before installation. Plugin registration fails visibly when a required
-runtime schema or API is absent.
+The current revision requires the documented Hermes 0.21 host, including H13
+durable origin proof and group classification. Plugin registration fails
+visibly when that classifier or another required runtime seam is absent. The
+twelve ordered patches under `patches/` remain the reproducible 0.20.5
+predecessor record only; applying them to 0.21 is unsupported.
 
 Report vulnerabilities through a private GitHub security advisory. Do not put
 conversation content, credentials, local paths, or runtime database excerpts in

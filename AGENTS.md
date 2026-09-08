@@ -14,8 +14,10 @@ Preserve these owner and provenance boundaries:
   changing retained algorithms, compare the exact donor symbols and tests at
   AsherieSystem revision
   `ddfb1e9aeb7c6f7797912e959a0970c621875c83`.
-- Keep the Hermes baseline explicit: upstream `fcbd1076`, owner overlay
-  `c7c36f36`, and ordered generic seams `201fe77` through `5a680e5`.
+- Keep both compatibility generations explicit: the current Wave 5 baseline is
+  Hermes 0.21.0 commit `13900108780ae712059075200b243aa049c634cf`
+  (tree `5e82789d9984f8c338c09bdd0ebb31794af1f0dc`); the twelve patches under
+  `patches/` reproduce only the accepted 0.20.5 predecessor.
 - Do not weaken physical request verification or move checkpoint CAS before
   `post_api_request`.
 - Verify delivery against `hermes.transport.v3` final `provider_body`, not the
@@ -25,6 +27,10 @@ Preserve these owner and provenance boundaries:
   exact tokenizer bound.
 - Keep `canonical-source.v2` profile-local, read-only, bounded, lineage-aware,
   and body-free outside its synchronous response.
+- Treat the host H13 group classifier as the sole source-class authority.
+  Session labels, display metadata, message text, and plugin configuration must
+  not grant `human`; missing/pre-H13 proof remains `unknown`, and proof
+  conflicts remain local to the affected complete group.
 - Keep `codex_app_server` unsupported until a real v1 carrier/proof contract is
   reviewed.
 - Keep MoA checkpoint publication disabled while its final provider body is
@@ -55,8 +61,10 @@ Preserve these owner and provenance boundaries:
   upgrade overwrite risk, latency, failure visibility, rollback, and actual
   CLI/gateway canaries. Reopen algorithm design only for a new reproducible
   regression or an owner-requested product change.
-- The cross-repo gate is `tests.test_real_host_entrypoint`; run it with both
-  `HERMES_SOURCE_ROOT` and `HERMES_GLOBAL_HOT_ROOT` set to exact trees.
+- The current Continuity-only gate is `tests.test_real_host_021`; run it with
+  `HERMES_SOURCE_ROOT` set to the exact accepted 0.21 tree. The legacy
+  `tests.test_real_host_entrypoint` dual-plugin gate belongs to the accepted
+  0.20.5 predecessor and additionally requires `HERMES_GLOBAL_HOT_ROOT`.
 
 Use the smallest compatible change. Update `PROGRESS.md` only when a release or
 deployment gate actually changes.

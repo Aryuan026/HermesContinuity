@@ -13,15 +13,6 @@ from .hermes_adapter import (
 from .runtime import ContinuityRuntime
 
 
-def _string_list_setting(ctx: Any, key: str) -> list[str]:
-    value = ctx.get_config(key, default=[])
-    if not isinstance(value, list) or any(
-        not isinstance(item, str) or not item.strip() for item in value
-    ):
-        raise RuntimeError(f"Hermes Continuity {key} must be a list of source tags")
-    return [item.strip() for item in value]
-
-
 def _require_compatible_host(ctx: Any) -> None:
     for name in (
         "register_middleware",
@@ -32,6 +23,13 @@ def _require_compatible_host(ctx: Any) -> None:
     ):
         if not callable(getattr(ctx, name, None)):
             raise RuntimeError(f"Hermes Continuity requires PluginContext.{name}()")
+
+    try:
+        from agent.message_origin import classify_message_origin_group
+    except ImportError as exc:
+        raise RuntimeError(
+            "Hermes Continuity requires the Hermes 0.21 message-origin group classifier"
+        ) from exc
 
     from agent.plugin_llm import PluginLlmCompleteResult
     try:
@@ -49,10 +47,14 @@ def _require_compatible_host(ctx: Any) -> None:
     if "finish_reason" not in {field.name for field in fields(PluginLlmCompleteResult)}:
         raise RuntimeError(
             "Hermes Continuity requires the generic PluginLlm finish_reason "
-            "seam; apply patches/hermes-0.20.5-plugin-llm-finish-reason.patch"
+            "seam from the documented compatible Hermes host"
         )
     if not callable(getattr(ctx.llm, "acomplete", None)):
         raise RuntimeError("Hermes Continuity requires PluginLlm.acomplete()")
+    if not callable(classify_message_origin_group):
+        raise RuntimeError(
+            "Hermes Continuity requires the Hermes 0.21 message-origin group classifier"
+        )
     if MIDDLEWARE_SCHEMA_VERSION != "hermes.middleware.v2":
         raise RuntimeError("Hermes Continuity requires hermes.middleware.v2")
     if TRANSPORT_SCHEMA_VERSION != "hermes.transport.v3":
@@ -67,9 +69,6 @@ def register(ctx: Any) -> None:
     _require_compatible_host(ctx)
     from hermes_state import SessionDB
 
-    additional_human_sources = _string_list_setting(
-        ctx, "additional_human_sources"
-    )
     # Hermes owns this layout: <profile>/plugin-data/<plugin namespace>.
     plugin_data_dir = ctx.state.data_dir
     profile_home = plugin_data_dir.parent.parent
@@ -92,10 +91,7 @@ def register(ctx: Any) -> None:
         session_db.close()
         raise
     adapter = HermesSessionAdapter(session_db, metadata_store)
-    canonical_source_service = ContinuityCanonicalSourceService(
-        adapter,
-        additional_human_sources=additional_human_sources,
-    )
+    canonical_source_service = ContinuityCanonicalSourceService(adapter)
     runtime = ContinuityRuntime(
         adapter,
         ctx.llm,

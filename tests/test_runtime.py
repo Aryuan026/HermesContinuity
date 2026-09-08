@@ -814,7 +814,9 @@ class ContinuityRuntimeTests(unittest.TestCase):
         self.assertEqual(adapter.cas_calls, [])
         self.assertEqual(adapter.metadata_store.rows, [])
 
-    def test_replaced_original_carrier_fails_open_current_without_settlement(self) -> None:
+    def test_replaced_original_carrier_preserves_current_without_settlement(self) -> None:
+        if not hasattr(RequestOverlayFilterResult, "_validate"):
+            self.skipTest("requires Hermes 0.21 deferred overlay acceptance")
         adapter = FakeAdapter(bundle())
         compiler = FakeCompiler(checkpoint("bridge"))
         runtime = make_runtime(adapter, compiler)
@@ -828,7 +830,11 @@ class ContinuityRuntimeTests(unittest.TestCase):
         _result, calls = execute(runtime, drifted, original)
         post(runtime)
 
-        self.assertEqual(calls, [drifted])
+        self.assertEqual(
+            calls[0]["messages"][-1]["content"],
+            "replaced payload",
+        )
+        self.assertNotIn("bridge", repr(calls[0]))
         self.assertEqual(adapter.cas_calls, [])
         self.assertEqual(adapter.metadata_store.rows, [])
 

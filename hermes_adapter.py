@@ -58,39 +58,11 @@ _CANONICAL_WINDOW_SOURCE_CLASSES = frozenset(
 _CANONICAL_WINDOW_FUTURE_TOLERANCE_SECONDS = 300
 _CANONICAL_WINDOW_MAX_PHYSICAL_ROWS = 2_048
 _CANONICAL_WINDOW_MAX_LINEAGE_SESSIONS = 64
-_HUMAN_SESSION_SOURCES = frozenset(
-    {
-        "api_server",
-        "bluebubbles",
-        "dingtalk",
-        "desktop",
-        "discord",
-        "email",
-        "feishu",
-        "hermes_browser",
-        "local",
-        "matrix",
-        "mattermost",
-        "qqbot",
-        "signal",
-        "slack",
-        "sms",
-        "telegram",
-        "cli",
-        "tui",
-        "dashboard",
-        "wecom",
-        "wecom_callback",
-        "weixin",
-        "whatsapp",
-        "whatsapp_cloud",
-        "yuanbao",
-    }
+_FULL_SOURCE_TIMESTAMP_BOUND = 1e100
+_ORIGIN_EVIDENCE_KEYS = frozenset(
+    {"source_class", "origin_status", "origin_proof_sha256"}
 )
-_INTERNAL_SESSION_SOURCES = frozenset(
-    {"agent_state", "background", "maintenance", "session", "system_turn"}
-)
-_TOOL_SESSION_SOURCES = frozenset({"provider", "reader", "tool"})
+_ORIGIN_STATUSES = frozenset({"verified", "missing", "invalid", "conflict"})
 
 
 class _ProjectionError(ValueError):
@@ -157,36 +129,81 @@ def _is_nonvisible_provider_scaffold(row: Mapping[str, Any], role: str) -> bool:
     return str(row.get("display_kind") or "").strip() == "hidden" or role == "user"
 
 
-def _source_evidence(row: Mapping[str, Any]) -> Dict[str, str]:
-    metadata = row.get("display_metadata")
-    metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+def _origin_evidence(
+    messages: Sequence[Mapping[str, Any]],
+    physical_obligations: Sequence[Mapping[str, Any]] = (),
+) -> Dict[str, str]:
+    """Consume the host-owned H13 classifier without duplicating its authority."""
+
+    try:
+        from agent.message_origin import classify_message_origin_group
+
+        source_class, status = classify_message_origin_group(
+            messages,
+            physical_obligations=physical_obligations,
+        )
+    except (ImportError, TypeError, ValueError) as exc:
+        raise _ProjectionError("message_origin_host_incompatible") from exc
+    if status not in _ORIGIN_STATUSES:
+        raise _ProjectionError("message_origin_result_invalid")
+    if status == "verified":
+        if source_class not in _CANONICAL_WINDOW_SOURCE_CLASSES - {"tool", "unknown"}:
+            raise _ProjectionError("message_origin_result_invalid")
+        raw_proof = messages[0].get(
+            "origin_proof", messages[0].get("_origin_proof")
+        )
+        proof_sha256 = _sha256(raw_proof)
+    else:
+        if source_class is not None:
+            raise _ProjectionError("message_origin_result_invalid")
+        source_class = "unknown"
+        proof_sha256 = ""
     return {
-        "display_kind": str(row.get("display_kind") or "").strip(),
-        "internal_kind": str(metadata.get("internal_kind") or "").strip(),
+        "source_class": source_class,
+        "origin_status": status,
+        "origin_proof_sha256": proof_sha256,
     }
 
 
-def _source_class(
-    source: str,
-    evidence: Mapping[str, Any],
-    human_sources: frozenset[str] = _HUMAN_SESSION_SOURCES,
-) -> str:
-    source = str(source or "").strip().lower()
-    display_kind = str(evidence.get("display_kind") or "").strip().lower()
-    internal_kind = str(evidence.get("internal_kind") or "").strip().lower()
-    if source == "cron" or (
-        display_kind == "internal_notification" and internal_kind == "wakeup"
-    ):
-        return "scheduled"
-    if display_kind == "internal_notification" or source in _INTERNAL_SESSION_SOURCES:
-        return "internal"
-    if source == "subagent":
-        return "delegated"
-    if source in _TOOL_SESSION_SOURCES:
-        return "tool"
-    if source in human_sources:
-        return "human"
-    return "unknown"
+def _same_origin_segment(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> bool:
+    """Keep consecutive user rows together only under one H13 authority."""
+
+    left_evidence = _origin_evidence([left])
+    right_evidence = _origin_evidence([right])
+    if left_evidence != right_evidence:
+        return False
+    pair_evidence = _origin_evidence([left, right])
+    return pair_evidence == left_evidence
+
+
+def _merge_origin_evidence(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> Dict[str, str]:
+    if dict(left) == dict(right):
+        return dict(left)
+    return {
+        "source_class": "unknown",
+        "origin_status": "conflict",
+        "origin_proof_sha256": "",
+    }
+
+
+def _valid_origin_evidence(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) != _ORIGIN_EVIDENCE_KEYS:
+        return False
+    source_class = value.get("source_class")
+    status = value.get("origin_status")
+    proof_sha256 = value.get("origin_proof_sha256")
+    if status not in _ORIGIN_STATUSES or not isinstance(proof_sha256, str):
+        return False
+    if status == "verified":
+        return (
+            source_class in _CANONICAL_WINDOW_SOURCE_CLASSES - {"tool", "unknown"}
+            and bool(_SHA256_RE.fullmatch(proof_sha256))
+        )
+    return source_class == "unknown" and proof_sha256 == ""
 
 
 def _dedupe_key(row: Mapping[str, Any]) -> tuple[str, ...]:
@@ -200,8 +217,15 @@ def _dedupe_key(row: Mapping[str, Any]) -> tuple[str, ...]:
     )
 
 
-def _signature(row: Mapping[str, Any], *, lifecycle: bool) -> str:
+def _signature(
+    row: Mapping[str, Any],
+    *,
+    lifecycle: bool,
+    ignore_origin: bool = False,
+) -> str:
     omitted = {"id"} if lifecycle else {"id", "active", "compacted"}
+    if ignore_origin:
+        omitted.update({"origin_proof", "_origin_proof"})
     return _json_text(
         {str(key): value for key, value in row.items() if str(key) not in omitted}
     )
@@ -281,9 +305,14 @@ def _audit_canonical_view(
                 raise _ProjectionError("source_lifecycle_invalid")
         else:
             winner = active_entries[0] if active_entries else entries[-1]
-            clone_signature = _signature(winner, lifecycle=False)
+            clone_signature = _signature(
+                winner,
+                lifecycle=False,
+                ignore_origin=True,
+            )
             if any(
-                _signature(row, lifecycle=False) != clone_signature
+                _signature(row, lifecycle=False, ignore_origin=True)
+                != clone_signature
                 for row in entries
             ):
                 raise _ProjectionError("canonical_clone_sidecar_collision")
@@ -323,6 +352,22 @@ def _audit_canonical_view(
         dict(row)
         for _origin, row in sorted(winners.values(), key=lambda value: value[0])
     ]
+
+
+def _physical_origin_obligations(
+    canonical_rows: Sequence[Mapping[str, Any]],
+    raw_rows: Sequence[Mapping[str, Any]],
+) -> Dict[int, List[Dict[str, Any]]]:
+    """Map canonical rows to every matching non-winning physical generation."""
+
+    canonical_by_key = {_dedupe_key(row): row for row in canonical_rows}
+    obligations: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for raw in raw_rows:
+        canonical = canonical_by_key.get(_dedupe_key(raw))
+        if canonical is None or _row_id(raw) == _row_id(canonical):
+            continue
+        obligations[_row_id(canonical)].append(dict(raw))
+    return dict(obligations)
 
 
 def _timestamp_text(value: Any) -> str:
@@ -407,7 +452,14 @@ def _failed_source(status: str, error: str) -> Dict[str, Any]:
 def _lineage_row_signature(row: Mapping[str, Any]) -> str:
     """Compare decoded persisted clone fields without physical ownership."""
 
-    omitted = {"id", "session_id", "active", "compacted"}
+    omitted = {
+        "id",
+        "session_id",
+        "active",
+        "compacted",
+        "origin_proof",
+        "_origin_proof",
+    }
     return _json_text(
         {
             str(key): value
@@ -424,6 +476,9 @@ def _project_canonical_source(
     full_prefix: bool,
     max_groups: int | None = None,
     include_lineage_proofs: bool = False,
+    physical_origin_obligations: Mapping[
+        int, Sequence[Mapping[str, Any]]
+    ] | None = None,
 ) -> Dict[str, Any]:
     """Run the retained canonical-row grouping algorithm."""
 
@@ -462,15 +517,20 @@ def _project_canonical_source(
     group_compacted: List[bool] = []
     lineage_proofs: List[Dict[str, str]] = []
     pending_users: List[Dict[str, Any]] = []
+    pending_turn_rows: List[Dict[str, Any]] = []
     group_occurrences: Dict[str, int] = defaultdict(int)
+    physical_origin_obligations = physical_origin_obligations or {}
     for row in prepared:
         role = row["_continuity_role"]
         if _is_compaction_summary(row) or role in {
             "system",
             "developer",
-            "tool",
             "session_meta",
         }:
+            continue
+        if role == "tool":
+            if pending_users:
+                pending_turn_rows.append(row)
             continue
         if role not in {"user", "assistant"}:
             return _failed_source("ambiguous", "source_role_invalid")
@@ -483,11 +543,17 @@ def _project_canonical_source(
                 or finish_reason == "tool_calls"
                 or finish_reason in _INTERIM_ASSISTANT_FINISH_REASONS
             ):
+                if pending_users:
+                    pending_turn_rows.append(row)
                 continue
         if not _content_to_text(row.get("content")):
             return _failed_source("ambiguous", "source_visible_content_invalid")
         if role == "user":
+            if pending_users and not _same_origin_segment(pending_users[-1], row):
+                pending_users = []
+                pending_turn_rows = []
             pending_users.append(row)
+            pending_turn_rows.append(row)
             continue
         if not pending_users and not groups:
             return _failed_source("ambiguous", "proactive_event_unverified")
@@ -495,7 +561,7 @@ def _project_canonical_source(
         assistant_id = row["_continuity_message_id"]
         assistant_hash = _content_hash(row.get("content"))
         effective_event_at = _timestamp_text(row.get("timestamp"))
-        persisted_rows = [*pending_users, row]
+        persisted_rows = [*pending_turn_rows, row] if pending_users else [row]
         if pending_users:
             user_contents = [pending.get("content") for pending in pending_users]
             if len(user_contents) == 1:
@@ -518,9 +584,6 @@ def _project_canonical_source(
                 return _failed_source(
                     "ambiguous", "consecutive_user_content_unmergeable"
                 )
-            evidence = _source_evidence(pending_users[-1])
-            if any(_source_evidence(pending) != evidence for pending in pending_users):
-                return _failed_source("ambiguous", "source_evidence_ambiguous")
             user_hash = _content_hash(user_content)
             group_kind = "dialogue_turn"
             message_ids = [user_id, assistant_id]
@@ -544,7 +607,6 @@ def _project_canonical_source(
                 ["assistant", assistant_hash],
             ]
         else:
-            evidence = _source_evidence(row)
             group_kind = "proactive_assistant_event"
             message_ids = [assistant_id]
             messages = [
@@ -556,6 +618,16 @@ def _project_canonical_source(
                 }
             ]
             visible_key = [effective_event_at, ["assistant", assistant_hash]]
+
+        obligations = [
+            dict(obligation)
+            for message in persisted_rows
+            for obligation in physical_origin_obligations.get(_row_id(message), ())
+        ]
+        try:
+            evidence = _origin_evidence(persisted_rows, obligations)
+        except _ProjectionError as exc:
+            return _failed_source("unavailable", str(exc))
 
         group_base = _json_text([session_id, group_kind, message_ids])
         group_occurrence = group_occurrences[group_base]
@@ -593,6 +665,7 @@ def _project_canonical_source(
                 }
             )
         pending_users = []
+        pending_turn_rows = []
         if max_groups is not None and len(groups) > max_groups:
             return _failed_source("overflow", "source_group_limit_exceeded")
 
@@ -642,15 +715,47 @@ class HermesSessionAdapter:
         if not session_id:
             return _failed_source("unavailable", "session_id_invalid")
         try:
-            canonical_rows = self.session_db.get_messages(
-                session_id, include_compacted=True
-            )
-            raw_rows = self.session_db.get_messages(
-                session_id, include_inactive=True
-            )
-            if not isinstance(canonical_rows, list) or not isinstance(raw_rows, list):
+            raw_seed = self.session_db.get_messages(session_id, include_inactive=True)
+            reader = getattr(self.session_db, "get_messages_time_window", None)
+            if not isinstance(raw_seed, list) or not callable(reader):
                 raise _ProjectionError("source_view_invalid")
+            max_physical_rows = max(1, len(raw_seed))
+
+            def read_view(**lifecycle: bool) -> List[Dict[str, Any]]:
+                result = reader(
+                    session_id,
+                    start_timestamp=-_FULL_SOURCE_TIMESTAMP_BOUND,
+                    end_timestamp=_FULL_SOURCE_TIMESTAMP_BOUND,
+                    max_physical_rows=max_physical_rows,
+                    **lifecycle,
+                )
+                if not isinstance(result, Mapping):
+                    raise _ProjectionError("source_view_invalid")
+                rows = result.get("messages")
+                if (
+                    not isinstance(rows, list)
+                    or result.get("scan_complete") is not True
+                    or result.get("overflow") is not False
+                    or result.get("max_physical_rows") != max_physical_rows
+                    or type(result.get("physical_row_count")) is not int
+                    or result["physical_row_count"] > max_physical_rows
+                    or any(not isinstance(row, Mapping) for row in rows)
+                ):
+                    raise _ProjectionError("source_view_invalid")
+                return [dict(row) for row in rows]
+
+            canonical_rows = read_view(
+                include_inactive=False,
+                include_compacted=True,
+            )
+            raw_rows = read_view(
+                include_inactive=True,
+                include_compacted=False,
+            )
+            if len(raw_rows) != len(raw_seed):
+                raise _ProjectionError("source_view_changed")
             canonical = _audit_canonical_view(session_id, canonical_rows, raw_rows)
+            obligations = _physical_origin_obligations(canonical, raw_rows)
         except _ProjectionError as exc:
             return _failed_source("ambiguous", str(exc))
         except Exception:
@@ -660,6 +765,7 @@ class HermesSessionAdapter:
             session_id,
             canonical,
             full_prefix=True,
+            physical_origin_obligations=obligations,
         )
 
     def _read_recent_session_source(
@@ -719,6 +825,7 @@ class HermesSessionAdapter:
                 include_compacted=False,
             )
             canonical = _audit_canonical_view(session_id, canonical_rows, raw_rows)
+            obligations = _physical_origin_obligations(canonical, raw_rows)
         except OverflowError:
             return _failed_source("overflow", "source_physical_row_limit_exceeded")
         except _ProjectionError as exc:
@@ -732,6 +839,7 @@ class HermesSessionAdapter:
             full_prefix=False,
             max_groups=max_groups,
             include_lineage_proofs=True,
+            physical_origin_obligations=obligations,
         )
         if source.get("status") == "ready":
             source["stats"] = {
@@ -774,6 +882,7 @@ class HermesSessionAdapter:
         groups: List[Dict[str, Any]] = []
         signatures: Dict[str, str] = {}
         selected_evidence: List[Dict[str, str]] = []
+        selected_occurrences: Dict[tuple[str, int], int] = {}
         prior_counts: Dict[str, int] = defaultdict(int)
         physical_row_count = 0
         canonical_physical_row_count = 0
@@ -812,12 +921,11 @@ class HermesSessionAdapter:
                 visible_key = str(proof.get("visible_key") or "")
                 persisted_signature = str(proof.get("persisted_signature") or "")
                 evidence = proof.get("source_evidence")
-                if not _SHA256_RE.fullmatch(visible_key) or not _SHA256_RE.fullmatch(
-                    persisted_signature
-                ) or not isinstance(evidence, Mapping) or set(evidence) != {
-                    "display_kind",
-                    "internal_kind",
-                } or any(not isinstance(value, str) for value in evidence.values()):
+                if (
+                    not _SHA256_RE.fullmatch(visible_key)
+                    or not _SHA256_RE.fullmatch(persisted_signature)
+                    or not _valid_origin_evidence(evidence)
+                ):
                     return _failed_source("ambiguous", "recent_lineage_proof_invalid")
                 known_signature = signatures.get(visible_key)
                 if known_signature is not None and known_signature != persisted_signature:
@@ -826,7 +934,16 @@ class HermesSessionAdapter:
                 occurrence = session_counts[visible_key]
                 session_counts[visible_key] += 1
                 if occurrence < prior_counts[visible_key]:
+                    selected_index = selected_occurrences.get((visible_key, occurrence))
+                    if selected_index is None:
+                        return _failed_source(
+                            "ambiguous", "recent_lineage_proof_invalid"
+                        )
+                    selected_evidence[selected_index] = _merge_origin_evidence(
+                        selected_evidence[selected_index], evidence
+                    )
                     continue
+                selected_occurrences[(visible_key, occurrence)] = len(groups)
                 groups.append(dict(group))
                 selected_evidence.append(dict(evidence))
                 if len(groups) > max_groups:
@@ -909,7 +1026,6 @@ class ContinuityCanonicalSourceService:
         adapter: HermesSessionAdapter,
         *,
         max_physical_rows: int = _CANONICAL_WINDOW_MAX_PHYSICAL_ROWS,
-        additional_human_sources: Sequence[str] = (),
     ) -> None:
         if type(max_physical_rows) is not int or max_physical_rows < 1:
             raise ValueError("canonical_window_physical_row_limit_invalid")
@@ -917,13 +1033,6 @@ class ContinuityCanonicalSourceService:
         self.session_db = adapter.session_db
         self.max_physical_rows = max_physical_rows
         self.max_lineage_sessions = _CANONICAL_WINDOW_MAX_LINEAGE_SESSIONS
-        normalized_human_sources = set(_HUMAN_SESSION_SOURCES)
-        for value in additional_human_sources:
-            source = str(value or "").strip().lower()
-            if not _CODE_RE.fullmatch(source):
-                raise ValueError("canonical_window_human_source_invalid")
-            normalized_human_sources.add(source)
-        self.human_session_sources = frozenset(normalized_human_sources)
 
     @staticmethod
     def _parse_request(request: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1470,11 +1579,11 @@ class ContinuityCanonicalSourceService:
                         raise _ProjectionError("canonical_window_group_invalid")
                     if not isinstance(evidence, Mapping):
                         raise _ProjectionError("canonical_window_source_evidence_invalid")
-                    classification = _source_class(
-                        source,
-                        evidence,
-                        self.human_session_sources,
-                    )
+                    if not _valid_origin_evidence(evidence):
+                        raise _ProjectionError(
+                            "canonical_window_source_evidence_invalid"
+                        )
+                    classification = str(evidence["source_class"])
                     neutral = self._neutral_group(
                         source_session_id=session_id,
                         source=source,

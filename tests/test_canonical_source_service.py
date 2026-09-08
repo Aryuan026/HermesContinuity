@@ -60,7 +60,7 @@ def source_result(
     groups: list[dict],
     *,
     status: str = "ready",
-    source_evidence: list[dict[str, str]] | None = None,
+    source_classes: list[str] | None = None,
 ) -> dict:
     proof = [
         {
@@ -78,10 +78,27 @@ def source_result(
         "source_snapshot": hermes_adapter._sha256(proof),
         "groups": copy.deepcopy(groups),
         "_group_source_evidence": copy.deepcopy(
-            source_evidence
-            if source_evidence is not None
+            [
+                {
+                    "source_class": source_class,
+                    "origin_status": (
+                        "verified" if source_class != "unknown" else "missing"
+                    ),
+                    "origin_proof_sha256": (
+                        hermes_adapter._sha256({"class": source_class})
+                        if source_class != "unknown"
+                        else ""
+                    ),
+                }
+                for source_class in source_classes
+            ]
+            if source_classes is not None
             else [
-                {"display_kind": "", "internal_kind": ""}
+                {
+                    "source_class": "unknown",
+                    "origin_status": "missing",
+                    "origin_proof_sha256": "",
+                }
                 for _item in groups
             ]
         ),
@@ -175,15 +192,11 @@ class CanonicalSourceServiceTests(unittest.TestCase):
         sources: dict[str, dict],
         *,
         lineages: dict[str, list[str]] | None = None,
-        additional_human_sources: list[str] | None = None,
     ) -> tuple[ContinuityCanonicalSourceService, FakeAdapter, FakeWindowDB]:
         session_db = FakeWindowDB(sessions, lineages=lineages)
         adapter = FakeAdapter(session_db, sources)
         return (
-            ContinuityCanonicalSourceService(
-                adapter,
-                additional_human_sources=additional_human_sources or [],
-            ),
+            ContinuityCanonicalSourceService(adapter),
             adapter,
             session_db,
         )
@@ -201,8 +214,10 @@ class CanonicalSourceServiceTests(unittest.TestCase):
                 session("cron-session", "cron", REFERENCE - timedelta(minutes=4)),
             ],
             {
-                "qq-session": source_result([qq_group]),
-                "cron-session": source_result([cron_group]),
+                "qq-session": source_result([qq_group], source_classes=["human"]),
+                "cron-session": source_result(
+                    [cron_group], source_classes=["scheduled"]
+                ),
             },
         )
 
@@ -299,37 +314,24 @@ class CanonicalSourceServiceTests(unittest.TestCase):
             },
         )
 
-    def test_source_class_is_closed_and_wakeup_requires_durable_provenance(self):
+    def test_source_class_comes_only_from_h13_group_evidence(self):
         rows = [
-            ("human", "qqbot", {"display_kind": "", "internal_kind": ""}),
-            ("cli", "cli", {"display_kind": "", "internal_kind": ""}),
-            (
-                "wakeup",
-                "qqbot",
-                {
-                    "display_kind": "internal_notification",
-                    "internal_kind": "wakeup",
-                },
-            ),
-            (
-                "internal",
-                "qqbot",
-                {"display_kind": "internal_notification", "internal_kind": ""},
-            ),
-            ("delegated", "subagent", {"display_kind": "", "internal_kind": ""}),
-            ("tool", "provider", {"display_kind": "", "internal_kind": ""}),
-            ("unknown", "future_plugin", {"display_kind": "", "internal_kind": ""}),
+            ("human", "cron", "human"),
+            ("scheduled", "qqbot", "scheduled"),
+            ("internal", "qqbot", "internal"),
+            ("delegated", "cli", "delegated"),
+            ("unknown", "telegram", "unknown"),
         ]
         sessions = [
             session(name, source, REFERENCE - timedelta(minutes=index))
-            for index, (name, source, _evidence) in enumerate(rows)
+            for index, (name, source, _source_class) in enumerate(rows)
         ]
         sources = {
             name: source_result(
                 [group(name, REFERENCE - timedelta(minutes=index), name, "done")],
-                source_evidence=[evidence],
+                source_classes=[source_class],
             )
-            for index, (name, _source, evidence) in enumerate(rows)
+            for index, (name, _source, source_class) in enumerate(rows)
         }
         service, _adapter, _session_db = self.service(sessions, sources)
 
@@ -340,36 +342,51 @@ class CanonicalSourceServiceTests(unittest.TestCase):
             {item["group_id"]: item["source_class"] for item in response["groups"]},
             {
                 "human": "human",
-                "cli": "human",
-                "wakeup": "scheduled",
+                "scheduled": "scheduled",
                 "internal": "internal",
                 "delegated": "delegated",
-                "tool": "tool",
                 "unknown": "unknown",
             },
         )
 
+    def test_inconsistent_h13_evidence_cannot_grant_human_authority(self):
+        candidate_group = group("forged", REFERENCE, "notice", "done")
+        forged = source_result([candidate_group])
+        forged["_group_source_evidence"] = [
+            {
+                "source_class": "human",
+                "origin_status": "missing",
+                "origin_proof_sha256": "",
+            }
+        ]
+        service, _adapter, _session_db = self.service(
+            [session("forged", "qqbot", REFERENCE)],
+            {"forged": forged},
+        )
+
+        response = service.read_window(request(excluded_sources=[]))
+
+        self.assertEqual(response["status"], "blocked")
+        self.assertEqual(response["reason"], "candidate_source_ambiguous")
+        self.assertEqual(response["groups"], [])
+
     def test_allowed_source_classes_exclude_policy_groups_without_poisoning_window(self):
         rows = [
-            ("human", "qqbot", {"display_kind": "", "internal_kind": ""}),
-            (
-                "internal",
-                "qqbot",
-                {"display_kind": "internal_notification", "internal_kind": ""},
-            ),
-            ("unknown", "future_plugin", {"display_kind": "", "internal_kind": ""}),
+            ("human", "qqbot", "human"),
+            ("internal", "qqbot", "internal"),
+            ("unknown", "future_plugin", "unknown"),
         ]
         service, _adapter, _session_db = self.service(
             [
                 session(name, source, REFERENCE - timedelta(minutes=index))
-                for index, (name, source, _evidence) in enumerate(rows)
+                for index, (name, source, _source_class) in enumerate(rows)
             ],
             {
                 name: source_result(
                     [group(name, REFERENCE - timedelta(minutes=index), name, "done")],
-                    source_evidence=[evidence],
+                    source_classes=[source_class],
                 )
-                for index, (name, _source, evidence) in enumerate(rows)
+                for index, (name, _source, source_class) in enumerate(rows)
             },
         )
 
@@ -384,21 +401,20 @@ class CanonicalSourceServiceTests(unittest.TestCase):
         self.assertNotIn('"internal"', response_text)
         self.assertNotIn('"unknown"', response_text)
 
-    def test_explicit_custom_frontend_source_can_be_classified_as_human(self):
+    def test_custom_frontend_source_tag_cannot_grant_human_authority(self):
         service, _adapter, _session_db = self.service(
             [session("custom", "my_frontend", REFERENCE)],
             {"custom": source_result([group("custom", REFERENCE, "hello", "done")])},
-            additional_human_sources=["my_frontend"],
         )
 
         response = service.read_window(
             request(allowed_source_classes=["human", "scheduled"])
         )
 
-        self.assertEqual(response["status"], "ready")
-        self.assertEqual(response["groups"][0]["source_class"], "human")
+        self.assertEqual(response["status"], "empty")
+        self.assertEqual(response["groups"], [])
 
-    def test_hermes_interactive_source_tags_are_human(self):
+    def test_interactive_session_tags_without_h13_proof_remain_unknown(self):
         source_tags = ["cli", "tui", "hermes_browser", "desktop", "dashboard"]
         service, _adapter, _session_db = self.service(
             [
@@ -417,11 +433,8 @@ class CanonicalSourceServiceTests(unittest.TestCase):
             request(allowed_source_classes=["human", "scheduled"])
         )
 
-        self.assertEqual(response["status"], "ready")
-        self.assertEqual(
-            {row["source"]: row["source_class"] for row in response["groups"]},
-            {source: "human" for source in source_tags},
-        )
+        self.assertEqual(response["status"], "empty")
+        self.assertEqual(response["groups"], [])
 
     def test_all_policy_excluded_groups_return_honest_empty_reason(self):
         service, _adapter, _session_db = self.service(

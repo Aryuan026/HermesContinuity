@@ -114,6 +114,11 @@ class PluginRegistrationTests(unittest.TestCase):
         agent = types.ModuleType("agent")
         plugin_llm = types.ModuleType("agent.plugin_llm")
         plugin_llm.PluginLlmCompleteResult = result_type
+        message_origin = types.ModuleType("agent.message_origin")
+        message_origin.classify_message_origin_group = lambda *_args, **_kwargs: (
+            None,
+            "missing",
+        )
         hermes_state = types.ModuleType("hermes_state")
         hermes_state.SessionDB = session_db_type
         hermes_cli = types.ModuleType("hermes_cli")
@@ -127,6 +132,7 @@ class PluginRegistrationTests(unittest.TestCase):
         return {
             "agent": agent,
             "agent.plugin_llm": plugin_llm,
+            "agent.message_origin": message_origin,
             "hermes_state": hermes_state,
             "hermes_cli": hermes_cli,
             "hermes_cli.middleware": middleware,
@@ -134,7 +140,7 @@ class PluginRegistrationTests(unittest.TestCase):
         }
 
     def test_registers_only_request_execution_and_settlement_boundaries(self):
-        self.ctx.config["additional_human_sources"] = ["custom_frontend"]
+        self.ctx.config["additional_human_sources"] = ["stale_custom_frontend"]
         with patch.dict(sys.modules, self._modules(CompatibleResult)):
             plugin.register(self.ctx)
 
@@ -158,9 +164,7 @@ class PluginRegistrationTests(unittest.TestCase):
             self.ctx.services[0][1], plugin.ContinuityCanonicalSourceService
         )
         self.assertTrue(callable(self.ctx.services[0][1].read_window))
-        self.assertIn(
-            "custom_frontend", self.ctx.services[0][1].human_session_sources
-        )
+        self.assertNotIn("additional_human_sources", self.ctx.config_reads)
         self.assertEqual(len(FakeSessionDB.instances), 1)
         self.assertTrue(FakeSessionDB.instances[0].read_only)
         self.assertEqual(
@@ -185,13 +189,22 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertEqual(self.ctx.hooks, [])
         self.assertEqual(self.ctx.services, [])
 
-    def test_invalid_additional_human_sources_fail_before_db_open(self):
-        self.ctx.config["additional_human_sources"] = "custom_frontend"
-        with patch.dict(sys.modules, self._modules(CompatibleResult)):
-            with self.assertRaisesRegex(RuntimeError, "must be a list"):
+    def test_missing_message_origin_classifier_fails_before_db_open(self):
+        modules = self._modules(CompatibleResult)
+        modules["agent.message_origin"].classify_message_origin_group = None
+        with patch.dict(sys.modules, modules):
+            with self.assertRaisesRegex(RuntimeError, "message-origin group classifier"):
                 plugin.register(self.ctx)
 
         self.assertEqual(FakeSessionDB.instances, [])
+
+    def test_legacy_additional_human_sources_has_no_authority(self):
+        self.ctx.config["additional_human_sources"] = "custom_frontend"
+        with patch.dict(sys.modules, self._modules(CompatibleResult)):
+            plugin.register(self.ctx)
+
+        self.assertEqual(len(FakeSessionDB.instances), 1)
+        self.assertNotIn("additional_human_sources", self.ctx.config_reads)
 
     def test_missing_service_registry_fails_before_db_open(self):
         self.ctx.register_service = None

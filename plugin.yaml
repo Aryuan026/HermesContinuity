@@ -1,5 +1,5 @@
 name: hermes-continuity
-version: 0.4.0
+version: 0.5.0
 manifest_version: 2
 api_version: 1
 description: Exact-source rolling continuity bridges for Hermes without owning its transcript or memory backend
@@ -11,10 +11,6 @@ provides_hooks:
   - post_api_request
   - api_request_error
 config_schema:
-  additional_human_sources:
-    type: list
-    default: []
-    description: Plugin-validated list of extra source tags owned by trusted interactive front ends
   recent_horizon_hours:
     type: int
     default: 72

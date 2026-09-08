@@ -1,7 +1,53 @@
 # Progress
 
-- Lifecycle: active, local implementation.
-- Manifest version: 0.4.0.
+## Current Wave 5 candidate
+
+- Lifecycle: active, Continuity-only external-review candidate. Wave 6 is not
+  open.
+- Manifest version: 0.5.0.
+- Accepted host baseline: Hermes Agent 0.21.0 commit
+  `13900108780ae712059075200b243aa049c634cf`, tree
+  `5e82789d9984f8c338c09bdd0ebb31794af1f0dc`, with Wave 4 assembly receipt
+  `455ff4b442e15ee17a1b5ebb96fe4620e6acc322`.
+- H13 source authority: the adapter now asks the host classifier to decide each
+  complete logical group. Session/source/display labels, visible text, and the
+  removed `additional_human_sources` setting cannot mint `human`. Missing and
+  pre-H13 proof remains `unknown`.
+- Complete-group obligation: user rows, interim assistant/tool rows, the final
+  assistant, matching superseded physical generations, and ancestor/tip clones
+  all participate in the proof decision. A conflict makes only the affected
+  group unknown. An interrupted scheduled user-only tail cannot merge into a
+  later human group.
+- Runtime proof: the local exact-host suite is 219/219 Green with one expected
+  legacy dual-plugin skip. The Continuity-only production
+  `AIAgent.run_conversation` test covers primary-provider failure, model/window
+  fallback, final-provider delivery, post settlement, next-turn checkpoint
+  reuse, and manager unload/reload. The real SessionDB/Lean test covers a
+  tool-follow-up group, physical in-place archive, separately constructed
+  compression lineage, synthetic-summary exclusion,
+  close, and read-only reopen; both the production full-prefix reader and the
+  bounded lineage reader recover all 30/30 complete groups.
+- Storage compatibility: `ContinuityMetadataStore`, checkpoint v2, receipt
+  schema, CAS, and settlement code are unchanged. Existing restart tests read
+  back the pre-H13 checkpoint fixture and body-free receipt rows after reopening
+  the same database.
+- Frozen surfaces: `context_compactor.py`, `thread_continuity_runtime.py`, and
+  production `runtime.py` are unchanged; the 72h / 24,000 / 2,048 budgets are
+  unchanged. Hermes host code and Global Hot were not modified.
+- Public evidence boundary: the repository workflow runs host-independent
+  plugin unit tests using a minimal H13 contract fixture plus the accepted
+  predecessor request-overlay seam. It does not claim exact 0.21 host replay.
+  Publishing the full 0.21 patch chain and replay workflow remains an assembly
+  landing-wave task after both plugins are accepted.
+- Deployment boundary: the accepted 0.20.5 installation remains the control.
+  This Wave 5 revision has not been installed, enabled, deployed, or observed
+  on a live channel.
+- Long-history boundary: checkpoint v2 and the main continuity source read are
+  still O(total session history). A stable Hermes prefix-proof seam and compact
+  checkpoint v3 remain required before formal long-lived-profile use.
+
+## Retained predecessor evidence
+
 - Source extraction: completed from owner-authorized AsherieSystem revision
   `ddfb1e9aeb7c6f7797912e959a0970c621875c83`.
 - Hermes adapter: implemented against canonical `SessionDB` reads with raw-row
@@ -17,10 +63,9 @@
 - Canonical source service: implemented as the profile-local
   `hermes-continuity:canonical-source.v2` service with bounded physical reads,
   compression-lineage union, complete dialogue groups, closed source classes,
-  consumer-bound class filtering, explicit custom-frontend source ownership,
-  and body-free policy-exclusion trace.
-- Host prerequisites: twelve ordered generic patches are recorded under
-  `patches/`; the final compatible Hermes core commit is
+  consumer-bound class filtering, and body-free policy-exclusion trace.
+- Predecessor host prerequisites: twelve ordered generic patches are recorded
+  under `patches/`; the final compatible 0.20.5 Hermes core commit is
   `5a680e5e38625fb3275b4bf6973a40d089ec11a7` (`hermes.transport.v3`,
   manifest-v2 installer, joint Doctor, and shared request-overlay v2 host
   acceptance).
@@ -60,9 +105,8 @@
   ownership reminting, commits budget dispositions only after host acceptance,
   and records final-body estimates even when no filter is registered. The
   exact host plus paired Global Hot suite is 205/205 after this correction.
-  Public CI replays all twelve patches, installs the materialized host, exports
-  `HERMES_SOURCE_ROOT`, and runs the shared-overlay plus real-host plugin tests
-  before the Python 3.11/3.12 matrix completes.
+  That exact-host replay was valid for the accepted 0.20.5 generation; it is
+  not evidence for the current 0.21 candidate.
 - Plugin lifecycle proof: exact public candidates `698fd4d` and `9f01f61`
   installed through the official CLI into a disposable profile with full
   commit pins and remained disabled; Continuity passed native Doctor, Global
@@ -79,12 +123,9 @@
 - External review: the first public candidate was judged suitable only for a
   disposable canary. Its source-policy findings are incorporated in this
   replacement root; repeat exact-revision review remains the current gate.
-- Long-history boundary: checkpoint v2 and the main continuity source read are
-  still O(total session history). A stable Hermes prefix-proof seam and compact
-  checkpoint v3 remain required before formal long-lived-profile use.
 - Runtime installation and target canary truth are intentionally owned by the
   exact external assembly receipt rather than inferred from this source tree.
 
-The current review gate is H11's ownership-acceptance correction and public
-real-host patch replay. Target installation, canary authorization, and runtime
-evidence are recorded by the external assembly rather than this source tree.
+The current review gate is Wave 5 Continuity H13 consumption. Target
+installation, canary authorization, and runtime evidence remain owned by the
+external assembly rather than inferred from this source tree.

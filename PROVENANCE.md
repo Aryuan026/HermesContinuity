@@ -6,7 +6,15 @@ AsherieSystem revision
 tested Thread Continuity algorithms while replacing Asherie-specific storage,
 surface routing, and service wiring with narrow Hermes host seams.
 
-The Hermes compatibility lineage is:
+The current Wave 5 host identity is Hermes Agent 0.21.0 commit
+`13900108780ae712059075200b243aa049c634cf`, tree
+`5e82789d9984f8c338c09bdd0ebb31794af1f0dc`. Continuity consumes the
+host-owned `hermes.message_origin.v1` group classifier introduced by the H13
+storage/writer seam. It does not reproduce that classifier or mint origin
+proofs in production; `tests/host_contract/message_origin.py` is a deliberately
+small host-independent unit fixture, not a runtime fallback.
+
+The retained 0.20.5 predecessor compatibility lineage is:
 
 - upstream Hermes 0.20.5: `fcbd1076a93841fa88855acce810e342a5b78101`;
 - reviewed owner overlay: `c7c36f36ccee592a96f90e8acd9c6401808a02ad`;
@@ -66,7 +74,7 @@ The exported patch SHA-256 values, in application order, are:
 | Adapt | Hermes PluginLlm result boundary | `patches/hermes-0.20.5-plugin-llm-finish-reason.patch` | Adds generic finish-reason exposure needed to reject incomplete summaries. It is a Hermes core prerequisite, not plugin-owned monkey-patching. |
 | Adapt | Hermes request middleware, service registry, bounded SessionDB read, transport truth, closed finish-state truth, final-body budget filtering, and wakeup provenance | the seven subsequent ordered patches under `patches/` | Adds generic host composition, profile-local peer services, physically bounded canonical reads, final provider-body evidence/filtering, provider-complete finish normalization, and an unforgeable durable wakeup sidecar. These seams contain no Continuity algorithm. |
 | Adapt | Hermes plugin installation, Doctor lifecycle, and request overlay ownership | `patches/hermes-0.20.5-installer-manifest-v2.patch`, `patches/hermes-0.20.5-joint-plugin-doctor.patch`, and the two `patches/hermes-0.20.5-request-overlay-*.patch` artifacts | Reuses the runtime manifest-version authority in CLI/dashboard installation, lets Doctor load companion plugins in one temporary profile, and gives request plugins one shared carrier/proof/final-budget contract whose disposition is committed only after host acceptance. These are generic host seams, not Continuity exceptions. |
-| Adapt | Asherie cross-mouth recent-source ownership | `hermes_adapter.py`: `ContinuityCanonicalSourceService` | Replaced Home cache/window ownership with a neutral, read-only, profile-local canonical service over complete Hermes dialogue groups. v2 adds a closed Hermes source classification instead of disguising all origins as donor `home_gateway`. The service exposes no Global Hot material schema and persists no bodies. |
+| Adapt | Asherie cross-mouth recent-source ownership | `hermes_adapter.py`: `ContinuityCanonicalSourceService` | Replaced Home cache/window ownership with a neutral, read-only, profile-local canonical service over complete Hermes dialogue groups. On 0.21, source authority comes only from the host H13 classifier over the full persisted group, including tool/interim rows and matching superseded generations. Missing/pre-H13 proof stays `unknown`; conflicts are localized to the affected group. Session/source/display labels and the retired `additional_human_sources` setting grant no authority. The service exposes no Global Hot material schema and persists no bodies. |
 | Do not port | `ConversationCacheStore` JSONL buckets, append/capture paths, recent/time-window query and ranking, query scoring, filesystem repair ledgers, and cache search/storage | none | Hermes `state.db` remains the only transcript archive; original sentences remain searchable through native `session_search`. |
 | Do not port | `thread_continuity_gateway.py` Home/mobile/public-gateway preflight, transport reconciliation, `runtime_admin`, and capture-surface ownership | none | Those contracts belong to AsherieSystem surfaces and are not valid Hermes plugin APIs. |
 | Do not port | Home service startup, Bridge/mobile/chatbox wiring, provider-cache ownership, and Asherie capture workers | none | The plugin registers only Hermes request/execution middleware and post-API/error hooks. |
@@ -90,5 +98,5 @@ Consequently, searchable exact history and original-sentence retrieval stay in
 Hermes `state.db` and native `session_search`; the recent bridge is only a
 bounded request carrier.
 
-The compatibility patches retain the upstream Hermes/Nous MIT notice in
+The predecessor compatibility patches retain the upstream Hermes/Nous MIT notice in
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

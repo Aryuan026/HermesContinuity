@@ -54,22 +54,25 @@ foreign owners, and unclaimed nonempty SQLite schema rather than mixing stores.
 
 The `canonical-source.v2` service uses bounded physical reads, follows
 compression lineages from ancestor to tip, and blocks the whole window on
-ambiguous source history. Consecutive plain-text user rows are merged with the
-same double-newline rule as Hermes's provider replay; the first following
-assistant closes that dialogue group, and later visible assistant rows become
-typed proactive-assistant groups. API-only scaffolds and host metadata never
-become source material, while an unverified assistant at the start of a full
-session still fails closed. Every group carries one closed source class:
-`human`, `scheduled`, `internal`, `delegated`, `tool`, or `unknown`. Wakeups qualify as scheduled
-only when the durable user row carries host-proven wakeup provenance; an
-arbitrary platform label is not enough. Response bodies exist only in the
-synchronous in-process response; service traces and receipts remain body-free.
-Consumers may request a closed subset through `allowed_source_classes`.
-Clearly classified but disallowed groups are counted and omitted before their
-bodies cross the service boundary; source ambiguity still blocks the complete
-window. Hermes CLI, TUI, browser, desktop and dashboard tags are human inputs.
-An owner-operated custom frontend must be listed explicitly in
-`additional_human_sources`; unknown tags are never guessed to be human.
+ambiguous source history. Consecutive user rows may share a dialogue group only
+when the host-owned H13 proof keeps them in the same origin segment; a
+scheduled user-only interrupted tail therefore cannot merge into the next
+human turn. The first final assistant closes the group. Tool and interim
+assistant rows are not exposed as source material, but their proofs remain
+obligations of that complete logical group. API-only scaffolds and synthetic
+Lean summaries never become source material.
+
+Every group carries one closed source class: `human`, `scheduled`, `internal`,
+`delegated`, `tool`, or `unknown`. The class comes only from Hermes's
+`hermes.message_origin.v1` group classifier. Session source/title, platform
+label, display metadata, message text, and old plugin configuration grant no
+authority. Missing or pre-H13 proof remains `unknown`; invalid or conflicting
+proof makes only the affected group unknown. Superseded physical generations
+and ancestor/tip clones participate in that local fail-closed decision.
+Response bodies exist only in the synchronous in-process response; service
+traces and receipts remain body-free. Consumers may request a closed subset
+through `allowed_source_classes`. Clearly classified but disallowed groups are
+counted and omitted before their bodies cross the service boundary.
 
 `/continuity-status [session_id]` reports process-private attempt counts,
 expiry/cap state, context-window provenance, the final-body estimator's
@@ -85,50 +88,21 @@ publish a checkpoint or delivery receipt.
 
 ## Compatibility
 
-The reviewed host baseline and additive host seams are:
+The current Wave 5 source candidate is tested against the accepted Hermes
+Agent 0.21.0 host commit
+`13900108780ae712059075200b243aa049c634cf` with tree
+`5e82789d9984f8c338c09bdd0ebb31794af1f0dc`. It requires
+`hermes.middleware.v2`, `hermes.transport.v3`, `hermes.request_overlay.v2`,
+the bounded SessionDB time-window reader, PluginLlm finish truth, profile-local
+services, and the host-owned H13 message-origin group classifier. Registration
+fails visibly when any required seam is absent.
 
-- Hermes upstream release: `fcbd1076a93841fa88855acce810e342a5b78101`;
-- owner overlay: `c7c36f36ccee592a96f90e8acd9c6401808a02ad`;
-- PluginLlm finish reasons: `201fe7756c57c35aaed9af8e9886e10ff4d25cfe`;
-- sequential request middleware and `hermes.middleware.v2`:
-  `b7fac683859f5997b4cc63a951078b99c209abbc`;
-- profile-scoped plugin services:
-  `22dd21241f3628e0d25b808012f07874d45310d4`;
-- bounded SessionDB time-window reads:
-  `20b7b9a3b4f66871686503f222e39f4c55a058a5`;
-- final provider-body transport truth and `hermes.transport.v1`:
-  `81f8fa21167b1fcd3929b27ee172b6cf7a94ec21`;
-- closed finish-state truth across auxiliary/provider adapters:
-  `5e1b05f04b193ade4eb16fb28f29198b0ee672a3`;
-- host-resolved context provenance, final provider-body filtering, and
-  `hermes.transport.v3`:
-  `7a5c6ca23b544d73fb37a3a1c7d8b08d1a82938c`;
-- verified durable wakeup provenance:
-  `7c183e81832c81e29f6d095a15bb7c8cd080ee5c`;
-- installer manifest-v2 alignment:
-  `113b4ab5285f92a1013c6a494eb33260a7f70140`;
-- joint plugin Doctor:
-  `969cf5bdbc3a110e475c02ed8e4ee84f64be32ed`;
-- shared request overlay ownership, scoped proof, and final-budget disposition:
-  `ccd7bf350ca54a44b7351904e079f5ffdb64eec0`;
-- host-accepted overlay dispositions, zero-filter provider-body estimates, and
-  no byte-derived ownership reminting:
-  `5a680e5e38625fb3275b4bf6973a40d089ec11a7`.
-
-Apply the twelve ordered patches in [`patches/`](patches/) to the compatible
-Hermes core. The first eight are runtime prerequisites, the next two align
-the official installer with manifest v2 and let Doctor load dependency sets in
-one initialized temporary profile, and the final two own generic
-request-overlay carrier/proof behavior and host acceptance. They are generic
-host capabilities, not plugin-specific monkey patches. Registration fails
-visibly if a required runtime schema or API is absent.
-
-The order is: `plugin-llm-finish-reason`, `request-middleware-v2`,
-`plugin-service-registry`, `bounded-session-message-reads`,
-`provider-transport-truth`, `closed-finish-state-truth`,
-`final-provider-budget-controls`, `verified-wakeup-provenance`,
-`installer-manifest-v2`, `joint-plugin-doctor`, `request-overlay-proofs`, then
-`request-overlay-acceptance`.
+The twelve patches currently retained in [`patches/`](patches/) reproduce the
+accepted 0.20.5 predecessor only. They are provenance artifacts, not an
+installation path for plugin version 0.5.0 and must not be applied to 0.21.
+The public 0.21 patch replay and workflow migration belong to the later
+assembly landing wave, after Continuity and Global Hot are independently
+accepted.
 
 ## Test
 
@@ -145,27 +119,34 @@ tests. Point them at a compatible checkout to exercise
 `SessionDB.archive_and_compact` and the real middleware/hook registries:
 
 ```bash
+PYTHONPATH=/path/to/hermes \
 HERMES_SOURCE_ROOT=/path/to/hermes \
 python -B -m unittest discover -s tests -v
 ```
 
-All committed fixtures are synthetic. Public GitHub Actions replays all twelve
-patches from pure upstream `fcbd1076`, installs that materialized host, exports
-`HERMES_SOURCE_ROOT`, runs the shared-overlay host tests, and then runs the
-plugin's Python 3.11/3.12 suite with its real-host tests enabled. The
-dual-plugin `AIAgent.run_conversation` entrypoint still requires a Global Hot
-tree and is exercised by Global Hot's paired workflow rather than this
-single-repository workflow.
+All committed fixtures are synthetic. `tests/test_real_host_021.py` loads only
+Continuity through real plugin discovery and enters through production
+`AIAgent.run_conversation`; it covers a failed primary provider attempt,
+fallback delivery, post settlement, next-turn checkpoint reuse, and manager
+unload/reload. The adapter suite separately runs real Lean compaction and
+read-only reopen through both the production full-prefix and bounded lineage
+readers, including a tool-follow-up group. The legacy dual-plugin test
+remains for the accepted 0.20.5 predecessor. Public replay of the exact 0.21
+host is intentionally deferred to the assembly landing wave; local exact-host
+results are not presented as public-CI evidence.
 
 ## Current status
 
-The first public replacement candidate received external review. Its
-source-policy findings are incorporated in this next exact-revision candidate.
+The 0.20.5 public candidate remains the installed control. This 0.21 Wave 5
+revision is a Continuity-only source candidate: it consumes H13 proof and has
+local exact-host evidence, but has not been installed, enabled, deployed, or
+observed on a live channel.
 The current v2 source/checkpoint path still performs work and stores proof
 material proportional to full session history; formal use on a long-lived
 profile remains blocked until a stable host prefix-proof seam and compact
-checkpoint v3 exist. The plugin is not installed, enabled, deployed, or
-observed in a live conversation; see [`PROGRESS.md`](PROGRESS.md).
+checkpoint v3 exist. The new 0.21 artifact has not been installed, enabled,
+deployed, or observed in a live conversation; see
+[`PROGRESS.md`](PROGRESS.md).
 
 The extraction lineage and deliberate omissions are recorded in
 [`PROVENANCE.md`](PROVENANCE.md). Security and privacy boundaries are in
