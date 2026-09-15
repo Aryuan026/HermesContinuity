@@ -48,7 +48,7 @@ jobs:
           echo "HERMES_CONTINUITY_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
           echo "HERMES_GLOBAL_HOT_ROOT=$GITHUB_WORKSPACE/_paired/global-hot" >> "$GITHUB_ENV"
       - name: Install exact host test runtime
-        run: python -m pip install -e "$GITHUB_WORKSPACE/_upstream/hermes" pytest==9.1.1
+        run: python -m pip install -e "$GITHUB_WORKSPACE/_upstream/hermes[dev,messaging,acp]"
       - name: Run accepted host seam matrix
         run: |
           cd "$GITHUB_WORKSPACE/_upstream/hermes"
