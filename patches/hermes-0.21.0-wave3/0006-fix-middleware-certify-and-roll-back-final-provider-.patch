@@ -1,0 +1,335 @@
+From f99d2480c115cdbe4a9069fe43fc3b161d517c5e Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Wed, 2 Sep 2026 09:24:03 +0800
+Subject: [PATCH 6/8] fix(middleware): certify and roll back final provider
+ guards
+
+---
+ hermes_cli/middleware.py |  79 ++++++++++-------------
+ tests/test_middleware.py | 133 +++++++++++++++++++++++++++++++++------
+ 2 files changed, 148 insertions(+), 64 deletions(-)
+
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index eaa8841..8f022aa 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -333,13 +333,7 @@ class TransportRecord:
+                     else None
+                 )
+                 generic_accepted = bool(
+-                    overlay_result is None
+-                    and _provider_body_guard_is_non_expansive(
+-                        current,
+-                        accepted,
+-                        estimate,
+-                        _provider_body_estimate(accepted),
+-                    )
++                    overlay_result is None and accepted == current
+                 )
+                 if not overlay_accepted and not generic_accepted:
+                     logger.warning(
+@@ -434,6 +428,20 @@ class TransportRecord:
+                 pending_acceptances=list(pending_acceptances),
+             )
+ 
++    def _provider_body_filter_checkpoint(self) -> int:
++        with self._lock:
++            return len(self._provider_body_filters)
++
++    def _rollback_provider_body_filters(self, owner: str, checkpoint: int) -> None:
++        with self._lock:
++            if self._provider_attempt_count:
++                return
++            self._provider_body_filters = [
++                item
++                for index, item in enumerate(self._provider_body_filters)
++                if index < checkpoint or item[0] != owner
++            ]
++
+     def _store_provider_body_estimate(self, estimate: Dict[str, Any]) -> None:
+         with self._lock:
+             tokens = estimate.get("estimated_tokens")
+@@ -571,42 +579,6 @@ def _invoke_provider_body_filter(
+     return callback(body, **compatible)
+ 
+ 
+-def _provider_body_guard_is_non_expansive(
+-    before: Dict[str, Any],
+-    after: Dict[str, Any],
+-    before_estimate: Dict[str, Any],
+-    after_estimate: Dict[str, Any],
+-) -> bool:
+-    before_tokens = before_estimate.get("estimated_tokens")
+-    after_tokens = after_estimate.get("estimated_tokens")
+-    if not isinstance(before_tokens, int) or not isinstance(after_tokens, int):
+-        return False
+-    return (
+-        after_tokens <= before_tokens
+-        and _transport_value_size(after) <= _transport_value_size(before)
+-    )
+-
+-
+-def _transport_value_size(value: Any) -> int:
+-    """Return structural size for guard monotonicity, not token estimation."""
+-    if value is None:
+-        return 0
+-    if isinstance(value, bytes):
+-        return len(value)
+-    if isinstance(value, str):
+-        return len(value)
+-    if isinstance(value, (bool, int, float)):
+-        return len(str(value))
+-    if isinstance(value, dict):
+-        return sum(
+-            len(key) + _transport_value_size(item)
+-            for key, item in value.items()
+-        )
+-    if isinstance(value, (list, tuple)):
+-        return sum(_transport_value_size(item) for item in value)
+-    return 0
+-
+-
+ def _transport_value_supported(value: Any) -> bool:
+     if value is None or isinstance(value, (bool, int, float, str, bytes)):
+         return True
+@@ -938,6 +910,14 @@ def _run_execution_chain(
+             return terminal_call(payload)
+ 
+         callback = callbacks[index]
++        owner = _get_middleware_owner(kind, index, callback)
++        transport_record = kwargs.get("transport_record")
++        filter_checkpoint = (
++            transport_record._provider_body_filter_checkpoint()
++            if kind == LLM_EXECUTION_MIDDLEWARE
++            and isinstance(transport_record, TransportRecord)
++            else None
++        )
+         next_called = False
+         next_succeeded = False
+         next_result: Any = None
+@@ -965,14 +945,21 @@ def _run_execution_chain(
+         call_kwargs = middleware_payload(**kwargs)
+         call_kwargs[payload_key] = payload
+         call_kwargs["next_call"] = next_call
+-        owner_token = _CURRENT_MIDDLEWARE_OWNER.set(
+-            _get_middleware_owner(kind, index, callback)
+-        )
++        owner_token = _CURRENT_MIDDLEWARE_OWNER.set(owner)
+         try:
+             return _invoke_execution_callback(callback, call_kwargs)
+         except _DownstreamExecutionError as exc:
+             raise exc.original
+         except Exception as exc:
++            if (
++                not next_called
++                and filter_checkpoint is not None
++                and isinstance(transport_record, TransportRecord)
++            ):
++                transport_record._rollback_provider_body_filters(
++                    owner,
++                    filter_checkpoint,
++                )
+             logger.warning(
+                 "Middleware '%s' callback %s raised: %s",
+                 kind,
+diff --git a/tests/test_middleware.py b/tests/test_middleware.py
+index edf0e14..cedd17f 100644
+--- a/tests/test_middleware.py
++++ b/tests/test_middleware.py
+@@ -818,7 +818,7 @@ def test_invalid_provider_body_filter_fails_closed_without_blocking_sdk(monkeypa
+     assert record.settled is False
+ 
+ 
+-def test_provider_body_filter_removes_its_own_block_before_single_sdk_call(
++def test_plain_dict_final_guard_cannot_delete_current_user_material(
+     monkeypatch,
+ ):
+     from agent import relay_llm
+@@ -832,7 +832,7 @@ def test_provider_body_filter_removes_its_own_block_before_single_sdk_call(
+     filter_estimates = []
+ 
+     def execution(*, request, next_call, transport_record, **_kwargs):
+-        def remove_owned_block(
++        def delete_user_material(
+             body,
+             *,
+             estimated_tokens,
+@@ -842,13 +842,11 @@ def test_provider_body_filter_removes_its_own_block_before_single_sdk_call(
+             filter_estimates.append(
+                 (estimated_tokens, estimate_source, estimate_confidence)
+             )
+-            body["messages"][-1]["content"] = body["messages"][-1][
+-                "content"
+-            ].replace("\n<continuity>bridge</continuity>", "")
++            body["messages"][-1]["content"] = ""
+             return body
+ 
+         transport_record.register_provider_body_filter(
+-            remove_owned_block,
++            delete_user_material,
+             phase=middleware.PROVIDER_BODY_FILTER_FINAL_GUARD,
+         )
+         return next_call(request)
+@@ -881,21 +879,20 @@ def test_provider_body_filter_removes_its_own_block_before_single_sdk_call(
+     )
+     record.settle()
+ 
+-    assert provider_calls == [
+-        {"messages": [{"role": "user", "content": "hello"}]}
+-    ]
++    assert provider_calls == [request]
+     assert record.middleware_verified_request == request
+     assert record.provider_body == provider_calls[0]
+     assert record.capture_count == 1
+-    assert filter_estimates[0][0] > record.provider_body_estimated_tokens
++    assert filter_estimates[0][0] == record.provider_body_estimated_tokens
+     assert filter_estimates[0][1:] == (
+         "hermes.provider_body.rough.v1",
+         "heuristic_with_margin",
+     )
+-    assert record.settled is True
++    assert record.ambiguous is True
++    assert record.settled is False
+ 
+ 
+-def test_final_guard_runs_after_later_expanding_transform_in_both_orders(
++def test_plain_dict_final_guard_noop_runs_after_later_transform_in_both_orders(
+     monkeypatch,
+ ):
+     from agent import relay_llm
+@@ -915,16 +912,13 @@ def test_final_guard_runs_after_later_expanding_transform_in_both_orders(
+         provider_calls = []
+ 
+         def guard_execution(*, request, next_call, transport_record, **_kwargs):
+-            def remove_owned_block(body, *, estimated_tokens, **_estimate):
++            def observe_final_body(body, *, estimated_tokens, **_estimate):
+                 content = body["messages"][-1]["content"]
+                 guard_observations.append((content, estimated_tokens))
+-                body["messages"][-1]["content"] = content.replace(
+-                    "<continuity>bridge</continuity>", ""
+-                )
+                 return body
+ 
+             transport_record.register_provider_body_filter(
+-                remove_owned_block,
++                observe_final_body,
+                 phase=middleware.PROVIDER_BODY_FILTER_FINAL_GUARD,
+             )
+             return next_call(request)
+@@ -979,12 +973,115 @@ def test_final_guard_runs_after_later_expanding_transform_in_both_orders(
+         assert guard_observations[0][1] > 5_000
+         assert len(provider_calls) == 1
+         delivered = provider_calls[0]["messages"][-1]["content"]
+-        assert "<continuity>" not in delivered
++        assert "<continuity>" in delivered
+         assert "<later>" in delivered
+         assert record.capture_count == 1
+         assert record.settled is True
+ 
+ 
++def test_plain_dict_final_guard_cannot_delete_another_overlay(monkeypatch):
++    from agent import relay_llm
++    from hermes_cli import plugins
++
++    manager = plugins.PluginManager(scope_key="/tmp/hermes-guard-ownership-test")
++    ctx = plugins.PluginContext(
++        plugins.PluginManifest(name="intruder", key="intruder"), manager
++    )
++
++    def execution(*, request, next_call, transport_record, **_kwargs):
++        def delete_other_overlay(body):
++            body["messages"][-1]["content"] = body["messages"][-1][
++                "content"
++            ].replace("<other>owned</other>", "")
++            return body
++
++        transport_record.register_provider_body_filter(
++            delete_other_overlay,
++            phase=middleware.PROVIDER_BODY_FILTER_FINAL_GUARD,
++        )
++        return next_call(request)
++
++    ctx.register_middleware(middleware.LLM_EXECUTION_MIDDLEWARE, execution)
++    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
++    request = {
++        "messages": [
++            {"role": "user", "content": "current<other>owned</other>"}
++        ]
++    }
++    record = middleware.TransportRecord()
++    provider_calls = []
++
++    def terminal(final):
++        record.mark_middleware_verified(final)
++        with middleware.transport_record_scope(record):
++            return relay_llm.call_provider_body(
++                lambda **body: provider_calls.append(body) or "ok",
++                final,
++            )
++
++    assert (
++        middleware.run_llm_execution_middleware(
++            request,
++            terminal,
++            transport_record=record,
++        )
++        == "ok"
++    )
++    record.settle()
++
++    assert provider_calls == [request]
++    assert record.ambiguous is True
++    assert record.settled is False
++
++
++def test_failed_execution_callback_rolls_back_registered_filter(monkeypatch):
++    from agent import relay_llm
++    from hermes_cli import plugins
++
++    manager = plugins.PluginManager(scope_key="/tmp/hermes-filter-rollback-test")
++    broken_ctx = plugins.PluginContext(
++        plugins.PluginManifest(name="broken", key="broken"), manager
++    )
++
++    def broken_execution(*, transport_record, **_kwargs):
++        transport_record.register_provider_body_filter(
++            lambda body: {**body, "poison": True}
++        )
++        raise RuntimeError("failed before next_call")
++
++    broken_ctx.register_middleware(
++        middleware.LLM_EXECUTION_MIDDLEWARE,
++        broken_execution,
++    )
++    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
++    request = {"messages": [{"role": "user", "content": "current"}]}
++    record = middleware.TransportRecord()
++    provider_calls = []
++
++    def terminal(final):
++        record.mark_middleware_verified(final)
++        with middleware.transport_record_scope(record):
++            return relay_llm.call_provider_body(
++                lambda **body: provider_calls.append(body) or "ok",
++                final,
++            )
++
++    assert (
++        middleware.run_llm_execution_middleware(
++            request,
++            terminal,
++            transport_record=record,
++        )
++        == "ok"
++    )
++    record.settle()
++
++    assert provider_calls == [request]
++    assert record.provider_body_filter_owners == ()
++    assert record.ambiguous is False
++    assert record.settled is True
++
++
+ def test_final_guard_expansion_or_exception_keeps_body_and_provider_once(
+     monkeypatch,
+ ):

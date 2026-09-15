@@ -1,0 +1,597 @@
+From 4a70e0f3486b6e5eadc6503d0bd4ea2df7f95bfc Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 00:35:15 +0800
+Subject: [PATCH] fix(transport): expose SDK extra body semantics
+
+---
+ agent/chat_completion_helpers.py              |   2 +
+ agent/codex_runtime.py                        |   1 +
+ agent/relay_llm.py                            | 160 +++++++++--
+ hermes_cli/middleware.py                      |  20 +-
+ .../test_transport_successor_attempts.py      | 266 ++++++++++++++++++
+ 5 files changed, 426 insertions(+), 23 deletions(-)
+
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index eb80e41..66c25eb 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -1012,6 +1012,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+     return relay_llm.call_provider_body(
+         request_client.chat.completions.create,
+         api_kwargs,
++        merge_extra_body=True,
+     )
+ 
+ 
+@@ -4132,6 +4133,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+             attempt = relay_llm.ProviderBodyStreamAttempt(
+                 request_client.chat.completions.create,
+                 stream_kwargs,
++                merge_extra_body=not is_native_gemini_base_url(agent.base_url),
+             )
+             provider_body_stream_attempt["value"] = attempt
+             return attempt.open()
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index 5f21301..2b7e72f 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -1649,6 +1649,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+             body_attempt = relay_llm.ProviderBodyStreamAttempt(
+                 active_client.responses.create,
+                 stream_kwargs,
++                merge_extra_body=True,
+             )
+             provider_body_attempt["value"] = body_attempt
+             return body_attempt.open()
+diff --git a/agent/relay_llm.py b/agent/relay_llm.py
+index 9ae6061..542cfe2 100644
+--- a/agent/relay_llm.py
++++ b/agent/relay_llm.py
+@@ -72,23 +72,113 @@ def _capture_provider_body(body: dict[str, Any]) -> None:
+         record.capture_provider_body(body)
+ 
+ 
++def _provider_body_projection(
++    body: dict[str, Any],
++    *,
++    merge_extra_body: bool,
++) -> tuple[dict[str, Any] | None, frozenset[str] | None, Any, bool]:
++    """Project SDK kwargs into the semantic JSON body seen by the provider."""
++
++    client_timeout = body.get("timeout")
++    has_client_timeout = "timeout" in body
++    base = {
++        key: value
++        for key, value in body.items()
++        if key not in {"extra_body", "timeout"}
++    }
++    if not merge_extra_body or "extra_body" not in body:
++        return base, None, client_timeout, has_client_timeout
++    extra_body = body.get("extra_body")
++    if not isinstance(extra_body, dict):
++        return None, None, client_timeout, has_client_timeout
++    top_level_keys = frozenset(base)
++    semantic = dict(base)
++    semantic.update(extra_body)
++    return semantic, top_level_keys, client_timeout, has_client_timeout
++
++
++def _merge_provider_extra_body(body: dict[str, Any]) -> dict[str, Any] | None:
++    """Apply OpenAI SDK ``extra_body`` precedence to one transform result."""
++
++    if "extra_body" not in body:
++        return body
++    extra_body = body.get("extra_body")
++    if not isinstance(extra_body, dict):
++        return None
++    semantic = {key: value for key, value in body.items() if key != "extra_body"}
++    semantic.update(extra_body)
++    return semantic
++
++
++def _provider_sdk_body(
++    semantic: dict[str, Any],
++    *,
++    top_level_keys: frozenset[str] | None,
++    client_timeout: Any,
++    has_client_timeout: bool,
++) -> dict[str, Any]:
++    """Encode a filtered semantic body back into equivalent SDK kwargs."""
++
++    if top_level_keys is None:
++        final_body = dict(semantic)
++    else:
++        final_body = {
++            key: value for key, value in semantic.items() if key in top_level_keys
++        }
++        extra_body = {
++            key: value for key, value in semantic.items() if key not in top_level_keys
++        }
++        if extra_body:
++            final_body["extra_body"] = extra_body
++    if has_client_timeout:
++        final_body["timeout"] = client_timeout
++    return final_body
++
++
+ @contextmanager
+-def provider_body_scope(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
++def provider_body_scope(
++    body: dict[str, Any],
++    *,
++    merge_extra_body: bool = False,
++) -> Iterator[dict[str, Any]]:
+     """Run one physical SDK attempt, hiding client-only timeout from truth."""
+ 
+     from hermes_cli.middleware import current_transport_record
+ 
+-    client_timeout = body.get("timeout")
+-    has_client_timeout = "timeout" in body
+-    provider_body = {key: value for key, value in body.items() if key != "timeout"}
++    provider_body, top_level_keys, client_timeout, has_client_timeout = (
++        _provider_body_projection(body, merge_extra_body=merge_extra_body)
++    )
+     record = current_transport_record()
++    if record is not None and not record.provider_body_supported:
++        record.mark_provider_body_unsupported()
++        from hermes_cli.middleware import transport_record_scope
++
++        with transport_record_scope(None):
++            yield dict(body)
++        return
++    if provider_body is None:
++        if record is not None:
++            record.mark_provider_body_unsupported()
++        from hermes_cli.middleware import transport_record_scope
++
++        with transport_record_scope(None):
++            yield dict(body)
++        return
+     if record is not None:
+-        filtered = record.begin_provider_body_attempt(provider_body)
++        filtered = record.begin_provider_body_attempt(
++            provider_body,
++            transform_normalizer=(
++                _merge_provider_extra_body if merge_extra_body else None
++            ),
++        )
+         if filtered is not None:
+             provider_body = filtered
+-    final_body = dict(provider_body)
+-    if has_client_timeout:
+-        final_body["timeout"] = client_timeout
++    final_body = _provider_sdk_body(
++        provider_body,
++        top_level_keys=top_level_keys,
++        client_timeout=client_timeout,
++        has_client_timeout=has_client_timeout,
++    )
+     from hermes_cli.middleware import transport_record_scope
+ 
+     try:
+@@ -106,6 +196,8 @@ def provider_body_scope(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+ def call_provider_body(
+     callback: Callable[..., Any],
+     body: dict[str, Any],
++    *,
++    merge_extra_body: bool = False,
+ ) -> Any:
+     """Invoke an SDK surface while recording only its JSON request body."""
+ 
+@@ -121,7 +213,10 @@ def call_provider_body(
+             record.mark_provider_body_unsupported()
+         with transport_record_scope(None):
+             return callback(**body)
+-    with provider_body_scope(body) as final_body:
++    with provider_body_scope(
++        body,
++        merge_extra_body=merge_extra_body,
++    ) as final_body:
+         return callback(**final_body)
+ 
+ 
+@@ -156,12 +251,14 @@ class ProviderBodyStreamAttempt:
+         body: dict[str, Any],
+         *,
+         enter_context: bool = False,
++        merge_extra_body: bool = False,
+     ) -> None:
+         from hermes_cli.middleware import current_transport_record
+ 
+         self._callback = callback
+         self._body = dict(body)
+         self._enter_context = enter_context
++        self._merge_extra_body = merge_extra_body
+         self._record = current_transport_record()
+         self._provider_body: dict[str, Any] | None = None
+         self._manager: Any = None
+@@ -176,24 +273,43 @@ class ProviderBodyStreamAttempt:
+ 
+         from hermes_cli.middleware import transport_record_scope
+ 
+-        client_timeout = self._body.get("timeout")
+-        has_client_timeout = "timeout" in self._body
+-        provider_body = {
+-            key: value for key, value in self._body.items() if key != "timeout"
+-        }
++        provider_body, top_level_keys, client_timeout, has_client_timeout = (
++            _provider_body_projection(
++                self._body,
++                merge_extra_body=self._merge_extra_body,
++            )
++        )
+         record = self._record
+         if record is not None and not record.provider_body_supported:
+             record.mark_provider_body_unsupported()
+             self._record = None
+             record = None
+-        if record is not None:
+-            filtered = record.begin_provider_body_attempt(provider_body)
+-            if filtered is not None:
+-                provider_body = filtered
+-        self._provider_body = dict(provider_body)
+-        final_body = dict(provider_body)
+-        if has_client_timeout:
+-            final_body["timeout"] = client_timeout
++            provider_body = None
++        if provider_body is None:
++            if record is not None:
++                record.mark_provider_body_unsupported()
++            self._record = None
++            record = None
++            final_body = dict(self._body)
++        else:
++            if record is not None:
++                filtered = record.begin_provider_body_attempt(
++                    provider_body,
++                    transform_normalizer=(
++                        _merge_provider_extra_body
++                        if self._merge_extra_body
++                        else None
++                    ),
++                )
++                if filtered is not None:
++                    provider_body = filtered
++            self._provider_body = dict(provider_body)
++            final_body = _provider_sdk_body(
++                provider_body,
++                top_level_keys=top_level_keys,
++                client_timeout=client_timeout,
++                has_client_timeout=has_client_timeout,
++            )
+         try:
+             with transport_record_scope(None):
+                 resource = self._callback(**final_body)
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index e53070f..d74f986 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -282,7 +282,12 @@ class TransportRecord:
+                 )
+             self._provider_body_filters.append((owner, phase, callback))
+ 
+-    def begin_provider_body_attempt(self, body: Any) -> Dict[str, Any] | None:
++    def begin_provider_body_attempt(
++        self,
++        body: Any,
++        *,
++        transform_normalizer: Callable[[Dict[str, Any]], Any] | None = None,
++    ) -> Dict[str, Any] | None:
+         """Build one filtered SDK candidate without committing its outcome."""
+ 
+         initial = _provider_filter_snapshot(body)
+@@ -351,6 +356,19 @@ class TransportRecord:
+             if accepted is None or "timeout" in accepted:
+                 self._mark_ambiguous()
+                 continue
++            if (
++                phase == PROVIDER_BODY_FILTER_TRANSFORM
++                and transform_normalizer is not None
++            ):
++                try:
++                    accepted = _provider_filter_snapshot(
++                        transform_normalizer(accepted)
++                    )
++                except Exception:
++                    accepted = None
++                if accepted is None or "timeout" in accepted:
++                    self._mark_ambiguous()
++                    continue
+             if phase == PROVIDER_BODY_FILTER_FINAL_GUARD:
+                 overlay_accepted = (
+                     overlay_result._validate(current, accepted)
+diff --git a/tests/agent/test_transport_successor_attempts.py b/tests/agent/test_transport_successor_attempts.py
+index 2251053..e97c30b 100644
+--- a/tests/agent/test_transport_successor_attempts.py
++++ b/tests/agent/test_transport_successor_attempts.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
+ from copy import deepcopy
++from importlib.metadata import version
++import json
+ from types import SimpleNamespace
+ import httpx
+ import pytest
+@@ -12,6 +14,7 @@ from hermes_cli.middleware import (
+     transport_record_scope,
+ )
+ from hermes_cli.request_overlay import (
++    OVERLAY_DRIFTED,
+     OVERLAY_PENDING,
+     OVERLAY_REMOVED_FINAL_BUDGET,
+     project_request_overlay,
+@@ -24,6 +27,42 @@ MARKER = f"{NAMESPACE} marker=one]"
+ BODY = f"quoted material\n{END}"
+ 
+ 
++def _openai_mock_client(wire_bodies):
++    from openai import OpenAI
++
++    assert version("openai") == "2.24.0"
++
++    def handler(request):
++        wire_bodies.append(json.loads(request.content))
++        return httpx.Response(
++            200,
++            json={
++                "id": "response-1",
++                "object": "chat.completion",
++                "created": 0,
++                "model": "gpt-test",
++                "choices": [
++                    {
++                        "index": 0,
++                        "finish_reason": "stop",
++                        "message": {"role": "assistant", "content": "done"},
++                    }
++                ],
++                "usage": {
++                    "prompt_tokens": 1,
++                    "completion_tokens": 1,
++                    "total_tokens": 2,
++                },
++            },
++        )
++
++    return OpenAI(
++        api_key="test-key",
++        base_url="https://provider.invalid/v1",
++        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
++    )
++
++
+ def _guarded_request(extra: dict | None = None):
+     request = {
+         "messages": [{"role": "user", "content": "current"}],
+@@ -799,3 +838,230 @@ def test_codex_bypass_preserves_existing_extra_body_precedence(monkeypatch):
+     assert "tools" not in bypassed
+     assert bypassed["extra_body"]["input"] == override_input
+     assert bypassed["extra_body"]["metadata"] == {"owner": "caller"}
++
++
++def test_openai_extra_body_capture_matches_actual_http_json():
++    wire_bodies = []
++    client = _openai_mock_client(wire_bodies)
++    request = {
++        "model": "gpt-test",
++        "messages": [{"role": "user", "content": "top-level"}],
++        "extra_body": {
++            "messages": [{"role": "user", "content": "SDK override"}],
++            "provider_extension": {"mode": "test"},
++        },
++    }
++    record = TransportRecord()
++    record.mark_middleware_verified(request)
++
++    with transport_record_scope(record):
++        cch._dispatch_nonstreaming_api_request(
++            SimpleNamespace(api_mode="chat_completions", provider="openai"),
++            request,
++            make_client=lambda *_args, **_kwargs: client,
++        )
++    record.settle()
++
++    assert record.provider_body == wire_bodies[0]
++    assert record.provider_body["messages"] == [
++        {"role": "user", "content": "SDK override"}
++    ]
++    assert "extra_body" not in record.provider_body
++    assert record.capture_count == 1
++    assert record.ambiguous is False
++    assert record.settled is True
++
++
++def test_openai_extra_body_message_shadow_cannot_settle_overlay_receipt():
++    request = {
++        "model": "gpt-test",
++        "messages": [{"role": "user", "content": "current"}],
++        "extra_body": {
++            "messages": [{"role": "user", "content": "SDK override"}],
++        },
++    }
++    overlay = project_request_overlay(
++        request,
++        marker_namespace=NAMESPACE,
++        end_boundary=END,
++        marker=MARKER,
++        body=BODY,
++    )
++    record = TransportRecord()
++    owner = _CURRENT_MIDDLEWARE_OWNER.set("extra-body-overlay")
++    try:
++        assert overlay.register_final_budget_guard(
++            record,
++            context_window_tokens=100_000,
++            reserve_tokens=lambda _body, _window: 0,
++            validator=lambda _body, native: (
++                native["messages"][-1]["content"] == "current"
++            ),
++        )
++    finally:
++        _CURRENT_MIDDLEWARE_OWNER.reset(owner)
++    record.mark_middleware_verified(overlay.request)
++    wire_bodies = []
++    client = _openai_mock_client(wire_bodies)
++
++    with transport_record_scope(record):
++        cch._dispatch_nonstreaming_api_request(
++            SimpleNamespace(api_mode="chat_completions", provider="openai"),
++            overlay.request,
++            make_client=lambda *_args, **_kwargs: client,
++        )
++    record.settle()
++
++    assert wire_bodies[0]["messages"] == [
++        {"role": "user", "content": "SDK override"}
++    ]
++    assert NAMESPACE not in str(wire_bodies[0])
++    assert record.provider_body == wire_bodies[0]
++    assert record.ambiguous is True
++    assert record.settled is False
++    assert overlay.disposition == OVERLAY_DRIFTED
++
++
++def test_openai_extra_body_budget_guard_filters_actual_http_json():
++    overlay, record = _guarded_request(
++        {
++            "model": "gpt-test",
++            "extra_body": {
++                "tools": [
++                    {
++                        "type": "function",
++                        "function": {
++                            "name": "large_tool",
++                            "description": "x" * 20_000,
++                            "parameters": {"type": "object"},
++                        },
++                    }
++                ]
++            },
++        }
++    )
++    wire_bodies = []
++    client = _openai_mock_client(wire_bodies)
++
++    with transport_record_scope(record):
++        cch._dispatch_nonstreaming_api_request(
++            SimpleNamespace(api_mode="chat_completions", provider="openai"),
++            overlay.request,
++            make_client=lambda *_args, **_kwargs: client,
++        )
++    record.settle()
++
++    assert record.provider_body == wire_bodies[0]
++    assert record.provider_body["messages"][-1]["content"] == "current"
++    assert NAMESPACE not in str(wire_bodies[0])
++    assert wire_bodies[0]["tools"][0]["function"]["name"] == "large_tool"
++    assert overlay.disposition == OVERLAY_REMOVED_FINAL_BUDGET
++    assert record.capture_count == 1
++    assert record.settled is True
++
++
++def test_codex_late_extra_body_relocation_stays_visible_to_final_guards(monkeypatch):
++    from agent import codex_runtime, relay_llm
++
++    overlay, record, filter_runs = _codex_overlay_record()
++    monkeypatch.delenv("HERMES_CODEX_SDK_TRANSFORM", raising=False)
++    relocated = codex_runtime._bypass_sdk_request_transform(
++        {**deepcopy(overlay.request), "stream": True}
++    )
++    sdk_calls = []
++
++    with transport_record_scope(record):
++        attempt = relay_llm.ProviderBodyStreamAttempt(
++            lambda **body: sdk_calls.append(deepcopy(body))
++            or iter(_codex_terminal_events()),
++            relocated,
++            merge_extra_body=True,
++        )
++        list(attempt.open())
++        attempt.accept()
++    record.settle()
++
++    assert len(filter_runs) == 1
++    assert "input" in filter_runs[0]
++    assert "extra_body" not in filter_runs[0]
++    assert "input" in record.provider_body
++    assert "extra_body" not in record.provider_body
++    assert sdk_calls[0]["extra_body"]["input"] == record.provider_body["input"]
++    assert overlay.disposition != OVERLAY_PENDING
++    assert record.capture_count == 1
++    assert record.settled is True
++
++
++def test_late_transform_extra_body_is_normalized_before_final_budget_guard():
++    from agent import relay_llm
++
++    request = {
++        "model": "gpt-test",
++        "input": [
++            {
++                "role": "user",
++                "content": [{"type": "input_text", "text": "current"}],
++            }
++        ],
++    }
++    overlay = project_request_overlay(
++        request,
++        marker_namespace=NAMESPACE,
++        end_boundary=END,
++        marker=MARKER,
++        body=BODY,
++    )
++    record = TransportRecord()
++    owner = _CURRENT_MIDDLEWARE_OWNER.set("late-extra-body")
++    try:
++        record.register_provider_body_filter(
++            lambda body: {
++                **body,
++                "extra_body": {
++                    "tools": [
++                        {
++                            "type": "function",
++                            "name": "late_large_tool",
++                            "description": "x" * 20_000,
++                            "parameters": {"type": "object"},
++                        }
++                    ]
++                },
++            }
++        )
++    finally:
++        _CURRENT_MIDDLEWARE_OWNER.reset(owner)
++    owner = _CURRENT_MIDDLEWARE_OWNER.set("late-extra-body-overlay")
++    try:
++        assert overlay.register_final_budget_guard(
++            record,
++            context_window_tokens=2_000,
++            reserve_tokens=lambda _body, _window: 0,
++            validator=lambda _body, native: (
++                native["input"][-1]["content"][-1]["text"] == "current"
++            ),
++        )
++    finally:
++        _CURRENT_MIDDLEWARE_OWNER.reset(owner)
++    record.mark_middleware_verified(overlay.request)
++    sdk_calls = []
++
++    with transport_record_scope(record):
++        attempt = relay_llm.ProviderBodyStreamAttempt(
++            lambda **body: sdk_calls.append(deepcopy(body))
++            or iter(_codex_terminal_events()),
++            overlay.request,
++            merge_extra_body=True,
++        )
++        list(attempt.open())
++        attempt.accept()
++    record.settle()
++
++    assert NAMESPACE not in str(sdk_calls[0])
++    assert sdk_calls[0]["input"][-1]["content"][-1]["text"] == "current"
++    assert sdk_calls[0]["tools"][0]["name"] == "late_large_tool"
++    assert record.provider_body == sdk_calls[0]
++    assert overlay.disposition == OVERLAY_REMOVED_FINAL_BUDGET
++    assert record.capture_count == 1
++    assert record.ambiguous is False
++    assert record.settled is True

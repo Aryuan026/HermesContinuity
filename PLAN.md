@@ -48,9 +48,9 @@ provider, or a replacement compressor.
 - Leave `codex_app_server` unchanged in v1.
 - Leave MoA prepared requests unchanged and unpublished until Hermes can expose
   an unambiguous final provider body for that path.
-- Require the 0.21 host seams documented in `README.md`. The twelve retained
-  0.20.5 patches are predecessor provenance and are not an installation route
-  for this revision.
+- Require the 0.21 host seams documented in `README.md`. The 35 ordered 0.21
+  patches reproduce the accepted host tree; the twelve retained top-level
+  0.20.5 patches remain predecessor provenance.
 - Keep attempts that miss both post/error hooks under a strict count cap and
   TTL. Expiry revokes settlement authority. Execution may remove an expired
   carrier only while it still holds the exact bound proof; if another entry
@@ -79,17 +79,17 @@ service, but cannot honestly replace this full-prefix contract.
    unload/reload.
 2. Prove real Lean compaction preserves complete H13-classified groups and
    excludes synthetic summary material after a read-only database reopen.
-3. Push the Wave 5 Continuity revision for independent external review.
-4. Land the accepted 0.21 host patch replay and public workflow only in the
-   assembly landing wave, after Continuity and Global Hot are separately
-   accepted.
-5. Only after that assembly review perform a reversible disabled installation
-   in the target Hermes profile.
+3. Preserve the independently accepted Wave 5 Continuity and Wave 6 Global Hot
+   exact heads.
+4. Make both public workflows replay the digest-pinned 0.21 host, run both
+   plugin suites and the paired production entrypoint, and prove official
+   exact-ref disabled install, native/joint Doctor, remove, and metadata
+   cleanup in a disposable profile.
+5. Only after Wave 7 independent review perform reversible target staging.
 6. Enable and run synthetic/live canaries only under a separate deployment
    authorization.
 
-The accepted 0.20.5 build remains the live control. The current gate is the
-Continuity-only Wave 5 source candidate and its external review; Wave 6,
-Global Hot changes, installation, enablement, deployment, and live behavior
-remain outside this block. The long-history gate above must still close before
-formal long-lived-profile use.
+The accepted 0.20.5 build remains the live control. The current gate is Wave 7
+public replay and disposable disabled lifecycle. Target staging, installation,
+enablement, deployment, and live behavior remain outside this block. The
+long-history gate above must still close before formal long-lived-profile use.

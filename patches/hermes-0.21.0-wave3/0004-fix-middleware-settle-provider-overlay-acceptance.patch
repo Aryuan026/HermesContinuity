@@ -1,0 +1,872 @@
+From 68e192e888827477c7157beff11d33df7fe0db2a Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Wed, 2 Sep 2026 00:02:27 +0800
+Subject: [PATCH 4/4] fix(middleware): settle provider overlay acceptance
+
+---
+ agent/context_compressor.py                   |  70 +++++-----
+ hermes_cli/middleware.py                      |  39 ++++--
+ .../test_bedrock_interrupt_post_worker.py     |   4 -
+ .../test_compaction_redaction_boundaries.py   |   1 +
+ .../agent/test_compression_fallback_budget.py |   8 +-
+ .../test_compression_interrupt_protection.py  |   1 +
+ ...t_compression_small_ctx_threshold_floor.py |   2 +
+ .../test_compression_stall_fallback_78981.py  |   7 +-
+ ...test_compressor_truncated_summary_guard.py |  42 ++++--
+ tests/agent/test_context_compressor.py        |  19 +++
+ ...context_compressor_zero_user_provenance.py |   8 +-
+ tests/agent/test_lean_single_aux_call.py      |  28 ++++
+ tests/agent/test_transport_truth.py           | 130 ++++++++++++++++++
+ tests/test_middleware.py                      |  10 ++
+ tests/test_request_overlay.py                 |  80 +++++++++++
+ 15 files changed, 386 insertions(+), 63 deletions(-)
+
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index d13f044..57ae857 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -191,14 +191,13 @@ def _response_finish_reason(response: Any) -> str:
+         return ""
+ 
+ 
+-# RuntimeError marker raised when the summarizer's generation stopped on the
+-# output-token cap (``finish_reason == "length"``). A length stop means the
+-# summary text is PARTIAL — persisting it as a compaction checkpoint would
+-# silently truncate the conversation's memory and feed the cut-off text back
+-# into every subsequent iterative-update prompt. The except-branch classifier
+-# below keys on this exact substring, so keep raise sites and the classifier
+-# in sync. (Ported from earendil-works/pi#7048 / commit 97fa14e39.)
+-_TRUNCATED_SUMMARY_MARKER = "finish_reason=length"
++# RuntimeError marker for any summary result without closed success truth.
++# Only normalized ``finish_reason=stop`` proves that the text is complete;
++# length/content-filter/tool/failed/cancelled/unknown/missing results must not
++# replace the canonical turns they only partially describe.  The exception
++# classifier below keys on this exact marker so summary fallback and abort stay
++# atomic across every provider adapter.
++_TRUNCATED_SUMMARY_MARKER = "summary_finish_unproven"
+ 
+ 
+ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
+@@ -5314,7 +5313,14 @@ This compaction should PRIORITISE preserving all information related to the focu
+             }
+             call_kwargs["latency_info"] = _latency_info
+             try:
+-                with aux_interrupt_protection():
++                # Lean's single summary request is an auxiliary physical call,
++                # never a child of the foreground provider attempt.  Clear any
++                # ambient foreground transport record explicitly so it cannot
++                # consume request overlays, capture the auxiliary body, or
++                # settle a foreground delivery receipt.
++                from hermes_cli.middleware import transport_record_scope
++
++                with aux_interrupt_protection(), transport_record_scope(None):
+                     response = call_llm(**call_kwargs)
+             finally:
+                 route_known = bool(_aux_route.get("provider") and _aux_route.get("model"))
+@@ -5371,20 +5377,16 @@ This compaction should PRIORITISE preserving all information related to the focu
+                     f"(provider={self.provider or 'auto'} "
+                     f"model={self.summary_model or self.model})"
+                 )
+-            # A finish_reason of "length" means the summarizer hit its output
+-            # token cap mid-generation: the text present is PARTIAL. Persisting
+-            # a partial summary as the compaction checkpoint silently truncates
+-            # the conversation's memory — the cut-off text replaces the real
+-            # middle turns AND is fed back into every subsequent iterative
+-            # update prompt, compounding the loss across compactions. Treat it
+-            # as a failure so it routes through the same main-model fallback +
+-            # abort machinery as other degraded responses instead of becoming
+-            # a checkpoint. (Ported from earendil-works/pi#7048.)
+-            if _response_finish_reason(response) == "length":
++            # A non-stop or missing finish reason is not closed success.  The
++            # text may be filtered, tool-interrupted, cancelled, failed, or
++            # otherwise partial; never let it replace the canonical turns.
++            _summary_finish_reason = _response_finish_reason(response)
++            if _summary_finish_reason != "stop":
+                 raise RuntimeError(
+-                    "Context compression summary was truncated "
+-                    f"({_TRUNCATED_SUMMARY_MARKER}): generation hit the output "
+-                    "token cap and the summary is incomplete "
++                    "Context compression summary did not finish successfully "
++                    f"({_TRUNCATED_SUMMARY_MARKER}; "
++                    f"finish_reason={_summary_finish_reason or 'missing'}): "
++                    "the summary is incomplete "
+                     f"(provider={self.provider or 'auto'} "
+                     f"model={self.summary_model or self.model})"
+                 )
+@@ -5489,12 +5491,9 @@ This compaction should PRIORITISE preserving all information related to the focu
+                 or "llm returned none response" in _err_str
+                 or "llm returned invalid response" in _err_str
+             )
+-            # Summarizer stopped on its output-token cap (finish_reason ==
+-            # "length"): the summary text is partial and must never become a
+-            # compaction checkpoint. Same degraded-response handling shape as
+-            # empty content — one main-model retry (a larger/unconstrained
+-            # model may finish the summary), then ABORT preserving the session
+-            # unchanged. (Ported from earendil-works/pi#7048.)
++            # Summarizer did not return closed success. Treat every non-stop or
++            # missing finish state like partial output: one main-model retry,
++            # then abort while preserving the session unchanged.
+             _is_truncated_summary = (
+                 isinstance(e, RuntimeError)
+                 and _TRUNCATED_SUMMARY_MARKER in _err_str
+@@ -7110,15 +7109,14 @@ This compaction should PRIORITISE preserving all information related to the focu
+             logger.info("micro-summarization call failed: %s", exc)
+             return None
+ 
+-        # A length stop means the merged rolling summary is partial —
+-        # persisting it would silently drop the tail of the merge and feed
+-        # the cut-off text into every later micro-compact pass. Leave the
+-        # exchange unabsorbed instead; a later pass retries it.
+-        # (Same class as _generate_summary's guard; pi#7048.)
+-        if _response_finish_reason(response) == "length":
++        # Only a closed stop may replace the rolling summary. Any other or
++        # missing finish state leaves the exchange unabsorbed for a later pass.
++        _finish_reason = _response_finish_reason(response)
++        if _finish_reason != "stop":
+             logger.warning(
+-                "micro-summarization output hit the token cap "
+-                "(finish_reason=length) — discarding partial summary",
++                "micro-summarization did not finish successfully "
++                "(finish_reason=%s) — discarding partial summary",
++                _finish_reason or "missing",
+             )
+             return None
+ 
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index b8fa426..55cc068 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -263,6 +263,7 @@ class TransportRecord:
+             self._store_provider_body_estimate(_provider_body_estimate(None))
+             return None
+         if not filters:
++            self._store_provider_body_estimate(_provider_body_estimate(initial))
+             return initial
+         if preexisting_ambiguity:
+             self._store_provider_body_estimate(_provider_body_estimate(initial))
+@@ -282,20 +283,31 @@ class TransportRecord:
+                 )
+                 self._mark_ambiguous()
+                 continue
+-            accepted = _provider_filter_snapshot(result)
++            overlay_result = _request_overlay_filter_result(result)
++            accepted = _provider_filter_snapshot(
++                overlay_result.body if overlay_result is not None else result
++            )
+             if accepted is None or "timeout" in accepted:
+                 self._mark_ambiguous()
+                 continue
+             if phase == PROVIDER_BODY_FILTER_FINAL_GUARD:
+-                accepted_estimate = _provider_body_estimate(accepted)
+-                if not _provider_body_guard_is_non_expansive(
+-                    current,
+-                    accepted,
+-                    estimate,
+-                    accepted_estimate,
+-                ):
++                overlay_accepted = (
++                    overlay_result._accept(current, accepted)
++                    if overlay_result is not None
++                    else None
++                )
++                generic_accepted = bool(
++                    overlay_result is None
++                    and _provider_body_guard_is_non_expansive(
++                        current,
++                        accepted,
++                        estimate,
++                        _provider_body_estimate(accepted),
++                    )
++                )
++                if not overlay_accepted and not generic_accepted:
+                     logger.warning(
+-                        "Provider-body final guard %s expanded the body; "
++                        "Provider-body final guard %s was not accepted; "
+                         "keeping the previous body",
+                         getattr(callback, "__name__", repr(callback)),
+                     )
+@@ -397,6 +409,15 @@ def _provider_filter_snapshot(body: Any) -> Dict[str, Any] | None:
+         return None
+ 
+ 
++def _request_overlay_filter_result(result: Any) -> Any:
++    try:
++        from hermes_cli.request_overlay import RequestOverlayFilterResult
++
++        return result if isinstance(result, RequestOverlayFilterResult) else None
++    except Exception:
++        return None
++
++
+ def _provider_body_estimate(body: Any) -> Dict[str, Any]:
+     try:
+         from agent.model_metadata import estimate_provider_body_tokens_rough
+diff --git a/tests/agent/test_bedrock_interrupt_post_worker.py b/tests/agent/test_bedrock_interrupt_post_worker.py
+index cec02b8..9e4be05 100644
+--- a/tests/agent/test_bedrock_interrupt_post_worker.py
++++ b/tests/agent/test_bedrock_interrupt_post_worker.py
+@@ -8,15 +8,11 @@ agent._interrupt_requested still True. Without a post-worker re-check in the
+ poll loop, interruptible_streaming_api_call would return that partial response
+ and silently swallow the /stop signal.
+ """
+-import sys
+-import types
+ from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+ import pytest
+ 
+-sys.modules.setdefault("httpx", types.ModuleType("httpx"))
+-
+ from agent import chat_completion_helpers as cch
+ from hermes_cli.middleware import TransportRecord, transport_record_scope
+ 
+diff --git a/tests/agent/test_compaction_redaction_boundaries.py b/tests/agent/test_compaction_redaction_boundaries.py
+index 07e93a4..f33209d 100644
+--- a/tests/agent/test_compaction_redaction_boundaries.py
++++ b/tests/agent/test_compaction_redaction_boundaries.py
+@@ -52,6 +52,7 @@ def _response(content: str):
+     mock_response = MagicMock()
+     mock_response.choices = [MagicMock()]
+     mock_response.choices[0].message.content = content
++    mock_response.choices[0].finish_reason = "stop"
+     return mock_response
+ 
+ 
+diff --git a/tests/agent/test_compression_fallback_budget.py b/tests/agent/test_compression_fallback_budget.py
+index b94e058..3c284ce 100644
+--- a/tests/agent/test_compression_fallback_budget.py
++++ b/tests/agent/test_compression_fallback_budget.py
+@@ -50,7 +50,12 @@ def test_fallback_candidate_call_uses_entry_timeout():
+         def create(self, **kwargs):
+             seen.update(kwargs)
+             return SimpleNamespace(
+-                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
++                choices=[
++                    SimpleNamespace(
++                        message=SimpleNamespace(content="ok"),
++                        finish_reason="stop",
++                    )
++                ]
+             )
+ 
+     fb_client = SimpleNamespace(
+@@ -129,4 +134,3 @@ def test_non_timeout_transient_errors_keep_flat_cooldown():
+     # And it does not advance the timeout streak.
+     assert getattr(c, "_consecutive_timeout_failures", 0) == 0
+ 
+-
+diff --git a/tests/agent/test_compression_interrupt_protection.py b/tests/agent/test_compression_interrupt_protection.py
+index 7aa96f1..4fd5767 100644
+--- a/tests/agent/test_compression_interrupt_protection.py
++++ b/tests/agent/test_compression_interrupt_protection.py
+@@ -66,6 +66,7 @@ class TestCompressionProtectsSummaryCall:
+                 class _Msg:
+                     content = "[CONTEXT SUMMARY]: ok"
+                 message = _Msg()
++                finish_reason = "stop"
+             choices = [_Choice()]
+ 
+         def fake_call_llm(**kwargs):
+diff --git a/tests/agent/test_compression_small_ctx_threshold_floor.py b/tests/agent/test_compression_small_ctx_threshold_floor.py
+index 11797c5..1fdc444 100644
+--- a/tests/agent/test_compression_small_ctx_threshold_floor.py
++++ b/tests/agent/test_compression_small_ctx_threshold_floor.py
+@@ -75,6 +75,7 @@ class TestReasoningExcludedFromSummarizer:
+ 
+         class FakeChoice:
+             message = FakeMsg()
++            finish_reason = "stop"
+ 
+         class FakeResp:
+             choices = [FakeChoice()]
+@@ -108,6 +109,7 @@ class TestSummaryBudgetEnvelope:
+ 
+         class FakeChoice:
+             message = FakeMsg()
++            finish_reason = "stop"
+ 
+         class FakeResp:
+             choices = [FakeChoice()]
+diff --git a/tests/agent/test_compression_stall_fallback_78981.py b/tests/agent/test_compression_stall_fallback_78981.py
+index 398cbd4..cf0a0a3 100644
+--- a/tests/agent/test_compression_stall_fallback_78981.py
++++ b/tests/agent/test_compression_stall_fallback_78981.py
+@@ -294,7 +294,12 @@ def _msgs():
+ 
+ def _ok_response(content="SUMMARY BODY"):
+     return SimpleNamespace(
+-        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(content=content),
++                finish_reason="stop",
++            )
++        ]
+     )
+ 
+ 
+diff --git a/tests/agent/test_compressor_truncated_summary_guard.py b/tests/agent/test_compressor_truncated_summary_guard.py
+index edb326c..98257cb 100644
+--- a/tests/agent/test_compressor_truncated_summary_guard.py
++++ b/tests/agent/test_compressor_truncated_summary_guard.py
+@@ -1,4 +1,4 @@
+-"""Truncated compaction summaries must never become checkpoints.
++"""Only closed-success compaction summaries may become checkpoints.
+ 
+ Port of earendil-works/pi#7048 (commit 97fa14e39): a summarization response
+ whose ``finish_reason == "length"`` contains PARTIAL text — the generation
+@@ -117,15 +117,25 @@ class TestGenerateSummaryTruncationGuard:
+         assert result is not None
+         assert "complete summary" in result
+ 
+-    def test_missing_finish_reason_still_succeeds(self):
+-        """Providers that omit finish_reason entirely must not be rejected."""
++    @pytest.mark.parametrize(
++        "finish_reason",
++        [None, "content_filter", "tool_calls", "incomplete", "failed", "cancelled", "unknown"],
++    )
++    def test_non_stop_finish_truth_is_rejected(self, finish_reason):
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+-            c = ContextCompressor(model="test", quiet_mode=True)
+-        resp = {"choices": [{"message": {"content": "complete summary"}}]}
+-        with patch("agent.context_compressor.call_llm", return_value=resp):
+-            result = c._generate_summary(_msgs(2))
+-        assert result is not None
+-        assert "complete summary" in result
++            c = ContextCompressor(
++                model="test",
++                quiet_mode=True,
++                abort_on_summary_failure=False,
++            )
++        response = _mock_response("partial summary", finish_reason)
++        with patch("agent.context_compressor.call_llm", return_value=response):
++            result = c.compress(_msgs(), current_tokens=999999, force=True)
++
++        assert result == _msgs()
++        assert c._last_summary_truncated_failure is True
++        assert c._last_compress_aborted is True
++        assert c._previous_summary is None
+ 
+     def test_successful_summary_clears_truncated_flag(self):
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+@@ -163,3 +173,17 @@ class TestMicroSummarizeTruncationGuard:
+         ):
+             result = c._micro_summarize_one("user: hi\nassistant: hello")
+         assert result == "merged summary"
++
++    @pytest.mark.parametrize(
++        "finish_reason",
++        [None, "content_filter", "tool_calls", "incomplete", "failed", "cancelled", "unknown"],
++    )
++    def test_non_stop_finish_truth_discards_partial_merge(self, finish_reason):
++        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
++            c = ContextCompressor(model="test", quiet_mode=True)
++        c._micro_compact_rolling_summary = "existing"
++        with patch(
++            "agent.auxiliary_client.call_llm",
++            return_value=_mock_response("partial merge", finish_reason),
++        ):
++            assert c._micro_summarize_one("user: hi\nassistant: hello") is None
+diff --git a/tests/agent/test_context_compressor.py b/tests/agent/test_context_compressor.py
+index 2b822a1..4c292b4 100644
+--- a/tests/agent/test_context_compressor.py
++++ b/tests/agent/test_context_compressor.py
+@@ -650,6 +650,7 @@ class TestGenerateSummaryNoneContent:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: tool calls happened"
++        mock_response.choices[0].finish_reason = "stop"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             c = ContextCompressor(model="test", quiet_mode=True)
+@@ -697,6 +698,7 @@ class TestNonStringContent:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = None
++        mock_response.choices[0].finish_reason = "stop"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             # summary_model == model here, so no fallback path: straight to cooldown.
+@@ -721,6 +723,7 @@ class TestNonStringContent:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message = "plain summary text"
++        mock_response.choices[0].finish_reason = "stop"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             # Pin legacy: this test asserts the raw coerced string terminates
+@@ -1070,6 +1073,7 @@ class TestSummaryFallbackToMainModel:
+         mock_ok = MagicMock()
+         mock_ok.choices = [MagicMock()]
+         mock_ok.choices[0].message.content = "summary via main model"
++        mock_ok.choices[0].finish_reason = "stop"
+ 
+         err_404 = Exception("404 model_not_found: no such model")
+         err_404.status_code = 404
+@@ -1106,6 +1110,7 @@ class TestSummaryFallbackToMainModel:
+         mock_ok = MagicMock()
+         mock_ok.choices = [MagicMock()]
+         mock_ok.choices[0].message.content = "summary via main model after empty aux"
++        mock_ok.choices[0].finish_reason = "stop"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             c = ContextCompressor(
+@@ -1166,6 +1171,7 @@ class TestSummaryFallbackToMainModel:
+         mock_ok = MagicMock()
+         mock_ok.choices = [MagicMock()]
+         mock_ok.choices[0].message.content = "summary via main model"
++        mock_ok.choices[0].finish_reason = "stop"
+ 
+         # Simulate the SDK raising a raw JSONDecodeError with a realistic
+         # error message ("Expecting value: line X column Y char Z").
+@@ -1224,6 +1230,7 @@ class TestStreamingClosedFallback:
+         mock_ok = MagicMock()
+         mock_ok.choices = [MagicMock()]
+         mock_ok.choices[0].message.content = "summary via main model"
++        mock_ok.choices[0].finish_reason = "stop"
+ 
+         err = Exception("RemoteProtocolError: incomplete chunked read")
+ 
+@@ -1300,6 +1307,7 @@ class TestAuxModelFallbackSurfacedToCallers:
+         mock_ok = MagicMock()
+         mock_ok.choices = [MagicMock()]
+         mock_ok.choices[0].message.content = "summary via main"
++        mock_ok.choices[0].finish_reason = "stop"
+         err_400 = Exception("400 provider rejected configured model")
+         err_400.status_code = 400
+ 
+@@ -1336,6 +1344,7 @@ class TestAuxModelFallbackSurfacedToCallers:
+         mock_ok = MagicMock()
+         mock_ok.choices = [MagicMock()]
+         mock_ok.choices[0].message.content = "summary via main"
++        mock_ok.choices[0].finish_reason = "stop"
+         err_400 = Exception("400 aux model busted")
+         err_400.status_code = 400
+ 
+@@ -1513,6 +1522,7 @@ class TestAbortOnSummaryFailure:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = "summary text"
++        mock_response.choices[0].finish_reason = "stop"
+ 
+         db = SessionDB(db_path=tmp_path / "state.db")
+         db.create_session("s1", "cli")
+@@ -1582,6 +1592,7 @@ class TestCompressWithClient:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = "summary text"
++        mock_response.choices[0].finish_reason = "stop"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+@@ -1620,6 +1631,7 @@ class TestCompressWithClient:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: stuff happened"
++        mock_response.choices[0].finish_reason = "stop"
+         mock_client.chat.completions.create.return_value = mock_response
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+@@ -1658,6 +1670,7 @@ class TestCompressWithClient:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: stuff happened"
++        mock_response.choices[0].finish_reason = "stop"
+         mock_client.chat.completions.create.return_value = mock_response
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+@@ -1698,6 +1711,7 @@ class TestCompressWithClient:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = "summary text"
++        mock_response.choices[0].finish_reason = "stop"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=3)
+@@ -1751,6 +1765,7 @@ class TestCompressWithClient:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = "SUMMARY_BODY"
++        mock_response.choices[0].finish_reason = "stop"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=3)
+@@ -3062,6 +3077,7 @@ class TestDoubleCompactionSummaryRole:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = "summary of earlier turns"
++        mock_response.choices[0].finish_reason = "stop"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             c = ContextCompressor(
+@@ -3101,6 +3117,7 @@ class TestDoubleCompactionSummaryRole:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = "summary of resumed turns"
++        mock_response.choices[0].finish_reason = "stop"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             c = ContextCompressor(
+@@ -3131,6 +3148,7 @@ class TestDoubleCompactionSummaryRole:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = "summary of earlier turns"
++        mock_response.choices[0].finish_reason = "stop"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             c = ContextCompressor(
+@@ -3182,6 +3200,7 @@ class TestSummaryPromptBounding:
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = "updated summary"
++        mock_response.choices[0].finish_reason = "stop"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=272000):
+             c = ContextCompressor(model="test", quiet_mode=True)
+diff --git a/tests/agent/test_context_compressor_zero_user_provenance.py b/tests/agent/test_context_compressor_zero_user_provenance.py
+index 7a5bd12..a0132e5 100644
+--- a/tests/agent/test_context_compressor_zero_user_provenance.py
++++ b/tests/agent/test_context_compressor_zero_user_provenance.py
+@@ -27,7 +27,12 @@ from tools.todo_tool import TODO_INJECTION_HEADER
+ 
+ def _response(content: str) -> SimpleNamespace:
+     return SimpleNamespace(
+-        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(content=content),
++                finish_reason="stop",
++            )
++        ]
+     )
+ 
+ 
+@@ -456,4 +461,3 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
+ 
+ 
+ 
+-
+diff --git a/tests/agent/test_lean_single_aux_call.py b/tests/agent/test_lean_single_aux_call.py
+index 57597db..3ecc6cd 100644
+--- a/tests/agent/test_lean_single_aux_call.py
++++ b/tests/agent/test_lean_single_aux_call.py
+@@ -21,6 +21,11 @@ from agent.context_compressor import (
+     _LEAN_RECOVERY_HEADING,
+     _LEAN_SESSION_LOG_HEADING,
+ )
++from hermes_cli.middleware import (
++    TransportRecord,
++    current_transport_record,
++    transport_record_scope,
++)
+ 
+ 
+ def _mk_compressor(**overrides):
+@@ -47,6 +52,7 @@ def _llm_response(text):
+     resp.choices = [MagicMock()]
+     resp.choices[0].message = MagicMock()
+     resp.choices[0].message.content = text
++    resp.choices[0].finish_reason = "stop"
+     return resp
+ 
+ 
+@@ -93,6 +99,28 @@ class TestLeanSingleAuxiliaryCall:
+         # THE contract: one auxiliary request per compaction attempt, total.
+         assert main_call.call_count + aux_call.call_count == 1
+ 
++    def test_auxiliary_call_is_physically_isolated_from_foreground_transport(self):
++        c = _mk_compressor()
++        outer = TransportRecord()
++
++        def summary_call(**_kwargs):
++            assert current_transport_record() is None
++            return _llm_response(SUMMARY_BODY)
++
++        with transport_record_scope(outer), patch(
++            "agent.context_compressor.call_llm",
++            side_effect=summary_call,
++        ) as call:
++            summary = c._generate_summary(_big_region(n_rounds=5))
++            assert current_transport_record() is outer
++
++        assert summary is not None
++        assert call.call_count == 1
++        assert outer.middleware_verified_request is None
++        assert outer.provider_body is None
++        assert outer.capture_count == 0
++        assert outer.settled is False
++
+     def test_session_log_heading_lands_in_summary(self):
+         c = _mk_compressor()
+         turns = _big_region(n_rounds=5)
+diff --git a/tests/agent/test_transport_truth.py b/tests/agent/test_transport_truth.py
+index b74a5bc..5bb3223 100644
+--- a/tests/agent/test_transport_truth.py
++++ b/tests/agent/test_transport_truth.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import sys
+ from types import ModuleType
+ from types import SimpleNamespace
++from unittest.mock import patch
+ 
+ from agent import relay_llm, relay_runtime
+ from hermes_cli import lifecycle, middleware, plugins
+@@ -223,6 +224,135 @@ def test_direct_stream_fallback_settles_only_before_post_and_calls_provider_once
+     )
+ 
+ 
++def test_lean_auxiliary_call_isolated_before_foreground_overlay_and_settlement(
++    monkeypatch,
++):
++    from agent.context_compressor import ContextCompressor
++
++    marker = "[FOREGROUND OVERLAY]"
++    auxiliary_calls = []
++    provider_calls = []
++    execution_records = []
++    post_records = []
++    compression_calls = 0
++
++    compressor = ContextCompressor(
++        model="test-model",
++        quiet_mode=True,
++        tail_mode="lean",
++        config_context_length=128_000,
++    )
++
++    def auxiliary_call(**kwargs):
++        auxiliary_calls.append(kwargs)
++        assert middleware.current_transport_record() is None
++        assert marker not in repr(kwargs["messages"])
++        return SimpleNamespace(
++            choices=[
++                SimpleNamespace(
++                    message=SimpleNamespace(
++                        content=(
++                            "## Historical Task Snapshot\nold task\n\n"
++                            "## Detailed Session Log\n- old turn"
++                        )
++                    ),
++                    finish_reason="stop",
++                )
++            ]
++        )
++
++    def request_middleware(*, request, **_kwargs):
++        projected = dict(request)
++        projected["messages"] = [dict(message) for message in request["messages"]]
++        carrier = projected["messages"][-1]
++        carrier["content"] = f"{marker}\n\n{carrier['content']}"
++        return {"request": projected}
++
++    def execution(*, request, next_call, transport_record, **_kwargs):
++        result = next_call(request)
++        execution_records.append(transport_record)
++        return result
++
++    def post(*, transport_record, **_kwargs):
++        post_records.append(transport_record)
++
++    monkeypatch.setattr(
++        middleware,
++        "_get_middleware_callbacks",
++        lambda kind: [request_middleware]
++        if kind == middleware.LLM_REQUEST_MIDDLEWARE
++        else [execution]
++        if kind == middleware.LLM_EXECUTION_MIDDLEWARE
++        else [],
++    )
++    monkeypatch.setattr(
++        middleware,
++        "_has_middleware",
++        lambda kind: kind == middleware.LLM_REQUEST_MIDDLEWARE,
++    )
++    monkeypatch.setattr(lifecycle, "has_hook", lambda name: name == "post_api_request")
++    monkeypatch.setattr(
++        lifecycle,
++        "invoke_hook",
++        lambda name, **kwargs: post(**kwargs) if name == "post_api_request" else [],
++    )
++    monkeypatch.setattr(plugins, "invoke_hook", lambda *_args, **_kwargs: [])
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++    monkeypatch.setattr(
++        "agent.context_compressor.call_llm",
++        auxiliary_call,
++    )
++
++    agent = _agent(monkeypatch)
++    compress_now = iter((True, False, False))
++    agent.context_compressor.should_compress = lambda _tokens: next(
++        compress_now,
++        False,
++    )
++
++    def compress(messages, system_message, **_kwargs):
++        nonlocal compression_calls
++        compression_calls += 1
++        summary = compressor._generate_summary(messages)
++        assert summary is not None
++        return [
++            {"role": "assistant", "content": summary},
++            dict(messages[-1]),
++        ], system_message
++
++    agent._compress_context = compress
++
++    def provider(request, *, on_first_delta=None):
++        del on_first_delta
++        with relay_llm.provider_body_scope(request):
++            provider_calls.append(request)
++            return _response()
++
++    agent._interruptible_streaming_api_call = provider
++    result = agent.run_conversation(
++        "current",
++        conversation_history=[
++            {"role": "user", "content": "old question"},
++            {"role": "assistant", "content": "old answer"},
++        ],
++        task_id="task-lean-foreground-isolation",
++    )
++
++    assert result["final_response"] == "done"
++    assert compression_calls == 1
++    assert len(auxiliary_calls) == 1
++    assert len(provider_calls) == 1
++    assert repr(provider_calls[0]).count(marker) == 1
++    assert len(execution_records) == 1
++    assert post_records == execution_records
++    assert post_records[0].provider_body == provider_calls[0]
++    assert post_records[0].settled is True
++
++
+ def test_provider_error_never_settles_or_fires_post(monkeypatch):
+     agent = _agent(monkeypatch)
+     execution_records = []
+diff --git a/tests/test_middleware.py b/tests/test_middleware.py
+index 026dd96..e449431 100644
+--- a/tests/test_middleware.py
++++ b/tests/test_middleware.py
+@@ -756,6 +756,16 @@ def test_plugin_owned_provider_body_filters_compose_once_before_sdk(monkeypatch)
+     ]
+ 
+ 
++def test_transport_estimates_provider_body_without_registered_filters():
++    request = {"messages": [{"role": "user", "content": "hello"}]}
++    record = middleware.TransportRecord()
++
++    assert record.filter_provider_body(request) == request
++    assert record.provider_body_estimated_tokens is not None
++    assert record.provider_body_estimate_source == "hermes.provider_body.rough.v1"
++    assert record.provider_body_estimate_confidence == "heuristic_with_margin"
++
++
+ def test_invalid_provider_body_filter_fails_closed_without_blocking_sdk(monkeypatch):
+     from agent import relay_llm
+     from hermes_cli import plugins
+diff --git a/tests/test_request_overlay.py b/tests/test_request_overlay.py
+index d0afdff..5bf8a1e 100644
+--- a/tests/test_request_overlay.py
++++ b/tests/test_request_overlay.py
+@@ -327,6 +327,20 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+                 ),
+             )
+ 
++    def register_with_host_record(self, record, *, window):
++        owner = middleware._CURRENT_MIDDLEWARE_OWNER.set("test-overlay-owner")
++        try:
++            return self.overlay.register_final_budget_guard(
++                record,
++                context_window_tokens=window,
++                reserve_tokens=lambda body, _window: body.get("max_tokens", 32),
++                validator=lambda _body, native: (
++                    native["messages"][0]["content"] == "current"
++                ),
++            )
++        finally:
++            middleware._CURRENT_MIDDLEWARE_OWNER.reset(owner)
++
+     def test_missing_transport_capability_fails_closed(self) -> None:
+         record = _FilterRecord()
+ 
+@@ -355,6 +369,72 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+         self.assertEqual(filtered["messages"][0]["content"], "current")
+         self.assertEqual(self.overlay.disposition, OVERLAY_REMOVED_FINAL_BUDGET)
+ 
++    def test_real_transport_accepts_only_the_owned_overlay_disposition(self) -> None:
++        for window, expected_content, expected_disposition in (
++            (100_000, self.overlay.request["messages"][0]["content"], OVERLAY_KEPT),
++            (1, "current", OVERLAY_REMOVED_FINAL_BUDGET),
++        ):
++            with self.subTest(window=window):
++                self.setUp()
++                record = middleware.TransportRecord()
++                self.assertTrue(self.register_with_host_record(record, window=window))
++
++                filtered = record.filter_provider_body(self.overlay.request)
++
++                self.assertEqual(filtered["messages"][0]["content"], expected_content)
++                self.assertEqual(self.overlay.disposition, expected_disposition)
++                self.assertFalse(record.ambiguous)
++                self.assertEqual(
++                    record.provider_body_estimate_source,
++                    "hermes.provider_body.rough.v1",
++                )
++
++    def test_real_transport_preserves_late_transform_in_both_registration_orders(self) -> None:
++        for order in (("overlay", "transform"), ("transform", "overlay")):
++            with self.subTest(order=order):
++                self.setUp()
++                record = middleware.TransportRecord()
++
++                def register_transform():
++                    owner = middleware._CURRENT_MIDDLEWARE_OWNER.set(
++                        "test-transform-owner"
++                    )
++                    try:
++                        record.register_provider_body_filter(
++                            lambda body: {
++                                **body,
++                                "tools": [
++                                    {
++                                        "type": "function",
++                                        "function": {
++                                            "name": "late_tool",
++                                            "description": "x" * 20_000,
++                                        },
++                                    }
++                                ],
++                            }
++                        )
++                    finally:
++                        middleware._CURRENT_MIDDLEWARE_OWNER.reset(owner)
++
++                for item in order:
++                    if item == "overlay":
++                        self.assertTrue(
++                            self.register_with_host_record(record, window=1)
++                        )
++                    else:
++                        register_transform()
++
++                filtered = record.filter_provider_body(self.overlay.request)
++
++                self.assertEqual(filtered["messages"][0]["content"], "current")
++                self.assertEqual(filtered["tools"][0]["function"]["name"], "late_tool")
++                self.assertEqual(
++                    self.overlay.disposition,
++                    OVERLAY_REMOVED_FINAL_BUDGET,
++                )
++                self.assertFalse(record.ambiguous)
++
+     def test_unproven_estimate_has_a_distinct_removal_disposition(self) -> None:
+         record = _FilterRecord()
+         self.assertTrue(self.register(record, window=100_000))
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,251 @@
+From a01cc11c3a038770e9494049d82d938011db1865 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 15:56:55 +0800
+Subject: [PATCH 1/2] fix(middleware): fail closed when request isolation is
+ unavailable
+
+---
+ hermes_cli/middleware.py | 80 +++++++++++++++++++++++++++++--------
+ tests/test_middleware.py | 85 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 148 insertions(+), 17 deletions(-)
+
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index 170e131..5f03faf 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -34,6 +34,10 @@ VALID_MIDDLEWARE: set[str] = {
+ }
+ 
+ 
++class _PayloadIsolationError(RuntimeError):
++    """The payload cannot be detached safely for plugin-visible mutation."""
++
++
+ @dataclass
+ class RequestMiddlewareResult:
+     """Result of applying request middleware to a mutable payload."""
+@@ -56,22 +60,18 @@ def middleware_payload(**kwargs: Any) -> Dict[str, Any]:
+ 
+ 
+ def _safe_copy(payload: Any) -> Any:
+-    """Deep-copy a request payload, tolerating non-deepcopyable members.
++    """Deep-copy a request payload or reject plugin-visible mutation.
+ 
+     Request payloads are normally plain JSON-shaped dicts, but an LLM request
+     can occasionally carry non-deepcopyable objects (clients, callbacks, file
+-    handles). A hard ``deepcopy`` failure there would otherwise abort the whole
+-    request-middleware pass. Fall back to a shallow ``dict`` copy so middleware
+-    still runs and the original nested objects are shared by reference rather
+-    than corrupting the live payload.
++    handles). A shallow fallback would leave sibling containers shared and let
++    a failed callback corrupt the live request. Callers therefore fail the
++    whole request-middleware pass closed when isolation is unavailable.
+     """
+     try:
+         return deepcopy(payload)
+-    except Exception as exc:  # pragma: no cover - exercised via fallback test
+-        logger.debug("deepcopy failed for request payload (%s); using shallow copy", exc)
+-        if isinstance(payload, dict):
+-            return dict(payload)
+-        return payload
++    except Exception as exc:
++        raise _PayloadIsolationError(str(exc)) from exc
+ 
+ 
+ def apply_llm_request_middleware(
+@@ -91,8 +91,21 @@ def apply_llm_request_middleware(
+             trace=[],
+         )
+ 
+-    original_request = _safe_copy(request)
+-    current_request = _safe_copy(original_request)
++    try:
++        original_request = _safe_copy(request)
++        current_request = _safe_copy(original_request)
++    except _PayloadIsolationError as exc:
++        logger.warning(
++            "Skipping LLM request middleware because the payload cannot be "
++            "isolated safely: %s",
++            exc,
++        )
++        return RequestMiddlewareResult(
++            payload=request,
++            original_payload=request,
++            changed=False,
++            trace=[],
++        )
+     trace: List[Dict[str, Any]] = []
+ 
+     current_request, trace = _apply_request_callbacks(
+@@ -123,8 +136,21 @@ def apply_tool_request_middleware(
+     Middleware may return ``{"args": {...}}`` to replace the effective tool
+     arguments before hooks, guardrails, approvals, and execution see them.
+     """
+-    original_args = _safe_copy(args)
+-    current_args = _safe_copy(original_args)
++    try:
++        original_args = _safe_copy(args)
++        current_args = _safe_copy(original_args)
++    except _PayloadIsolationError as exc:
++        logger.warning(
++            "Skipping tool request middleware because the payload cannot be "
++            "isolated safely: %s",
++            exc,
++        )
++        return RequestMiddlewareResult(
++            payload=args,
++            original_payload=args,
++            changed=False,
++            trace=[],
++        )
+     trace: List[Dict[str, Any]] = []
+ 
+     session_id = str(context.get("session_id") or "")
+@@ -255,10 +281,20 @@ def _apply_request_callbacks(
+     """
+     current = current_payload
+     for callback in _get_middleware_callbacks(kind):
+-        working = _safe_copy(current)
++        try:
++            working = _safe_copy(current)
++            baseline = _safe_copy(original_payload)
++        except _PayloadIsolationError as exc:
++            logger.warning(
++                "Stopping '%s' request middleware because the accepted payload "
++                "can no longer be isolated safely: %s",
++                kind,
++                exc,
++            )
++            break
+         call_kwargs = middleware_payload(**context)
+         call_kwargs[payload_key] = working
+-        call_kwargs[original_key] = _safe_copy(original_payload)
++        call_kwargs[original_key] = baseline
+         try:
+             result = callback(**call_kwargs)
+         except Exception as exc:
+@@ -274,7 +310,17 @@ def _apply_request_callbacks(
+         next_payload = result.get(payload_key)
+         if not isinstance(next_payload, dict):
+             continue
+-        current = _safe_copy(next_payload)
++        try:
++            current = _safe_copy(next_payload)
++        except _PayloadIsolationError as exc:
++            logger.warning(
++                "Middleware '%s' callback %s returned a payload that cannot be "
++                "isolated safely: %s",
++                kind,
++                getattr(callback, "__name__", repr(callback)),
++                exc,
++            )
++            continue
+         trace.append(_trace_entry(result))
+     return current, trace
+ 
+diff --git a/tests/test_middleware.py b/tests/test_middleware.py
+index 63f275f..e1bc8d9 100644
+--- a/tests/test_middleware.py
++++ b/tests/test_middleware.py
+@@ -5,6 +5,11 @@ import copy
+ from hermes_cli import middleware
+ 
+ 
++class _OpaqueLeaf:
++    def __deepcopy__(self, memo):
++        raise TypeError("host-private leaf")
++
++
+ def _install_request_callbacks(monkeypatch, callbacks_by_kind):
+     monkeypatch.setattr(middleware, "_has_middleware", lambda kind: True)
+     monkeypatch.setattr(
+@@ -179,6 +184,86 @@ def test_each_retry_starts_from_a_clean_request(monkeypatch):
+     assert call_count == 2
+ 
+ 
++def test_llm_request_with_uncopyable_leaf_fails_closed_before_callbacks(monkeypatch):
++    baseline = {
++        "messages": [{"role": "user", "content": "original"}],
++        "metadata": {"steps": []},
++        "_client": _OpaqueLeaf(),
++    }
++    calls = []
++
++    def poison(*, request, original_request, **_kwargs):
++        calls.append("poison")
++        request["messages"][0]["content"] = "poisoned"
++        original_request["metadata"]["steps"].append("corrupt")
++        raise RuntimeError("boom")
++
++    _install_request_callbacks(
++        monkeypatch,
++        {middleware.LLM_REQUEST_MIDDLEWARE: [poison]},
++    )
++
++    first = middleware.apply_llm_request_middleware(baseline)
++    retry = middleware.apply_llm_request_middleware(baseline)
++
++    assert calls == []
++    assert first.payload is baseline
++    assert retry.payload is baseline
++    assert first.changed is retry.changed is False
++    assert baseline["messages"][0]["content"] == "original"
++    assert baseline["metadata"]["steps"] == []
++
++
++def test_tool_request_with_uncopyable_leaf_fails_closed_before_callbacks(monkeypatch):
++    baseline = {
++        "query": "original",
++        "options": {"steps": []},
++        "_handle": _OpaqueLeaf(),
++    }
++    calls = []
++
++    def poison(*, args, original_args, **_kwargs):
++        calls.append("poison")
++        args["options"]["steps"].append("poisoned")
++        original_args["query"] = "corrupt"
++        return {"args": "invalid"}
++
++    _install_request_callbacks(
++        monkeypatch,
++        {middleware.TOOL_REQUEST_MIDDLEWARE: [poison]},
++    )
++
++    result = middleware.apply_tool_request_middleware(
++        "web_search", baseline, skip_relay=True
++    )
++
++    assert calls == []
++    assert result.payload is baseline
++    assert result.changed is False
++    assert baseline["query"] == "original"
++    assert baseline["options"]["steps"] == []
++
++
++def test_accepted_payload_is_detached_from_callback_reference(monkeypatch):
++    baseline = {"messages": [], "metadata": {"steps": []}}
++    retained = []
++
++    def callback(*, request, **_kwargs):
++        request["metadata"]["steps"].append("accepted")
++        retained.append(request)
++        return {"request": request}
++
++    _install_request_callbacks(
++        monkeypatch,
++        {middleware.LLM_REQUEST_MIDDLEWARE: [callback]},
++    )
++    result = middleware.apply_llm_request_middleware(baseline)
++
++    retained[0]["metadata"]["steps"].append("late")
++    assert result.payload["metadata"]["steps"] == ["accepted"]
++    assert baseline["metadata"]["steps"] == []
++
++
+ def test_execution_chain_still_calls_each_wrapper_and_provider_once(monkeypatch):
+     calls = []
+ 
+-- 
+2.50.1 (Apple Git-155)
+

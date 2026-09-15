@@ -1,0 +1,224 @@
+From 46e5699fdb44e2ffb58383ccb44ad66e44925a68 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 00:27:22 +0800
+Subject: [PATCH] fix(transport): require dispatch certainty for stream retry
+
+---
+ agent/relay_llm.py                            |  50 +++++++-
+ .../test_transport_successor_attempts.py      | 109 ++++++++++++++++++
+ 2 files changed, 155 insertions(+), 4 deletions(-)
+
+diff --git a/agent/relay_llm.py b/agent/relay_llm.py
+index ab4b418..9ae6061 100644
+--- a/agent/relay_llm.py
++++ b/agent/relay_llm.py
+@@ -26,6 +26,44 @@ _RELAY_INTERNAL_PROVIDER_HEADERS = frozenset(
+ )
+ 
+ 
++def _stream_failure_proves_not_dispatched(exc: BaseException) -> bool:
++    """Return whether a stream-open failure proves no request was sent."""
++
++    try:
++        import httpx
++    except ImportError:  # pragma: no cover - Hermes provider installs include it
++        return False
++
++    current: BaseException | None = exc
++    seen: set[int] = set()
++    while current is not None and len(seen) < 5:
++        identity = id(current)
++        if identity in seen:
++            break
++        seen.add(identity)
++        if isinstance(
++            current,
++            (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout),
++        ):
++            return True
++        if isinstance(
++            current,
++            (
++                httpx.ReadError,
++                httpx.ReadTimeout,
++                httpx.RemoteProtocolError,
++                httpx.WriteError,
++                httpx.WriteTimeout,
++            ),
++        ):
++            return False
++        next_error = getattr(current, "__cause__", None) or getattr(
++            current, "__context__", None
++        )
++        current = next_error if isinstance(next_error, BaseException) else None
++    return False
++
++
+ def _capture_provider_body(body: dict[str, Any]) -> None:
+     from hermes_cli.middleware import current_transport_record
+ 
+@@ -162,10 +200,11 @@ class ProviderBodyStreamAttempt:
+                 if self._enter_context:
+                     self._manager = resource
+                     resource = resource.__enter__()
+-        except BaseException:
++        except BaseException as exc:
++            retryable = _stream_failure_proves_not_dispatched(exc)
+             if record is not None:
+-                record.reject_provider_body_attempt(successor_allowed=True)
+-            self._state = "preopen_failed"
++                record.reject_provider_body_attempt(successor_allowed=retryable)
++            self._state = "preopen_retryable" if retryable else "possibly_dispatched"
+             raise
+         self._state = "opened"
+         return resource
+@@ -189,11 +228,14 @@ class ProviderBodyStreamAttempt:
+     def finish_failure(self, exc: BaseException) -> bool:
+         """Close a failed stream and report whether an inner retry is safe."""
+ 
+-        if self._state == "preopen_failed":
++        if self._state == "preopen_retryable":
+             if self._record is not None:
+                 self._record.allow_provider_successor()
+             self._state = "retry_ready"
+             return True
++        if self._state == "possibly_dispatched":
++            self._state = "failed"
++            return self._record is None
+         if self._state == "opened":
+             try:
+                 self._exit_manager(exc)
+diff --git a/tests/agent/test_transport_successor_attempts.py b/tests/agent/test_transport_successor_attempts.py
+index a9cb123..2251053 100644
+--- a/tests/agent/test_transport_successor_attempts.py
++++ b/tests/agent/test_transport_successor_attempts.py
+@@ -363,6 +363,48 @@ def test_openai_preopen_connect_retry_reapplies_overlay_guard(monkeypatch):
+     assert overlay.disposition != OVERLAY_PENDING
+ 
+ 
++@pytest.mark.parametrize(
++    "error",
++    [
++        httpx.ReadTimeout("response headers timed out"),
++        httpx.RemoteProtocolError("peer closed after dispatch"),
++        httpx.WriteTimeout("partial request write timed out"),
++        ConnectionError("dispatch phase unknown"),
++    ],
++)
++def test_openai_stream_open_uncertainty_does_not_retry_same_record(
++    monkeypatch,
++    error,
++):
++    overlay, record, filter_runs = _stream_overlay_record()
++    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
++    provider_bodies = []
++
++    def create(**body):
++        provider_bodies.append(deepcopy(body))
++        raise error
++
++    client = SimpleNamespace(
++        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
++    )
++    agent = _streaming_agent()
++    agent._create_request_openai_client = lambda **_kwargs: client
++    agent._close_request_openai_client = lambda *_args, **_kwargs: None
++
++    with transport_record_scope(record):
++        with pytest.raises(type(error)):
++            agent._interruptible_streaming_api_call(deepcopy(overlay.request))
++    record.settle()
++
++    assert len(provider_bodies) == 1
++    assert len(filter_runs) == 1
++    assert record.provider_attempt_count == 1
++    assert record.capture_count == 0
++    assert record.ambiguous is True
++    assert record.settled is False
++    assert overlay.disposition == OVERLAY_PENDING
++
++
+ def test_openai_opened_empty_stream_does_not_retry_same_record(monkeypatch):
+     overlay, record, filter_runs = _stream_overlay_record()
+     monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+@@ -445,6 +487,43 @@ def test_anthropic_eventless_stream_does_not_retry_same_record(monkeypatch):
+     assert overlay.disposition == OVERLAY_PENDING
+ 
+ 
++def test_anthropic_manager_enter_timeout_does_not_retry_same_record(monkeypatch):
++    overlay, record, filter_runs = _stream_overlay_record()
++    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
++    provider_bodies = []
++
++    class StreamManager:
++        def __enter__(self):
++            raise httpx.ReadTimeout("headers timed out after dispatch")
++
++        def __exit__(self, *_args):
++            return False
++
++    class Messages:
++        def stream(self, **body):
++            provider_bodies.append(deepcopy(body))
++            return StreamManager()
++
++    client = SimpleNamespace(messages=Messages())
++    agent = _streaming_agent()
++    agent.api_mode = "anthropic_messages"
++    agent._create_request_anthropic_client = lambda **_kwargs: client
++    agent._close_request_anthropic_client = lambda *_args, **_kwargs: None
++
++    with transport_record_scope(record):
++        with pytest.raises(httpx.ReadTimeout):
++            agent._interruptible_streaming_api_call(deepcopy(overlay.request))
++    record.settle()
++
++    assert len(provider_bodies) == 1
++    assert len(filter_runs) == 1
++    assert record.provider_attempt_count == 1
++    assert record.capture_count == 0
++    assert record.ambiguous is True
++    assert record.settled is False
++    assert overlay.disposition == OVERLAY_PENDING
++
++
+ def _codex_overlay_record():
+     request = {
+         "model": "gpt-test",
+@@ -556,6 +635,36 @@ def test_codex_preopen_connect_retry_reapplies_overlay_guard(monkeypatch):
+     assert overlay.disposition != OVERLAY_PENDING
+ 
+ 
++def test_codex_stream_open_timeout_does_not_retry_same_record(monkeypatch):
++    from agent.codex_runtime import run_codex_stream
++
++    overlay, record, filter_runs = _codex_overlay_record()
++    monkeypatch.setenv("HERMES_CODEX_SDK_TRANSFORM", "1")
++    provider_bodies = []
++
++    def create(**body):
++        provider_bodies.append(deepcopy(body))
++        raise httpx.ReadTimeout("response headers timed out after dispatch")
++
++    client = SimpleNamespace(responses=SimpleNamespace(create=create))
++    with transport_record_scope(record):
++        with pytest.raises(httpx.ReadTimeout):
++            run_codex_stream(
++                _codex_agent(),
++                deepcopy(overlay.request),
++                client=client,
++            )
++    record.settle()
++
++    assert len(provider_bodies) == 1
++    assert len(filter_runs) == 1
++    assert record.provider_attempt_count == 1
++    assert record.capture_count == 0
++    assert record.ambiguous is True
++    assert record.settled is False
++    assert overlay.disposition == OVERLAY_PENDING
++
++
+ def test_codex_mid_iteration_failure_does_not_retry_same_record(monkeypatch):
+     from agent.codex_runtime import run_codex_stream
+ 

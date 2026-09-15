@@ -1,0 +1,802 @@
+From a748f62eaebc5e5353696fa260994a652cf155c2 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Tue, 8 Sep 2026 18:47:21 +0800
+Subject: [PATCH] fix(provenance): preserve CLI queued input origins
+
+---
+ agent/message_origin.py                       |  31 +++++
+ agent/turn_context.py                         |  11 ++
+ cli.py                                        | 107 +++++++++++++----
+ hermes_cli/cli_commands_mixin.py              |  21 ++--
+ hermes_cli/plugins.py                         |  11 +-
+ tests/agent/test_turn_context.py              |  17 +++
+ .../cli/test_cli_async_delegation_delivery.py |   6 +-
+ tests/cli/test_cli_goal_interrupt.py          |   3 +-
+ tests/cli/test_cli_interrupt_ack_race.py      | 109 ++++++++++++++++++
+ .../cli/test_cli_shutdown_memory_messages.py  |  46 ++++++++
+ tests/gateway/test_goal_resume_restart.py     |   3 +-
+ .../test_plugin_message_injection.py          |  27 ++++-
+ 12 files changed, 352 insertions(+), 40 deletions(-)
+
+diff --git a/agent/message_origin.py b/agent/message_origin.py
+index 267987d..c5f5b0f 100644
+--- a/agent/message_origin.py
++++ b/agent/message_origin.py
+@@ -4,10 +4,12 @@ from __future__ import annotations
+ 
+ import os
+ from collections.abc import Mapping, MutableMapping, Sequence
++from dataclasses import dataclass
+ from typing import Any, Optional
+ 
+ 
+ MESSAGE_ORIGIN_SCHEMA = "hermes.message_origin.v1"
++MESSAGE_ORIGIN_DECLARED_FIELD = "_origin_proof_declared"
+ INTERNAL_ORIGIN_HEADER = "X-Hermes-Internal-Origin"
+ CLI_ORIGIN_ENV = "HERMES_INTERNAL_MESSAGE_ORIGIN"
+ CRON_BOT_CHAT_CLAIM = "cron.bot_chat"
+@@ -111,6 +113,27 @@ def normalize_message_origin_proof(value: Any) -> dict[str, str]:
+     return {"schema": schema, "kind": kind, "writer": writer}
+ 
+ 
++@dataclass(frozen=True)
++class QueuedInput:
++    """CLI queue payload whose producer origin has been decided by the host.
++
++    ``origin_proof=None`` is meaningful: the producer is explicitly
++    unclassified and must not inherit ``cli.user`` merely because the CLI
++    transports the payload to the next turn.
++    """
++
++    payload: Any
++    origin_proof: Optional[dict[str, str]]
++
++    def __post_init__(self) -> None:
++        if self.origin_proof is not None:
++            object.__setattr__(
++                self,
++                "origin_proof",
++                normalize_message_origin_proof(self.origin_proof),
++            )
++
++
+ def message_origin_for_platform(platform: Any) -> Optional[dict[str, str]]:
+     """Return the default proof for this live execution surface.
+ 
+@@ -182,6 +205,14 @@ def stamp_message_origin(
+     message["_origin_proof"] = normalized
+ 
+ 
++def declare_message_origin(
++    message: MutableMapping[str, Any], proof: Optional[Mapping[str, Any]]
++) -> None:
++    """Record that the host classified this message, including as unknown."""
++    message[MESSAGE_ORIGIN_DECLARED_FIELD] = True
++    stamp_message_origin(message, proof)
++
++
+ def busy_input_origin_matches(
+     agent: Any, incoming_proof: Optional[Mapping[str, Any]]
+ ) -> bool:
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index 789f8b1..c56b419 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -754,6 +754,7 @@ def build_turn_context(
+     # clean persistence override rather than the API-only prefixed payload.
+     pending_cli_message = getattr(agent, "_pending_cli_user_message", None)
+     from agent.message_origin import (
++        MESSAGE_ORIGIN_DECLARED_FIELD,
+         message_origin_for_platform,
+         normalize_message_origin_proof,
+         stamp_message_origin,
+@@ -761,6 +762,16 @@ def build_turn_context(
+ 
+     if message_origin_proof is not None:
+         turn_origin_proof = normalize_message_origin_proof(message_origin_proof)
++    elif (
++        isinstance(pending_cli_message, dict)
++        and pending_cli_message.get(MESSAGE_ORIGIN_DECLARED_FIELD) is True
++    ):
++        pending_proof = pending_cli_message.get("_origin_proof")
++        turn_origin_proof = (
++            normalize_message_origin_proof(pending_proof)
++            if pending_proof is not None
++            else None
++        )
+     elif (
+         isinstance(pending_cli_message, dict)
+         and pending_cli_message.get("_origin_proof") is not None
+diff --git a/cli.py b/cli.py
+index 777d2e4..e4402aa 100644
+--- a/cli.py
++++ b/cli.py
+@@ -56,7 +56,10 @@ from hermes_cli.cli_commands_mixin import CLICommandsMixin
+ from hermes_cli.cli_billing_mixin import CLIBillingMixin
+ from agent.interrupt_compat import request_hard_interrupt
+ from agent.message_origin import (
++    QueuedInput,
++    SUBAGENT,
+     busy_input_origin_matches,
++    build_message_origin_proof,
+     message_origin_for_platform,
+ )
+ from agent.pet import render as pet_render
+@@ -102,6 +105,8 @@ except Exception:
+ import threading
+ import queue
+ 
++_DEFAULT_CLI_MESSAGE_ORIGIN = object()
++
+ def CanonicalUsage(*args, **kwargs):
+     from agent.usage_pricing import CanonicalUsage as _CanonicalUsage
+ 
+@@ -13351,7 +13356,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                             continue
+                         prompt = mgr.due_prompt()
+                         if prompt:
+-                            self._pending_input.put(prompt)
++                            self._pending_input.put(QueuedInput(prompt, None))
+                     except Exception as exc:
+                         logging.debug("heartbeat watchdog tick failed: %s", exc)
+             finally:
+@@ -13426,7 +13431,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             state = mgr.state
+             tick_no = state.ticks_fired if state else "?"
+             _cprint(f"  {_DIM}↻ /loop wakeup #{tick_no} firing…{_RST}")
+-            self._pending_input.put(wakeup)
++            self._pending_input.put(QueuedInput(wakeup, None))
+         except Exception as exc:
+             logging.debug("loop tick injection failed: %s", exc)
+             try:
+@@ -13550,7 +13555,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             claim = claim_event_delivery(event, consumer)
+             if claim is None:
+                 continue
+-            self._pending_input.put(synthetic_message)
++            self._pending_input.put(
++                QueuedInput(
++                    synthetic_message,
++                    build_message_origin_proof(SUBAGENT),
++                )
++            )
+             complete_event_delivery(event, claim)
+ 
+     def _drain_interrupt_queue_to_pending_input(self) -> None:
+@@ -13700,7 +13710,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             prompt = decision.get("continuation_prompt")
+             if prompt:
+                 try:
+-                    self._pending_input.put(prompt)
++                    self._pending_input.put(QueuedInput(prompt, None))
+                 except Exception as exc:
+                     logging.debug("goal continuation enqueue failed: %s", exc)
+ 
+@@ -16809,7 +16819,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             except Exception:
+                 pass
+ 
+-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
++    def chat(
++        self,
++        message,
++        images: list = None,
++        voice_input: bool = False,
++        *,
++        message_origin_proof=_DEFAULT_CLI_MESSAGE_ORIGIN,
++    ) -> Optional[str]:
+         """
+         Send a message to the agent and get a response.
+         
+@@ -16977,18 +16994,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             agent._persist_user_message_timestamp = None
+             from agent.message_metadata import stamp_message_timestamp
+             from agent.message_origin import (
++                declare_message_origin,
+                 message_origin_for_platform,
+-                stamp_message_origin,
+                 take_cli_message_origin_proof,
+             )
+ 
+             staged_user_message = stamp_message_timestamp(
+                 {"role": "user", "content": message}
+             )
+-            stamp_message_origin(
++            resolved_origin = message_origin_proof
++            if resolved_origin is _DEFAULT_CLI_MESSAGE_ORIGIN:
++                resolved_origin = (
++                    take_cli_message_origin_proof()
++                    or message_origin_for_platform("cli")
++                )
++            declare_message_origin(
+                 staged_user_message,
+-                take_cli_message_origin_proof()
+-                or message_origin_for_platform("cli"),
++                resolved_origin,
+             )
+             agent._pending_cli_user_message = staged_user_message
+             self.conversation_history.append(staged_user_message)
+@@ -17264,11 +17286,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             # When a clarify question is active, user input is handled entirely
+             # by the Enter key binding (routed to the clarify response queue),
+             # so we skip interrupt processing to avoid stealing that input.
++            interrupt_input = None
+             interrupt_msg = None
+             while agent_thread.is_alive():
+                 if hasattr(self, '_interrupt_queue'):
+                     try:
+-                        interrupt_msg = self._interrupt_queue.get(timeout=0.1)
++                        interrupt_input = self._interrupt_queue.get(timeout=0.1)
++                        interrupt_msg = (
++                            interrupt_input.payload
++                            if isinstance(interrupt_input, QueuedInput)
++                            else interrupt_input
++                        )
+                         if interrupt_msg:
+                             # If clarify is active, the Enter handler routes
+                             # input directly; this queue shouldn't have anything.
+@@ -17277,7 +17305,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                             # _pending_input so it runs as the next turn.
+                             if self._clarify_state or self._clarify_freetext:
+                                 try:
+-                                    self._pending_input.put(interrupt_msg)
++                                    self._pending_input.put(interrupt_input)
+                                 except Exception:
+                                     pass
+                                 interrupt_msg = None
+@@ -17618,22 +17646,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             # In "queue" mode Enter routes directly to _pending_input so this
+             # block is never hit.
+             if pending_message and hasattr(self, '_pending_input'):
+-                all_parts = [pending_message]
++                pending_input = (
++                    QueuedInput(pending_message, interrupt_input.origin_proof)
++                    if isinstance(interrupt_input, QueuedInput)
++                    else pending_message
++                )
++                all_inputs = [pending_input]
+                 while not self._interrupt_queue.empty():
+                     try:
+                         extra = self._interrupt_queue.get_nowait()
+                         if extra:
+-                            all_parts.append(extra)
++                            all_inputs.append(extra)
+                     except queue.Empty:
+                         break
+-                combined = "\n".join(all_parts)
+-                n = len(all_parts)
+-                preview = combined[:50] + ("..." if len(combined) > 50 else "")
++                payloads = [
++                    item.payload if isinstance(item, QueuedInput) else item
++                    for item in all_inputs
++                ]
++                first = all_inputs[0]
++                same_origin = all(
++                    isinstance(item, QueuedInput) == isinstance(first, QueuedInput)
++                    and (
++                        not isinstance(first, QueuedInput)
++                        or item.origin_proof == first.origin_proof
++                    )
++                    for item in all_inputs
++                )
++                if same_origin and all(isinstance(payload, str) for payload in payloads):
++                    combined_payload = "\n".join(payloads)
++                    queued_inputs = [
++                        QueuedInput(combined_payload, first.origin_proof)
++                        if isinstance(first, QueuedInput)
++                        else combined_payload
++                    ]
++                else:
++                    queued_inputs = all_inputs
++                preview_text = "\n".join(str(payload) for payload in payloads)
++                n = len(all_inputs)
++                preview = preview_text[:50] + ("..." if len(preview_text) > 50 else "")
+                 if n > 1:
+                     print(f"\n⚡ Sending {n} messages after interrupt: '{preview}'")
+                 else:
+                     print(f"\n⚡ Sending after interrupt: '{preview}'")
+-                self._pending_input.put(combined)
++                for queued_input in queued_inputs:
++                    self._pending_input.put(queued_input)
+ 
+             # If a /steer was left over (agent finished before another tool
+             # batch could absorb it), deliver it as the next user turn.
+@@ -20948,6 +21004,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                                 pass
+                         continue
+ 
++                    queued_origin = _DEFAULT_CLI_MESSAGE_ORIGIN
++                    if isinstance(user_input, QueuedInput):
++                        queued_origin = user_input.origin_proof
++                        user_input = user_input.payload
++
+                     # Voice-transcribed messages arrive wrapped in a sentinel
+                     # so only genuine STT output gets the voice prefix (#65827).
+                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
+@@ -20970,8 +21031,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     if not user_input:
+                         continue
+ 
+-                    # The user has typed and submitted something, so any
+-                    # post-resize transient suppression should end here.
++                    # An input producer submitted something, so any post-resize
++                    # transient suppression should end here.
+                     self._status_bar_suppressed_after_resize = False
+ 
+                     # Unpack image payload: (text, [Path, ...]) or plain str
+@@ -21092,7 +21153,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     app.invalidate()  # Refresh status line
+ 
+                     try:
+-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
++                        chat_kwargs = {
++                            "images": submit_images or None,
++                            "voice_input": is_voice_input,
++                        }
++                        if queued_origin is not _DEFAULT_CLI_MESSAGE_ORIGIN:
++                            chat_kwargs["message_origin_proof"] = queued_origin
++                        self.chat(user_input, **chat_kwargs)
+                     finally:
+                         self._agent_running = False
+                         self._spinner_text = ""
+diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
+index 31782de..1b18e83 100644
+--- a/hermes_cli/cli_commands_mixin.py
++++ b/hermes_cli/cli_commands_mixin.py
+@@ -28,6 +28,7 @@ from rich.markup import escape as _escape
+ from rich.panel import Panel
+ 
+ from hermes_constants import display_hermes_home, is_termux as _is_termux_environment
++from agent.message_origin import QueuedInput
+ from agent.turn_context import extract_api_content_sidecar
+ from hermes_cli.browser_connect import (
+     DEFAULT_BROWSER_CDP_URL,
+@@ -2782,7 +2783,7 @@ class CLICommandsMixin:
+             # Inject context message so the model knows this slash command
+             # intentionally makes the dev/debug CDP browser available for use.
+             if hasattr(self, '_pending_input'):
+-                self._pending_input.put(
++                self._pending_input.put(QueuedInput(
+                     "[System note: The user invoked /browser connect and connected your browser tools to "
+                     "a Chromium-family dev/debug browser via Chrome DevTools Protocol. "
+                     "Your browser_navigate, browser_snapshot, browser_click, and other browser tools now "
+@@ -2791,8 +2792,9 @@ class CLICommandsMixin:
+                     "just because CDP is connected. This is typically a Hermes-managed isolated debug "
+                     "profile, not the user's main everyday browser. It is still user-visible and may contain "
+                     "pages, logged-in sessions, or cookies in that debug profile, so avoid destructive actions, "
+-                    "closing tabs, or navigating away unless the user's task calls for it.]"
+-                )
++                    "closing tabs, or navigating away unless the user's task calls for it.]",
++                    None,
++                ))
+ 
+         elif sub == "disconnect":
+             if current:
+@@ -2809,10 +2811,11 @@ class CLICommandsMixin:
+                 print()
+ 
+                 if hasattr(self, '_pending_input'):
+-                    self._pending_input.put(
++                    self._pending_input.put(QueuedInput(
+                         "[System note: The user has disconnected the browser tools from their live Chromium-family browser. "
+-                        "Browser tools are back to default mode (headless local browser or cloud provider).]"
+-                    )
++                        "Browser tools are back to default mode (headless local browser or cloud provider).]",
++                        None,
++                    ))
+             else:
+                 print()
+                 print("Browser is not connected to a live Chromium-family browser (already using default mode)")
+@@ -3110,7 +3113,7 @@ class CLICommandsMixin:
+                 queued = False
+                 if prompt:
+                     try:
+-                        self._pending_input.put(prompt)
++                        self._pending_input.put(QueuedInput(prompt, None))
+                         queued = True
+                     except Exception:
+                         pass
+@@ -3234,7 +3237,7 @@ class CLICommandsMixin:
+         # Kick the loop off immediately so the user doesn't have to send a
+         # separate message after setting the goal.
+         try:
+-            self._pending_input.put(state.goal)
++            self._pending_input.put(QueuedInput(state.goal, None))
+         except Exception:
+             pass
+ 
+@@ -3280,7 +3283,7 @@ class CLICommandsMixin:
+                 f"running as a free-form goal. The per-turn judge still applies.{_RST}"
+             )
+         try:
+-            self._pending_input.put(state.goal)
++            self._pending_input.put(QueuedInput(state.goal, None))
+         except Exception:
+             pass
+ 
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index d2fb1b7..7b4ca8b 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -78,6 +78,7 @@ from hermes_cli.relay_plugin_cutover import (
+     RELAY_PLUGINS_CONFIG_ENV,
+     legacy_relay_plugin_keys,
+ )
++from agent.message_origin import QueuedInput
+ 
+ 
+ def get_bundled_plugins_dir() -> Path:
+@@ -2089,8 +2090,9 @@ class PluginContext:
+     ) -> bool:
+         """Inject a message into a CLI or gateway conversation.
+ 
+-        If the agent is idle (waiting for user input), this starts a new turn.
+-        If the agent is running, this interrupts and injects the message.
++        If the agent is idle (waiting for input), this starts a new turn. If
++        the agent is running, this requests an interrupt and keeps the message
++        as a separately classified next turn.
+ 
+         This enables plugins (e.g. remote control viewers, messaging bridges)
+         to send messages into the conversation from external sources.
+@@ -2106,12 +2108,13 @@ class PluginContext:
+         msg = content if role == "user" else f"[{role}] {content}"
+ 
+         if cli is not None:
++            queued = QueuedInput(msg, origin_proof=None)
+             if getattr(cli, "_agent_running", False):
+                 # Agent is mid-turn - interrupt with the message
+-                cli._interrupt_queue.put(msg)
++                cli._interrupt_queue.put(queued)
+             else:
+                 # Agent is idle - queue as next input
+-                cli._pending_input.put(msg)
++                cli._pending_input.put(queued)
+             return True
+ 
+         if not session_key:
+diff --git a/tests/agent/test_turn_context.py b/tests/agent/test_turn_context.py
+index 74e5957..73a9b20 100644
+--- a/tests/agent/test_turn_context.py
++++ b/tests/agent/test_turn_context.py
+@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
+ import pytest
+ 
+ from agent.context_compressor import ContextCompressor
++from agent.message_origin import MESSAGE_ORIGIN_DECLARED_FIELD
+ from agent.turn_context import (
+     PreflightCompressionTimedOut,
+     TurnContext,
+@@ -368,6 +369,22 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
+     assert agent._pending_cli_user_message is None
+ 
+ 
++def test_explicit_unclassified_cli_handoff_does_not_inherit_human_origin():
++    agent = _FakeAgent()
++    staged = {
++        "role": "user",
++        "content": "New data arrived from the webhook",
++        MESSAGE_ORIGIN_DECLARED_FIELD: True,
++    }
++    agent._pending_cli_user_message = staged
++
++    ctx = _build(agent, user_message=staged["content"])
++
++    assert ctx.messages[-1] is staged
++    assert agent._current_message_origin_proof is None
++    assert "_origin_proof" not in ctx.messages[-1]
++
++
+ 
+ 
+ 
+diff --git a/tests/cli/test_cli_async_delegation_delivery.py b/tests/cli/test_cli_async_delegation_delivery.py
+index b970aca..b1cbcf8 100644
+--- a/tests/cli/test_cli_async_delegation_delivery.py
++++ b/tests/cli/test_cli_async_delegation_delivery.py
+@@ -2,6 +2,7 @@
+ 
+ import queue
+ 
++from agent.message_origin import SUBAGENT, QueuedInput, build_message_origin_proof
+ from cli import HermesCLI
+ 
+ 
+@@ -42,7 +43,10 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
+     cli._drain_process_notifications("cli-idle")
+ 
+     assert calls == [("visible-session", True)]
+-    assert cli._pending_input.get_nowait() == "completion payload"
++    assert cli._pending_input.get_nowait() == QueuedInput(
++        "completion payload",
++        build_message_origin_proof(SUBAGENT),
++    )
+     assert claimed == [(event, "cli-idle")]
+     assert completed == [(event, "claim-token")]
+ 
+diff --git a/tests/cli/test_cli_goal_interrupt.py b/tests/cli/test_cli_goal_interrupt.py
+index 37ee84c..219d3b7 100644
+--- a/tests/cli/test_cli_goal_interrupt.py
++++ b/tests/cli/test_cli_goal_interrupt.py
+@@ -109,7 +109,8 @@ class TestHealthyTurnStillRuns:
+         # Continuation prompt must be queued.
+         assert not cli._pending_input.empty()
+         queued = cli._pending_input.get_nowait()
+-        assert "Continuing toward your standing goal" in queued
++        assert "Continuing toward your standing goal" in queued.payload
++        assert queued.origin_proof is None
+         assert mgr.state.status == "active"
+ 
+     def test_clean_response_marks_done_when_judge_says_done(self, hermes_home):
+diff --git a/tests/cli/test_cli_interrupt_ack_race.py b/tests/cli/test_cli_interrupt_ack_race.py
+index ee2b53b..b2df3c7 100644
+--- a/tests/cli/test_cli_interrupt_ack_race.py
++++ b/tests/cli/test_cli_interrupt_ack_race.py
+@@ -31,6 +31,14 @@ import time
+ import types
+ from unittest.mock import MagicMock, patch
+ 
++from agent.message_origin import (
++    CLI_USER,
++    CRON_AGENT,
++    MESSAGE_ORIGIN_DECLARED_FIELD,
++    QueuedInput,
++    build_message_origin_proof,
++)
++
+ 
+ def _make_cli():
+     """Build a HermesCLI with prompt_toolkit stubbed (same pattern as
+@@ -154,6 +162,107 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
+     assert agent.clear_calls >= 1
+ 
+ 
++def test_unacknowledged_typed_interrupt_keeps_explicit_origin_state():
++    cli = _make_cli()
++    agent = _StubAgent(cli.session_id)
++    cli.agent = agent
++    cli._interrupt_queue = queue.Queue()
++    cli._pending_input = queue.Queue()
++    cli._interrupt_queue.put(
++        QueuedInput("New data arrived from the webhook", origin_proof=None)
++    )
++
++    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
++         patch.object(cli, "_resolve_turn_agent_config", return_value={
++             "signature": cli._active_agent_route_signature,
++             "model": None, "runtime": None, "request_overrides": None,
++         }), \
++         patch.object(cli, "_init_agent", return_value=True):
++        cli.chat(
++            "scheduled turn",
++            message_origin_proof=build_message_origin_proof(CRON_AGENT),
++        )
++
++    assert agent.interrupt_calls == ["New data arrived from the webhook"]
++    assert agent._pending_cli_user_message["_origin_proof"] == (
++        build_message_origin_proof(CRON_AGENT)
++    )
++    queued = cli._pending_input.get_nowait()
++    assert queued == QueuedInput(
++        "New data arrived from the webhook", origin_proof=None
++    )
++
++
++def test_interrupt_requeue_never_merges_different_origin_states():
++    cli = _make_cli()
++    agent = _StubAgent(cli.session_id)
++    cli.agent = agent
++    cli._interrupt_queue = queue.Queue()
++    cli._pending_input = queue.Queue()
++    plugin_notice = QueuedInput("webhook notice", origin_proof=None)
++    cli._interrupt_queue.put(plugin_notice)
++    cli._interrupt_queue.put("typed human follow-up")
++
++    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
++         patch.object(cli, "_resolve_turn_agent_config", return_value={
++             "signature": cli._active_agent_route_signature,
++             "model": None, "runtime": None, "request_overrides": None,
++         }), \
++         patch.object(cli, "_init_agent", return_value=True):
++        cli.chat(
++            "scheduled turn",
++            message_origin_proof=build_message_origin_proof(CRON_AGENT),
++        )
++
++    queued = []
++    while not cli._pending_input.empty():
++        queued.append(cli._pending_input.get_nowait())
++    assert queued == [plugin_notice, "typed human follow-up"]
++
++
++def test_chat_stages_unclassified_plugin_input_but_keeps_human_defaults():
++    cli = _make_cli()
++
++    class _StagingAgent(_StubAgent):
++        def __init__(self, session_id):
++            super().__init__(session_id, turn_seconds=0)
++            self.staged = []
++
++        def run_conversation(self, **kwargs):
++            self.staged.append(dict(self._pending_cli_user_message))
++            return {
++                "final_response": "done",
++                "messages": [{"role": "assistant", "content": "done"}],
++                "api_calls": 1,
++                "completed": True,
++                "partial": True,
++                "response_previewed": True,
++            }
++
++    agent = _StagingAgent(cli.session_id)
++    cli.agent = agent
++    cli._interrupt_queue = queue.Queue()
++    cli._pending_input = queue.Queue()
++
++    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
++         patch.object(cli, "_resolve_turn_agent_config", return_value={
++             "signature": cli._active_agent_route_signature,
++             "model": None, "runtime": None, "request_overrides": None,
++         }), \
++         patch.object(cli, "_init_agent", return_value=True):
++        cli.chat("New data arrived from the webhook", message_origin_proof=None)
++        cli.conversation_history = []
++        cli.chat("typed at the keyboard")
++        cli.conversation_history = []
++        cli.chat("spoken into the microphone", voice_input=True)
++
++    unclassified, keyboard, voice = agent.staged
++    assert unclassified[MESSAGE_ORIGIN_DECLARED_FIELD] is True
++    assert "_origin_proof" not in unclassified
++    assert keyboard["_origin_proof"] == build_message_origin_proof(CLI_USER)
++    assert voice["_origin_proof"] == build_message_origin_proof(CLI_USER)
++
++
+ 
+ 
+ def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():
+diff --git a/tests/cli/test_cli_shutdown_memory_messages.py b/tests/cli/test_cli_shutdown_memory_messages.py
+index 55aebee..55df580 100644
+--- a/tests/cli/test_cli_shutdown_memory_messages.py
++++ b/tests/cli/test_cli_shutdown_memory_messages.py
+@@ -21,6 +21,11 @@ import types
+ from typing import Any
+ from unittest.mock import MagicMock, patch
+ 
++from agent.message_origin import (
++    MESSAGE_ORIGIN_DECLARED_FIELD,
++    classify_message_origin_group,
++)
++
+ 
+ @patch("hermes_cli.plugins.invoke_hook")
+ def test_cleanup_forwards_session_messages(mock_invoke_hook):
+@@ -293,6 +298,47 @@ def test_cli_close_uses_clean_override_for_shortened_pending_snapshot(tmp_path,
+     assert staged["_db_persisted"] is True
+ 
+ 
++def test_cli_close_and_reopen_preserve_unclassified_injected_origin(
++    tmp_path, monkeypatch
++):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++
++    import cli as cli_mod
++    from hermes_state import SessionDB
++
++    path = tmp_path / "state.db"
++    db = SessionDB(db_path=path)
++    session_id = "cli-close-plugin-injection"
++    db.create_session(session_id=session_id, source="cli")
++    staged = {
++        "role": "user",
++        "content": "New data arrived from the webhook",
++        MESSAGE_ORIGIN_DECLARED_FIELD: True,
++    }
++    agent = _real_agent(db, session_id, [])
++    agent._pending_cli_user_message = staged
++    agent._current_message_origin_proof = None
++
++    cli = object.__new__(cli_mod.HermesCLI)
++    cli.conversation_history = [staged]
++    cli.session_id = session_id
++    cli.agent = agent
++
++    cli._persist_active_session_before_close()
++    db.close()
++
++    reopened = SessionDB(db_path=path, read_only=True)
++    try:
++        rows = reopened.get_messages_as_conversation(session_id)
++    finally:
++        reopened.close()
++
++    assert [row["content"] for row in rows] == [staged["content"]]
++    assert rows[0].get("origin_proof") is None
++    assert classify_message_origin_group(rows) == (None, "missing")
++    assert staged["_db_persisted"] is True
++
++
+ 
+ 
+ def test_cli_close_builds_prompt_before_creating_first_session_row(tmp_path, monkeypatch):
+diff --git a/tests/gateway/test_goal_resume_restart.py b/tests/gateway/test_goal_resume_restart.py
+index 7b9be97..080eed8 100644
+--- a/tests/gateway/test_goal_resume_restart.py
++++ b/tests/gateway/test_goal_resume_restart.py
+@@ -98,7 +98,8 @@ class TestCliResumeRestartsWork:
+             "— otherwise the goal sits idle until the user types something"
+         )
+         queued = cli._pending_input.get_nowait()
+-        assert queued.startswith("[Continuing toward your standing goal]")
++        assert queued.payload.startswith("[Continuing toward your standing goal]")
++        assert queued.origin_proof is None
+ 
+         state = goals.GoalManager(sid).state
+         assert state.status == "active"
+diff --git a/tests/hermes_cli/test_plugin_message_injection.py b/tests/hermes_cli/test_plugin_message_injection.py
+index 209f6f3..aff9671 100644
+--- a/tests/hermes_cli/test_plugin_message_injection.py
++++ b/tests/hermes_cli/test_plugin_message_injection.py
+@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
+ 
+ import yaml
+ 
++from agent.message_origin import QueuedInput
+ from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+ 
+ 
+@@ -24,7 +25,7 @@ def _write_plugin_config(tmp_path, monkeypatch, entry: dict) -> None:
+     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+ 
+ 
+-def test_cli_idle_injection_keeps_existing_queue_behaviour():
++def test_cli_idle_injection_preserves_explicit_unclassified_origin():
+     context, manager = _context()
+     cli = SimpleNamespace(
+         _agent_running=False,
+@@ -34,11 +35,12 @@ def test_cli_idle_injection_keeps_existing_queue_behaviour():
+     manager._cli_ref = cli
+ 
+     assert context.inject_message("new input") is True
+-    assert cli._pending_input.get_nowait() == "new input"
++    queued = cli._pending_input.get_nowait()
++    assert queued == QueuedInput("new input", origin_proof=None)
+     assert cli._interrupt_queue.empty()
+ 
+ 
+-def test_cli_running_injection_keeps_existing_interrupt_behaviour():
++def test_cli_running_injection_preserves_origin_through_interrupt_queue():
+     context, manager = _context()
+     cli = SimpleNamespace(
+         _agent_running=True,
+@@ -48,10 +50,27 @@ def test_cli_running_injection_keeps_existing_interrupt_behaviour():
+     manager._cli_ref = cli
+ 
+     assert context.inject_message("status", "system") is True
+-    assert cli._interrupt_queue.get_nowait() == "[system] status"
++    queued = cli._interrupt_queue.get_nowait()
++    assert queued == QueuedInput("[system] status", origin_proof=None)
+     assert cli._pending_input.empty()
+ 
+ 
++def test_official_webhook_example_cannot_gain_human_origin_from_cli_shell():
++    context, manager = _context()
++    cli = SimpleNamespace(
++        _agent_running=False,
++        _pending_input=SimpleQueue(),
++        _interrupt_queue=SimpleQueue(),
++    )
++    manager._cli_ref = cli
++
++    assert context.inject_message("New data arrived from the webhook") is True
++    queued = cli._pending_input.get_nowait()
++
++    assert queued.payload == "New data arrived from the webhook"
++    assert queued.origin_proof is None
++
++
+ def test_gateway_injection_requires_session_key(tmp_path, monkeypatch):
+     _write_plugin_config(
+         tmp_path,
+-- 
+2.50.1 (Apple Git-155)
+

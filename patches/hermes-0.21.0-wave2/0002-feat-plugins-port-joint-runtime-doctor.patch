@@ -1,0 +1,538 @@
+From 8ba0825c5f290ab0f1bf23ad22913ca7ade96970 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 18:32:03 +0800
+Subject: [PATCH 2/2] feat(plugins): port joint runtime doctor
+
+---
+ hermes_cli/plugin_dev.py          | 175 +++++++++++++++++++--------
+ hermes_cli/plugins_cmd.py         |  17 ++-
+ hermes_cli/subcommands/plugins.py |  11 ++
+ tests/test_plugin_doctor_joint.py | 192 ++++++++++++++++++++++++++++++
+ 4 files changed, 342 insertions(+), 53 deletions(-)
+ create mode 100644 tests/test_plugin_doctor_joint.py
+
+diff --git a/hermes_cli/plugin_dev.py b/hermes_cli/plugin_dev.py
+index 2687fd7..46729d7 100644
+--- a/hermes_cli/plugin_dev.py
++++ b/hermes_cli/plugin_dev.py
+@@ -18,7 +18,7 @@ from contextlib import ExitStack, contextmanager
+ from dataclasses import dataclass, field
+ from pathlib import Path, PurePath
+ from types import SimpleNamespace
+-from typing import Any, Literal
++from typing import Any, Iterable, Literal
+ from unittest.mock import patch
+ 
+ from hermes_constants import get_hermes_home
+@@ -33,12 +33,12 @@ def _deny_network(*_args: Any, **_kwargs: Any) -> None:
+ 
+ 
+ @contextmanager
+-def _doctor_runtime(plugin_path: Path):
+-    """Load one plugin through the real runtime and restore global state.
++def _doctor_runtime(plugin_path: Path, companion_paths: tuple[Path, ...] = ()):
++    """Load one plugin set through the real runtime and restore global state.
+ 
+     This is deliberately private Doctor machinery, not a standalone plugin
+     test framework. Registration code executes under a temporary HERMES_HOME
+-    with outbound socket connects blocked.
++    with a real empty canonical state database and outbound connects blocked.
+     """
+     stack = ExitStack()
+     try:
+@@ -54,12 +54,18 @@ def _doctor_runtime(plugin_path: Path):
+         plugins_root = home / "plugins"
+         bundled.mkdir(parents=True)
+         plugins_root.mkdir(parents=True)
+-        copied = plugins_root / plugin_path.name
+-        shutil.copytree(
+-            plugin_path,
+-            copied,
+-            ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache", "*.pyc"),
+-        )
++        source_paths = (*companion_paths, plugin_path)
++        copied_paths: dict[Path, Path] = {}
++        for index, source_path in enumerate(source_paths):
++            copied = plugins_root / f"{index:02d}-{source_path.name}"
++            shutil.copytree(
++                source_path,
++                copied,
++                ignore=shutil.ignore_patterns(
++                    ".git", "__pycache__", ".pytest_cache", "*.pyc"
++                ),
++            )
++            copied_paths[source_path] = copied
+ 
+         stack.enter_context(
+             patch.dict(
+@@ -79,7 +85,8 @@ def _doctor_runtime(plugin_path: Path):
+         stack.close()
+         raise
+ 
+-    from hermes_cli.plugins import PluginManager
++    from hermes_cli.plugins import PluginManager, resolve_plugin_load_order
++    from hermes_state import SessionDB
+     from tools.registry import registry
+ 
+     entries_before = {entry.name: entry for entry in registry._snapshot_entries()}
+@@ -89,26 +96,60 @@ def _doctor_runtime(plugin_path: Path):
+         for name in sys.modules
+         if name == "hermes_plugins" or name.startswith("hermes_plugins.")
+     }
+-    manager = PluginManager()
++    manager = PluginManager(scope_key=str(home))
++    loaded_keys: list[str] = []
+     try:
++        SessionDB(home / "state.db").close()
+         manifests = manager._scan_directory(plugins_root, source="user")
+         if not manifests:
+             raise _DoctorLoadError(
+-                f"Hermes discovery found no valid plugin manifest under {copied}"
++                "Hermes discovery found no valid plugin manifest under the "
++                "temporary plugins directory"
+             )
+-        if len(manifests) != 1:
++        if len(manifests) != len(source_paths):
+             raise _DoctorLoadError(
+-                f"Expected one plugin manifest, discovered {len(manifests)} under {copied}"
++                f"Expected {len(source_paths)} plugin manifest(s), discovered "
++                f"{len(manifests)} under the temporary plugins directory"
+             )
+-        manifest = manifests[0]
+-        manager._load_plugin(manifest)
++        by_key: dict[str, Any] = {}
++        for discovered in manifests:
++            key = discovered.key or discovered.name
++            if key in by_key:
++                raise _DoctorLoadError(f"Duplicate plugin id {key!r} in Doctor input")
++            by_key[key] = discovered
++
++        primary_copy = copied_paths[plugin_path].resolve()
++        manifest = next(
++            (
++                discovered
++                for discovered in manifests
++                if Path(discovered.path).resolve() == primary_copy
++            ),
++            None,
++        )
++        if manifest is None:
++            raise _DoctorLoadError("Hermes discovery lost the primary plugin manifest")
++
++        for key in resolve_plugin_load_order(by_key):
++            manager._load_plugin(by_key[key])
++            loaded_keys.append(key)
++            candidate = manager._plugins.get(key)
++            if candidate is None:
++                raise _DoctorLoadError(
++                    f"Plugin {key!r} registration produced no runtime record"
++                )
++            if candidate.error:
++                raise _DoctorLoadError(
++                    f"Plugin {key!r} registration failed: {candidate.error}"
++                )
++            if not candidate.enabled:
++                raise _DoctorLoadError(
++                    f"Plugin {key!r} registration did not enable the runtime record"
++                )
++
+         loaded = manager._plugins.get(manifest.key or manifest.name)
+         if loaded is None:
+             raise _DoctorLoadError("Plugin registration produced no runtime record")
+-        if loaded.error:
+-            raise _DoctorLoadError(f"Plugin registration failed: {loaded.error}")
+-        if not loaded.enabled:
+-            raise _DoctorLoadError("Plugin registration did not enable the runtime record")
+         yield SimpleNamespace(
+             manifest=manifest,
+             manager=manager,
+@@ -116,30 +157,45 @@ def _doctor_runtime(plugin_path: Path):
+             registered_hooks=tuple(loaded.hooks_registered),
+         )
+     finally:
+-        entries_after = {entry.name: entry for entry in registry._snapshot_entries()}
+-        changed_names = {
+-            name
+-            for name in set(entries_before) | set(entries_after)
+-            if entries_after.get(name) is not entries_before.get(name)
+-        }
+-        with registry._lock:
+-            for name in changed_names:
+-                previous = entries_before.get(name)
+-                if previous is None:
+-                    registry._tools.pop(name, None)
+-                else:
+-                    registry._tools[name] = previous
+-            registry._plugin_override_policy.clear()
+-            registry._plugin_override_policy.update(policy_before)
+-            if changed_names:
+-                registry._generation += 1
+-        for name in list(sys.modules):
+-            if (
+-                name not in modules_before
+-                and (name == "hermes_plugins" or name.startswith("hermes_plugins."))
+-            ):
+-                sys.modules.pop(name, None)
+-        stack.close()
++        try:
++            # Exercise the real ownership ledger, then restore the remaining
++            # process-global test state below. PluginManager deliberately logs
++            # and continues past individual cleanup-callback failures, so this
++            # proves unload invocation and registry cleanup, not arbitrary
++            # plugin callback success.
++            for key in reversed(loaded_keys):
++                manager.unload(key)
++            manager.unload()
++        finally:
++            entries_after = {
++                entry.name: entry for entry in registry._snapshot_entries()
++            }
++            changed_names = {
++                name
++                for name in set(entries_before) | set(entries_after)
++                if entries_after.get(name) is not entries_before.get(name)
++            }
++            with registry._lock:
++                for name in changed_names:
++                    previous = entries_before.get(name)
++                    if previous is None:
++                        registry._tools.pop(name, None)
++                    else:
++                        registry._tools[name] = previous
++                registry._plugin_override_policy.clear()
++                registry._plugin_override_policy.update(policy_before)
++                if changed_names:
++                    registry._generation += 1
++            for name in list(sys.modules):
++                if (
++                    name not in modules_before
++                    and (
++                        name == "hermes_plugins"
++                        or name.startswith("hermes_plugins.")
++                    )
++                ):
++                    sys.modules.pop(name, None)
++            stack.close()
+ 
+ 
+ @dataclass(frozen=True)
+@@ -155,6 +211,7 @@ class DoctorReport:
+     findings: list[DoctorFinding] = field(default_factory=list)
+     registered_tools: tuple[str, ...] = ()
+     registered_hooks: tuple[str, ...] = ()
++    companion_paths: tuple[Path, ...] = ()
+ 
+     @property
+     def ok(self) -> bool:
+@@ -173,6 +230,11 @@ class DoctorReport:
+                 f"  manifest: {self.manifest.name} "
+                 f"{self.manifest.version or '(no version)'} ({self.manifest.kind})"
+             )
++        if self.companion_paths:
++            lines.append(
++                "  joint companions: "
++                + ", ".join(str(path) for path in self.companion_paths)
++            )
+         for finding in self.findings:
+             marker = "ERROR" if finding.level == "error" else "WARN"
+             lines.append(f"  {marker}: {finding.message}")
+@@ -355,8 +417,12 @@ def _check_manifest_v2(report: "DoctorReport", manifest: Any) -> None:
+                 )
+ 
+ 
+-def doctor_plugin(target: str | os.PathLike[str] | None = None) -> DoctorReport:
+-    """Validate one plugin through Hermes' real scanner and registration path."""
++def doctor_plugin(
++    target: str | os.PathLike[str] | None = None,
++    *,
++    with_plugins: Iterable[str | os.PathLike[str]] = (),
++) -> DoctorReport:
++    """Validate one plugin plus optional companions in an isolated runtime."""
+     try:
+         path = resolve_plugin_path(target)
+     except FileNotFoundError as exc:
+@@ -364,9 +430,20 @@ def doctor_plugin(target: str | os.PathLike[str] | None = None) -> DoctorReport:
+         report.error(str(exc))
+         return report
+ 
+-    report = DoctorReport(path)
++    companion_paths: list[Path] = []
++    for companion in with_plugins:
++        try:
++            resolved = resolve_plugin_path(companion)
++        except FileNotFoundError as exc:
++            report = DoctorReport(path, companion_paths=tuple(companion_paths))
++            report.error(str(exc))
++            return report
++        if resolved != path and resolved not in companion_paths:
++            companion_paths.append(resolved)
++
++    report = DoctorReport(path, companion_paths=tuple(companion_paths))
+     try:
+-        with _doctor_runtime(path) as host:
++        with _doctor_runtime(path, tuple(companion_paths)) as host:
+             report.manifest = host.manifest
+             report.registered_tools = host.registered_tools
+             report.registered_hooks = host.registered_hooks
+diff --git a/hermes_cli/plugins_cmd.py b/hermes_cli/plugins_cmd.py
+index e57c820..4bbc811 100644
+--- a/hermes_cli/plugins_cmd.py
++++ b/hermes_cli/plugins_cmd.py
+@@ -3048,13 +3048,18 @@ def dashboard_remove_user_plugin(name: str) -> dict[str, Any]:
+     return {"ok": True, "name": name}
+ 
+ 
+-def cmd_plugin_doctor(target: str = ".", *, ci: bool = False) -> None:
+-    """Validate one plugin through runtime discovery and registration."""
++def cmd_plugin_doctor(
++    target: str = ".",
++    *,
++    ci: bool = False,
++    with_plugins: tuple[str, ...] = (),
++) -> None:
++    """Validate one plugin and optional companions through the real runtime."""
+     from rich.console import Console
+ 
+     from hermes_cli.plugin_dev import doctor_plugin
+ 
+-    report = doctor_plugin(target)
++    report = doctor_plugin(target, with_plugins=with_plugins)
+     Console().print(report.format_text())
+     if ci and not report.ok:
+         raise SystemExit(1)
+@@ -3162,7 +3167,11 @@ def plugins_command(args) -> None:
+     elif action in {"list", "ls"}:
+         cmd_list(args)
+     elif action == "doctor":
+-        cmd_plugin_doctor(args.target, ci=getattr(args, "ci", False))
++        cmd_plugin_doctor(
++            args.target,
++            ci=getattr(args, "ci", False),
++            with_plugins=tuple(getattr(args, "with_plugins", ()) or ()),
++        )
+     elif action == "pack":
+         from hermes_cli.plugin_packs import pack_command
+ 
+diff --git a/hermes_cli/subcommands/plugins.py b/hermes_cli/subcommands/plugins.py
+index 975770c..ee5a697 100644
+--- a/hermes_cli/subcommands/plugins.py
++++ b/hermes_cli/subcommands/plugins.py
+@@ -172,6 +172,17 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
+         action="store_true",
+         help="Exit non-zero when validation reports an error",
+     )
++    plugins_doctor.add_argument(
++        "--with",
++        dest="with_plugins",
++        action="append",
++        default=[],
++        metavar="PLUGIN",
++        help=(
++            "Load a companion plugin path or installed id in the same temporary "
++            "runtime (repeat for multiple dependencies)"
++        ),
++    )
+ 
+     plugins_pack = plugins_subparsers.add_parser(
+         "pack",
+diff --git a/tests/test_plugin_doctor_joint.py b/tests/test_plugin_doctor_joint.py
+new file mode 100644
+index 0000000..dbd6ea6
+--- /dev/null
++++ b/tests/test_plugin_doctor_joint.py
+@@ -0,0 +1,192 @@
++from __future__ import annotations
++
++import argparse
++import os
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++from hermes_cli.plugin_dev import _doctor_runtime, doctor_plugin
++from hermes_cli.subcommands.plugins import build_plugins_parser
++
++
++def _write_plugin(
++    root: Path,
++    *,
++    name: str,
++    source: str,
++    requires: str | None = None,
++    hooks: tuple[str, ...] = (),
++) -> Path:
++    plugin = root / name
++    plugin.mkdir(parents=True)
++    manifest = [
++        "manifest_version: 2",
++        f"name: {name}",
++        "version: 1.0.0",
++        "description: joint Doctor fixture",
++        "provides_tools: []",
++        f"provides_hooks: [{', '.join(hooks)}]",
++    ]
++    if requires is not None:
++        manifest.extend(
++            [
++                "requires_plugins:",
++                f"  - id: {requires}",
++                "    version_range: '>=1,<2'",
++            ]
++        )
++    (plugin / "plugin.yaml").write_text(
++        "\n".join(manifest) + "\n", encoding="utf-8"
++    )
++    (plugin / "__init__.py").write_text(source, encoding="utf-8")
++    return plugin
++
++
++def _joint_plugins(root: Path) -> tuple[Path, Path]:
++    provider = _write_plugin(
++        root,
++        name="doctor-provider",
++        source=(
++            "import os\n"
++            "from pathlib import Path\n"
++            "from hermes_constants import get_hermes_home\n"
++            "from hermes_state import SessionDB\n\n"
++            "def _unloaded():\n"
++            "    marker = os.environ.get('DOCTOR_UNLOAD_MARKER')\n"
++            "    if marker:\n"
++            "        with Path(marker).open('a', encoding='utf-8') as stream:\n"
++            "            stream.write('provider\\n')\n\n"
++            "def register(ctx):\n"
++            "    db = SessionDB(get_hermes_home() / 'state.db', read_only=True)\n"
++            "    ctx.on_unload(db.close)\n"
++            "    ctx.on_unload(_unloaded)\n"
++            "    ctx.register_service('ready.v1', {'ready': True})\n"
++        ),
++    )
++    consumer = _write_plugin(
++        root,
++        name="doctor-consumer",
++        requires="doctor-provider",
++        hooks=("pre_llm_call",),
++        source=(
++            "import os\n"
++            "from pathlib import Path\n\n"
++            "def _hook(**_kwargs):\n"
++            "    return None\n\n"
++            "def _unloaded():\n"
++            "    marker = os.environ.get('DOCTOR_UNLOAD_MARKER')\n"
++            "    if marker:\n"
++            "        with Path(marker).open('a', encoding='utf-8') as stream:\n"
++            "            stream.write('consumer\\n')\n\n"
++            "def register(ctx):\n"
++            "    service = ctx.get_service('doctor-provider:ready.v1')\n"
++            "    if service is None:\n"
++            "        raise RuntimeError('provider service missing')\n"
++            "    ctx.on_unload(_unloaded)\n"
++            "    ctx.register_hook('pre_llm_call', _hook)\n"
++        ),
++    )
++    return provider, consumer
++
++
++class JointPluginDoctorTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self._temporary = tempfile.TemporaryDirectory()
++        self.root = Path(self._temporary.name)
++
++    def tearDown(self) -> None:
++        self._temporary.cleanup()
++
++    def test_joint_doctor_initializes_state_and_loads_dependencies_first(self) -> None:
++        provider, consumer = _joint_plugins(self.root)
++
++        report = doctor_plugin(consumer, with_plugins=[provider])
++
++        self.assertTrue(report.ok, report.format_text())
++        self.assertEqual(report.registered_hooks, ("pre_llm_call",))
++        self.assertEqual(report.companion_paths, (provider.resolve(),))
++        self.assertIn("joint companions:", report.format_text())
++
++    def test_single_plugin_doctor_keeps_missing_dependency_visible(self) -> None:
++        _provider, consumer = _joint_plugins(self.root)
++
++        report = doctor_plugin(consumer)
++
++        self.assertFalse(report.ok)
++        self.assertTrue(
++            any(
++                "provider service missing" in finding.message
++                for finding in report.findings
++            )
++        )
++
++    def test_joint_runtime_unloads_every_owner_in_reverse_load_order(self) -> None:
++        provider, consumer = _joint_plugins(self.root)
++        marker = self.root / "unloaded.txt"
++
++        with patch.dict(
++            os.environ, {"DOCTOR_UNLOAD_MARKER": str(marker)}, clear=False
++        ):
++            with _doctor_runtime(consumer, (provider,)) as host:
++                manager = host.manager
++                self.assertIsNotNone(
++                    manager._get_plugin_service("doctor-provider:ready.v1")
++                )
++
++        self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), [
++            "consumer",
++            "provider",
++        ])
++        self.assertEqual(manager._services, {})
++        self.assertEqual(manager._hooks, {})
++        self.assertEqual(manager._plugins, {})
++
++    def test_missing_companion_is_reported_without_partial_runtime(self) -> None:
++        _provider, consumer = _joint_plugins(self.root)
++
++        report = doctor_plugin(
++            consumer,
++            with_plugins=[self.root / "does-not-exist"],
++        )
++
++        self.assertFalse(report.ok)
++        self.assertTrue(
++            any("not found" in finding.message for finding in report.findings)
++        )
++
++    def test_duplicate_companion_path_is_loaded_once(self) -> None:
++        provider, consumer = _joint_plugins(self.root)
++
++        report = doctor_plugin(
++            consumer,
++            with_plugins=[provider, provider, consumer],
++        )
++
++        self.assertTrue(report.ok, report.format_text())
++        self.assertEqual(report.companion_paths, (provider.resolve(),))
++
++    def test_doctor_parser_accepts_repeated_joint_companions(self) -> None:
++        parser = argparse.ArgumentParser()
++        subparsers = parser.add_subparsers(dest="command")
++        build_plugins_parser(subparsers, cmd_plugins=lambda _args: None)
++
++        args = parser.parse_args(
++            [
++                "plugins",
++                "doctor",
++                "consumer",
++                "--with",
++                "provider-a",
++                "--with",
++                "provider-b",
++            ]
++        )
++
++        self.assertEqual(args.target, "consumer")
++        self.assertEqual(args.with_plugins, ["provider-a", "provider-b"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.50.1 (Apple Git-155)
+

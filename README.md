@@ -88,8 +88,9 @@ publish a checkpoint or delivery receipt.
 
 ## Compatibility
 
-The current Wave 5 source candidate is tested against the accepted Hermes
-Agent 0.21.0 host commit
+The accepted Wave 5 source is paired with accepted Global Hot
+`01918856aa46f80ca17dd67d079eed1b7261f85f` and tested against the accepted
+Hermes Agent 0.21.0 host commit
 `13900108780ae712059075200b243aa049c634cf` with tree
 `5e82789d9984f8c338c09bdd0ebb31794af1f0dc`. It requires
 `hermes.middleware.v2`, `hermes.transport.v3`, `hermes.request_overlay.v2`,
@@ -97,12 +98,12 @@ the bounded SessionDB time-window reader, PluginLlm finish truth, profile-local
 services, and the host-owned H13 message-origin group classifier. Registration
 fails visibly when any required seam is absent.
 
-The twelve patches currently retained in [`patches/`](patches/) reproduce the
-accepted 0.20.5 predecessor only. They are provenance artifacts, not an
-installation path for plugin version 0.5.0 and must not be applied to 0.21.
-The public 0.21 patch replay and workflow migration belong to the later
-assembly landing wave, after Continuity and Global Hot are independently
-accepted.
+The 35 ordered patches under `patches/hermes-0.21.0-wave1/` through
+`patches/hermes-0.21.0-wave4/` reproduce that exact 0.21 host tree from pure
+upstream `29112bef099274229cadff79cdff7bf7b99c4b77`. Their byte identities are
+recorded in `patches/hermes-0.21.0-series.sha256`. The twelve top-level 0.20.5
+patches remain immutable predecessor provenance and must not be applied to
+0.21.
 
 ## Test
 
@@ -130,17 +131,22 @@ Continuity through real plugin discovery and enters through production
 fallback delivery, post settlement, next-turn checkpoint reuse, and manager
 unload/reload. The adapter suite separately runs real Lean compaction and
 read-only reopen through both the production full-prefix and bounded lineage
-readers, including a tool-follow-up group. The legacy dual-plugin test
-remains for the accepted 0.20.5 predecessor. Public replay of the exact 0.21
-host is intentionally deferred to the assembly landing wave; local exact-host
-results are not presented as public-CI evidence.
+readers, including a tool-follow-up group. The paired production entrypoint now
+uses real H13 human proofs for its synthetic dialogue groups and current turns.
+
+The public workflow reconstructs the exact 0.21 host from the 35 digest-pinned
+patches, runs the changed host seam matrix and both plugin suites, enters the
+paired production conversation path, then installs both exact Git revisions
+disabled in a disposable profile, runs native/joint Doctor, removes them, and
+requires empty plugin directories and install metadata. It performs no network
+provider call, enablement, deployment, or live-channel canary.
 
 ## Current status
 
-The 0.20.5 public candidate remains the installed control. This 0.21 Wave 5
-revision is a Continuity-only source candidate: it consumes H13 proof and has
-local exact-host evidence, but has not been installed, enabled, deployed, or
-observed on a live channel.
+The 0.20.5 public candidate remains the installed control. Wave 5 Continuity
+and Wave 6 Global Hot are independently accepted source checkpoints. The
+current Wave 7 revision is a public-replay and disposable disabled-lifecycle
+candidate; it does not change Continuity production code.
 The current v2 source/checkpoint path still performs work and stores proof
 material proportional to full session history; formal use on a long-lived
 profile remains blocked until a stable host prefix-proof seam and compact

@@ -1,0 +1,1170 @@
+From d4a8949637c05175cd27c38e7edb67adfe736592 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 13:36:14 +0800
+Subject: [PATCH] fix(provenance): split cross-origin busy input
+
+---
+ acp_adapter/server.py                         | 21 ++++-
+ agent/message_origin.py                       | 25 +++++-
+ cli.py                                        | 24 +++++-
+ gateway/platforms/api_server_runs.py          | 23 ++++++
+ gateway/run.py                                | 47 ++++++++++-
+ tests/acp_adapter/test_acp_commands.py        | 43 +++++++++-
+ tests/agent/test_message_origin.py            | 81 +++++++++++++++++++
+ tests/cli/test_cli_steer_busy_path.py         | 23 ++++++
+ tests/gateway/test_api_server_runs.py         | 25 ++++++
+ tests/gateway/test_busy_session_ack.py        | 69 +++++++++++++---
+ .../gateway/test_multiplex_busy_input_mode.py | 19 +++++
+ tests/gateway/test_steer_command.py           | 38 ++++++++-
+ .../gateway/test_subagent_protection_30170.py | 11 ++-
+ tests/gateway/test_turn_context.py            |  4 +
+ tests/test_tui_gateway_server.py              | 59 +++++++++++++-
+ tui_gateway/methods_session.py                | 20 +++++
+ tui_gateway/methods_tools.py                  | 13 ++-
+ tui_gateway/server.py                         | 18 ++++-
+ 18 files changed, 535 insertions(+), 28 deletions(-)
+
+diff --git a/acp_adapter/server.py b/acp_adapter/server.py
+index 792e44b..56d9339 100644
+--- a/acp_adapter/server.py
++++ b/acp_adapter/server.py
+@@ -1881,9 +1881,17 @@ class HermesACPAgent(acp.Agent):
+         queued_depth: int | None = None
+         with state.runtime_lock:
+             if state.is_running:
++                from agent.message_origin import (
++                    busy_input_origin_matches,
++                    message_origin_for_platform,
++                )
++
+                 if (
+                     text_only_prompt
+                     and isinstance(user_content, str)
++                    and busy_input_origin_matches(
++                        state.agent, message_origin_for_platform("acp")
++                    )
+                     and getattr(
+                         state.agent,
+                         "_supports_active_turn_redirect",
+@@ -2539,7 +2547,18 @@ class HermesACPAgent(acp.Agent):
+         if not steer_text:
+             return "Usage: /steer <guidance>"
+ 
+-        if state.is_running and hasattr(state.agent, "steer"):
++        from agent.message_origin import (
++            busy_input_origin_matches,
++            message_origin_for_platform,
++        )
++
++        if (
++            state.is_running
++            and busy_input_origin_matches(
++                state.agent, message_origin_for_platform("acp")
++            )
++            and hasattr(state.agent, "steer")
++        ):
+             try:
+                 if state.agent.steer(steer_text):
+                     preview = steer_text[:80] + ("..." if len(steer_text) > 80 else "")
+diff --git a/agent/message_origin.py b/agent/message_origin.py
+index 92ead74..267987d 100644
+--- a/agent/message_origin.py
++++ b/agent/message_origin.py
+@@ -123,7 +123,7 @@ def message_origin_for_platform(platform: Any) -> Optional[dict[str, str]]:
+         return build_message_origin_proof(CRON_AGENT)
+     if token == "subagent":
+         return build_message_origin_proof(SUBAGENT)
+-    if token == "api_server":
++    if token in {"acp", "api_server"}:
+         return build_message_origin_proof(API_USER)
+     if token == "cli":
+         return build_message_origin_proof(CLI_USER)
+@@ -176,11 +176,32 @@ def stamp_message_origin(
+     normalized = normalize_message_origin_proof(proof)
+     existing = message.get("_origin_proof")
+     if existing is not None:
+-        normalize_message_origin_proof(existing)
++        if normalize_message_origin_proof(existing) != normalized:
++            raise ValueError("message origin proof conflicts with existing row")
+         return
+     message["_origin_proof"] = normalized
+ 
+ 
++def busy_input_origin_matches(
++    agent: Any, incoming_proof: Optional[Mapping[str, Any]]
++) -> bool:
++    """Whether busy input may mutate the agent's current durable turn.
++
++    Unknown, invalid, and cross-writer inputs must cross a turn boundary.  The
++    ingress surface keeps ownership of queueing or rejecting the new turn; this
++    helper only answers whether ``steer``/``redirect`` is provenance-safe.
++    """
++    running_proof = getattr(agent, "_current_message_origin_proof", None)
++    if running_proof is None or incoming_proof is None:
++        return False
++    try:
++        return normalize_message_origin_proof(
++            running_proof
++        ) == normalize_message_origin_proof(incoming_proof)
++    except ValueError:
++        return False
++
++
+ def stamp_turn_message_origins(
+     messages: Sequence[Any],
+     start_index: Any,
+diff --git a/cli.py b/cli.py
+index 555773e..777d2e4 100644
+--- a/cli.py
++++ b/cli.py
+@@ -55,6 +55,10 @@ from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+ from hermes_cli.cli_commands_mixin import CLICommandsMixin
+ from hermes_cli.cli_billing_mixin import CLIBillingMixin
+ from agent.interrupt_compat import request_hard_interrupt
++from agent.message_origin import (
++    busy_input_origin_matches,
++    message_origin_for_platform,
++)
+ from agent.pet import render as pet_render
+ 
+ # prompt_toolkit for fixed input area TUI
+@@ -12978,7 +12982,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             payload = parts[1].strip() if len(parts) > 1 else ""
+             if not payload:
+                 _cprint("  Usage: /steer <prompt>")
+-            elif self._agent_running and self.agent is not None and hasattr(self.agent, "steer"):
++            elif (
++                self._agent_running
++                and self.agent is not None
++                and busy_input_origin_matches(
++                    self.agent, message_origin_for_platform("cli")
++                )
++                and hasattr(self.agent, "steer")
++            ):
+                 try:
+                     accepted = self.agent.steer(payload)
+                 except Exception as exc:
+@@ -12991,7 +13002,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             else:
+                 # No active run — treat as a normal next-turn message.
+                 self._pending_input.put(payload)
+-                _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
++                _cprint(f"  Queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
+         elif canonical == "goal":
+             self._handle_goal_command(cmd_original)
+         elif canonical == "heartbeat":
+@@ -18636,6 +18647,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                 )
+                 if self._agent_running and not _is_local_dispatch:
+                     _effective_mode = self.busy_input_mode
++                    _same_turn_origin = (
++                        self.agent is not None
++                        and busy_input_origin_matches(
++                            self.agent, message_origin_for_platform("cli")
++                        )
++                    )
+                     redirected = False
+                     if _effective_mode == "steer":
+                         # Route Enter through /steer — inject mid-run after the
+@@ -18643,7 +18660,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                         # appends text), so fall back to queue when images are
+                         # attached.  If the agent lacks steer() or rejects the
+                         # payload, also fall back to queue so nothing is lost.
+-                        if images or not text:
++                        if images or not text or not _same_turn_origin:
+                             _effective_mode = "queue"
+                         else:
+                             accepted = False
+@@ -18668,6 +18685,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                             try:
+                                 if (
+                                     self.agent is not None
++                                    and _same_turn_origin
+                                     and getattr(
+                                         self.agent,
+                                         "_supports_active_turn_redirect",
+diff --git a/gateway/platforms/api_server_runs.py b/gateway/platforms/api_server_runs.py
+index f687217..5b4ed25 100644
+--- a/gateway/platforms/api_server_runs.py
++++ b/gateway/platforms/api_server_runs.py
+@@ -1354,6 +1354,29 @@ async def _handle_steer_run(
+             status=400,
+         )
+ 
++    from agent.message_origin import (
++        API_USER,
++        PEER_RUN_CLAIM,
++        build_message_origin_proof,
++        busy_input_origin_matches,
++    )
++
++    incoming_origin_proof, origin_error = self._verify_peer_origin_request(
++        request, expected_claim=PEER_RUN_CLAIM
++    )
++    if origin_error is not None:
++        return origin_error
++    if incoming_origin_proof is None:
++        incoming_origin_proof = build_message_origin_proof(API_USER)
++    if not busy_input_origin_matches(agent, incoming_origin_proof):
++        return web.json_response(
++            _openai_error(
++                "Steer input belongs to a different message origin; submit it as a new run.",
++                code="cross_origin_busy_input",
++            ),
++            status=409,
++        )
++
+     try:
+         accepted = bool(agent.steer(steer_text))
+     except Exception as exc:
+diff --git a/gateway/run.py b/gateway/run.py
+index de36700..b2a7790 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -63,6 +63,12 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+ from agent.compaction_display import project_compaction_message_for_display
+ from agent.i18n import t
+ from agent.interrupt_compat import request_hard_interrupt
++from agent.message_origin import (
++    busy_input_origin_matches,
++    message_origin_for_gateway_event,
++    message_origin_for_platform,
++    normalize_message_origin_proof,
++)
+ from agent.turn_context import (
+     compression_made_progress,
+ )
+@@ -6605,6 +6611,15 @@ class TurnRunner:
+         # tool_progress mode. Mattermost needs an explicit per-platform
+         # opt-in so global scratch-text display does not leak into threads.
+         agent.thinking_progress = ctx._thinking_enabled
++        # Bind this turn's provenance before publishing the reusable agent to
++        # busy-input handlers.  A cached agent still carries the prior turn's
++        # proof until run_conversation reaches its prologue; exposing that stale
++        # value would let a human correction merge into a just-starting wakeup.
++        agent._current_message_origin_proof = (
++            normalize_message_origin_proof(ctx.message_origin_proof)
++            if ctx.message_origin_proof is not None
++            else message_origin_for_platform(ctx.source.platform)
++        )
+         # Store agent reference for interrupt support
+         ctx.agent_holder[0] = agent
+         # Wire the platform thread-rename lane onto the agent, because the
+@@ -11067,6 +11082,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+ 
+         _busy_state = self._peek_session_state(session_key)
+         running_agent = _busy_state.turn.agent if _busy_state else None
++        incoming_origin_proof = message_origin_for_gateway_event(event)
++        same_turn_origin = busy_input_origin_matches(
++            running_agent, incoming_origin_proof
++        )
+ 
+         busy_text_mode = self._effective_busy_text_mode(event.source)
+         if (
+@@ -11124,6 +11143,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             )
+             can_steer = (
+                 steer_text
++                and same_turn_origin
+                 and (
+                     (
+                         event.message_type == MessageType.TEXT
+@@ -11147,6 +11167,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 effective_mode = "queue"
+         elif (
+             effective_mode == "interrupt"
++            and same_turn_origin
+             and event.message_type == MessageType.TEXT
+             and not event.media_urls
+             and not event.media_types
+@@ -11205,7 +11226,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     )
+                 elif not _interrupt_text and _media_urls:
+                     _interrupt_text = _build_media_placeholder(event)
+-                running_agent.interrupt(_interrupt_text)
++                running_agent.interrupt(
++                    _interrupt_text if same_turn_origin else None
++                )
+             except Exception:
+                 pass  # don't let interrupt failure block the ack
+ 
+@@ -18022,7 +18045,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 )
+                 self._enqueue_fifo(quick_key, queued_event, adapter)
+             return "Agent still starting — /steer queued for the next turn."
+-        if running_agent and hasattr(running_agent, "steer"):
++        if (
++            running_agent
++            and busy_input_origin_matches(
++                running_agent, message_origin_for_gateway_event(event)
++            )
++            and hasattr(running_agent, "steer")
++        ):
+             try:
+                 accepted = running_agent.steer(steer_text)
+             except Exception as exc:
+@@ -18799,10 +18828,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     if queue_during_drain
+                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                 )
++            same_turn_origin = busy_input_origin_matches(
++                running_agent, message_origin_for_gateway_event(event)
++            )
+             if effective_busy_input_mode == "queue":
+                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
+                 self._queue_or_replace_pending_event(_quick_key, event)
+                 return None
++            if not same_turn_origin:
++                self._queue_or_replace_pending_event(_quick_key, event)
++                if (
++                    effective_busy_input_mode == "interrupt"
++                    and not self._agent_has_active_subagents(running_agent)
++                    and not await self._session_has_compression_in_flight(
++                        _quick_key
++                    )
++                ):
++                    running_agent.interrupt()
++                return None
+             if effective_busy_input_mode == "steer":
+                 # Steer mode: inject text into the running agent mid-run via
+                 # agent.steer().  Falls back to queue semantics if the payload
+diff --git a/tests/acp_adapter/test_acp_commands.py b/tests/acp_adapter/test_acp_commands.py
+index ff51128..c6e1f76 100644
+--- a/tests/acp_adapter/test_acp_commands.py
++++ b/tests/acp_adapter/test_acp_commands.py
+@@ -4,6 +4,12 @@ from types import ModuleType, SimpleNamespace
+ import pytest
+ from acp.schema import TextContentBlock
+ 
++from agent.message_origin import (
++    API_USER,
++    CRON_AGENT,
++    build_message_origin_proof,
++)
++
+ from acp_adapter.server import HermesACPAgent
+ from acp_adapter.session import SessionManager
+ 
+@@ -20,6 +26,7 @@ class FakeAgent:
+         self.steers = []
+         self.redirects = []
+         self.runs = []
++        self._current_message_origin_proof = build_message_origin_proof(API_USER)
+ 
+     def steer(self, text):
+         self.steers.append(text)
+@@ -135,6 +142,40 @@ async def test_acp_steer_slash_command_injects_into_running_agent():
+     assert fake.runs == []
+ 
+ 
++@pytest.mark.asyncio
++async def test_acp_human_prompt_queues_behind_a_scheduled_turn():
++    acp_agent, state, fake, _conn = make_agent_and_state()
++    state.is_running = True
++    fake._current_message_origin_proof = build_message_origin_proof(CRON_AGENT)
++
++    response = await acp_agent.prompt(
++        session_id=state.session_id,
++        prompt=[TextContentBlock(type="text", text="human correction")],
++    )
++
++    assert response.stop_reason == "end_turn"
++    assert fake.redirects == []
++    assert fake.runs == []
++    assert state.queued_prompts == ["human correction"]
++
++
++@pytest.mark.asyncio
++async def test_acp_steer_command_queues_behind_a_scheduled_turn():
++    acp_agent, state, fake, _conn = make_agent_and_state()
++    state.is_running = True
++    fake._current_message_origin_proof = build_message_origin_proof(CRON_AGENT)
++
++    response = await acp_agent.prompt(
++        session_id=state.session_id,
++        prompt=[TextContentBlock(type="text", text="/steer human correction")],
++    )
++
++    assert response.stop_reason == "end_turn"
++    assert fake.steers == []
++    assert fake.runs == []
++    assert state.queued_prompts == ["human correction"]
++
++
+ 
+ 
+ 
+@@ -165,5 +206,3 @@ async def test_acp_cancel_publishes_hard_stop_while_holding_runtime_lock():
+ 
+ 
+ 
+-
+-
+diff --git a/tests/agent/test_message_origin.py b/tests/agent/test_message_origin.py
+index 11f15ac..4e300f7 100644
+--- a/tests/agent/test_message_origin.py
++++ b/tests/agent/test_message_origin.py
+@@ -17,10 +17,12 @@ from agent.message_origin import (
+     PEER_DM,
+     ROOM_DISPATCH,
+     SCHEDULED,
++    busy_input_origin_matches,
+     build_message_origin_proof,
+     classify_message_origin_group,
+     message_origin_for_platform,
+     normalize_message_origin_proof,
++    stamp_message_origin,
+     stamp_turn_message_origins,
+     take_cli_message_origin_proof,
+ )
+@@ -69,6 +71,7 @@ def test_execution_surfaces_map_without_using_session_labels():
+     assert message_origin_for_platform("api_server") == build_message_origin_proof(
+         API_USER
+     )
++    assert message_origin_for_platform("acp") == build_message_origin_proof(API_USER)
+     assert message_origin_for_platform("cron") == build_message_origin_proof(
+         CRON_AGENT
+     )
+@@ -76,6 +79,39 @@ def test_execution_surfaces_map_without_using_session_labels():
+         assert message_origin_for_platform(unproved) is None
+ 
+ 
++def test_busy_input_may_only_mutate_the_same_verified_writer():
++    human = build_message_origin_proof(CLI_USER)
++    scheduled = build_message_origin_proof(CRON_BOT_CHAT)
++
++    class Agent:
++        _current_message_origin_proof = human
++
++    assert busy_input_origin_matches(Agent(), human) is True
++    assert busy_input_origin_matches(Agent(), scheduled) is False
++    assert busy_input_origin_matches(
++        Agent(), build_message_origin_proof(ROOM_DISPATCH)
++    ) is False
++    assert busy_input_origin_matches(Agent(), None) is False
++    Agent._current_message_origin_proof = None
++    assert busy_input_origin_matches(Agent(), human) is False
++
++
++def test_stamping_is_idempotent_but_rejects_cross_origin_relabeling():
++    human = build_message_origin_proof(CLI_USER)
++    scheduled = build_message_origin_proof(CRON_BOT_CHAT)
++    message = {"role": "user", "content": "visible"}
++
++    stamp_message_origin(message, human)
++    stamp_message_origin(message, human)
++    assert message["_origin_proof"] == human
++    try:
++        stamp_message_origin(message, scheduled)
++    except ValueError as exc:
++        assert "conflicts" in str(exc)
++    else:
++        raise AssertionError("cross-origin durable relabeling was accepted")
++
++
+ def test_cron_bot_chat_claim_is_one_shot_and_closed():
+     env = {CLI_ORIGIN_ENV: CRON_BOT_CHAT_CLAIM}
+     assert take_cli_message_origin_proof(env) == build_message_origin_proof(
+@@ -193,6 +229,51 @@ def test_mixed_bot_chat_proofs_survive_durable_read_and_restart(tmp_path):
+     ]
+ 
+ 
++def test_two_origins_remain_two_verified_groups_after_compaction_and_restart(
++    tmp_path,
++):
++    path = tmp_path / "state.db"
++    store = SessionDB(path)
++    store.create_session("mixed", source="qq")
++    human = build_message_origin_proof(CLI_USER)
++    scheduled = build_message_origin_proof(CRON_BOT_CHAT)
++    for index, (proof, label) in enumerate(
++        ((scheduled, "wake"), (human, "human"))
++    ):
++        store.append_message(
++            "mixed", "user", label, timestamp=index * 2, origin_proof=proof
++        )
++        store.append_message(
++            "mixed",
++            "assistant",
++            f"{label}-answer",
++            timestamp=index * 2 + 1,
++            origin_proof=proof,
++        )
++    store.archive_and_compact(
++        "mixed", store.get_messages("mixed"), tail_count=2
++    )
++    store.close()
++
++    reopened = SessionDB(path, read_only=True)
++    try:
++        rows = reopened.get_messages_time_window(
++            "mixed",
++            start_timestamp=0,
++            end_timestamp=4,
++            include_compacted=True,
++            max_physical_rows=8,
++        )["messages"]
++    finally:
++        reopened.close()
++
++    groups = [rows[index : index + 2] for index in range(0, len(rows), 2)]
++    assert [classify_message_origin_group(group) for group in groups] == [
++        (SCHEDULED, "verified"),
++        (HUMAN, "verified"),
++    ]
++
++
+ def test_physical_clone_conflict_fails_only_its_group():
+     human = build_message_origin_proof(CLI_USER)
+     scheduled = build_message_origin_proof(CRON_BOT_CHAT)
+diff --git a/tests/cli/test_cli_steer_busy_path.py b/tests/cli/test_cli_steer_busy_path.py
+index 071c741..c4d7e32 100644
+--- a/tests/cli/test_cli_steer_busy_path.py
++++ b/tests/cli/test_cli_steer_busy_path.py
+@@ -25,6 +25,12 @@ import importlib
+ import sys
+ from unittest.mock import MagicMock, patch
+ 
++from agent.message_origin import (
++    CLI_USER,
++    CRON_AGENT,
++    build_message_origin_proof,
++)
++
+ 
+ def _make_cli():
+     """Create a HermesCLI instance with prompt_toolkit stubbed out."""
+@@ -113,6 +119,9 @@ class TestSteerBusyPathDispatch:
+         cli = _make_cli()
+         cli._agent_running = True
+         cli.agent = MagicMock()
++        cli.agent._current_message_origin_proof = build_message_origin_proof(
++            CLI_USER
++        )
+         cli.agent.steer = MagicMock(return_value=True)
+         # Make sure the idle-path fallback would be observable if taken
+         cli._pending_input = MagicMock()
+@@ -139,6 +148,20 @@ class TestSteerBusyPathDispatch:
+         # It puts the payload in the queue as a normal next-turn message
+         cli._pending_input.put.assert_called_once_with("would-be-next-turn")
+ 
++    def test_cli_human_steer_queues_behind_scheduled_turn(self):
++        cli = _make_cli()
++        cli._agent_running = True
++        cli.agent = MagicMock()
++        cli.agent._current_message_origin_proof = build_message_origin_proof(
++            CRON_AGENT
++        )
++        cli._pending_input = MagicMock()
++
++        cli.process_command("/steer human correction")
++
++        cli.agent.steer.assert_not_called()
++        cli._pending_input.put.assert_called_once_with("human correction")
++
+ 
+ if __name__ == "__main__":  # pragma: no cover
+     import pytest
+diff --git a/tests/gateway/test_api_server_runs.py b/tests/gateway/test_api_server_runs.py
+index 2a23e97..d02c3cd 100644
+--- a/tests/gateway/test_api_server_runs.py
++++ b/tests/gateway/test_api_server_runs.py
+@@ -20,6 +20,8 @@ from aiohttp import web
+ from aiohttp.test_utils import TestClient, TestServer
+ 
+ from agent.message_origin import (
++    API_USER,
++    CRON_AGENT,
+     INTERNAL_ORIGIN_HEADER,
+     PEER_RUN,
+     PEER_RUN_CLAIM,
+@@ -507,6 +509,9 @@ class TestSteerRun:
+     async def test_steer_running_agent(self, adapter):
+         app = _create_runs_app(adapter)
+         agent = MagicMock()
++        agent._current_message_origin_proof = build_message_origin_proof(
++            API_USER
++        )
+         agent.steer.return_value = True
+         queue = asyncio.Queue()
+         adapter._active_run_agents["run_123"] = agent
+@@ -530,6 +535,26 @@ class TestSteerRun:
+         assert event["run_id"] == "run_123"
+         assert event["accepted"] is True
+ 
++    @pytest.mark.asyncio
++    async def test_api_human_cannot_steer_a_scheduled_run(self, adapter):
++        app = _create_runs_app(adapter)
++        agent = MagicMock()
++        agent._current_message_origin_proof = build_message_origin_proof(
++            CRON_AGENT
++        )
++        adapter._active_run_agents["run_123"] = agent
++        adapter._set_run_status("run_123", "running")
++
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(
++                "/v1/runs/run_123/steer", json={"input": "human correction"}
++            )
++            payload = await resp.json()
++
++        assert resp.status == 409
++        assert payload["error"]["code"] == "cross_origin_busy_input"
++        agent.steer.assert_not_called()
++
+     @pytest.mark.asyncio
+     async def test_steer_nonexistent_run_returns_404(self, adapter):
+         app = _create_runs_app(adapter)
+diff --git a/tests/gateway/test_busy_session_ack.py b/tests/gateway/test_busy_session_ack.py
+index c9b5442..cf7eeca 100644
+--- a/tests/gateway/test_busy_session_ack.py
++++ b/tests/gateway/test_busy_session_ack.py
+@@ -31,6 +31,11 @@ from gateway.platforms.base import (
+     SessionSource,
+     build_session_key,
+ )
++from agent.message_origin import (
++    GATEWAY_USER,
++    GATEWAY_WAKEUP,
++    build_message_origin_proof,
++)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -91,6 +96,14 @@ def _make_adapter(platform_val="telegram"):
+     return adapter
+ 
+ 
++def _same_origin_agent():
++    agent = MagicMock()
++    agent._current_message_origin_proof = build_message_origin_proof(
++        GATEWAY_USER
++    )
++    return agent
++
++
+ # ---------------------------------------------------------------------------
+ # Tests
+ # ---------------------------------------------------------------------------
+@@ -120,7 +133,7 @@ class TestBusySessionAck:
+         sk = build_session_key(source)
+         runner.adapters[source.platform] = adapter
+ 
+-        agent = MagicMock()
++        agent = _same_origin_agent()
+         agent.get_activity_summary.return_value = {
+             "seconds_since_activity": 0.0,
+         }
+@@ -159,7 +172,7 @@ class TestBusySessionAck:
+         sk = build_session_key(event.source)
+ 
+         # Simulate running agent
+-        agent = MagicMock()
++        agent = _same_origin_agent()
+         agent.get_activity_summary.return_value = {
+             "api_call_count": 21,
+             "max_iterations": 60,
+@@ -204,7 +217,7 @@ class TestBusySessionAck:
+         sk = build_session_key(event.source)
+         runner.adapters[event.source.platform] = adapter
+ 
+-        agent = MagicMock()
++        agent = _same_origin_agent()
+         agent.steer = MagicMock(return_value=True)
+         runner._running_agents[sk] = agent
+ 
+@@ -225,6 +238,40 @@ class TestBusySessionAck:
+         assert "Steered" in content or "steer" in content.lower()
+         assert "Interrupting" not in content
+ 
++    @pytest.mark.asyncio
++    @pytest.mark.parametrize("mode", ["steer", "interrupt"])
++    async def test_human_followup_cannot_merge_into_scheduled_wakeup_turn(
++        self, monkeypatch, mode
++    ):
++        import gateway.run as _gr
++
++        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
++        runner, _sentinel = _make_runner()
++        runner._busy_input_mode = mode
++        adapter = _make_adapter(platform_val="qq")
++        event = _make_event(text="这是我本人补充的", platform_val="qq")
++        sk = build_session_key(event.source)
++        runner.adapters[event.source.platform] = adapter
++
++        agent = MagicMock()
++        agent._supports_active_turn_redirect = True
++        agent._current_message_origin_proof = build_message_origin_proof(
++            GATEWAY_WAKEUP
++        )
++        agent.steer.return_value = True
++        agent.redirect.return_value = True
++        runner._running_agents[sk] = agent
++
++        await runner._handle_active_session_busy_message(event, sk)
++
++        agent.steer.assert_not_called()
++        agent.redirect.assert_not_called()
++        assert adapter._pending_messages[sk] is event
++        if mode == "interrupt":
++            agent.interrupt.assert_called_once_with(None)
++        else:
++            agent.interrupt.assert_not_called()
++
+     @pytest.mark.asyncio
+     async def test_steer_mode_transcribes_voice_before_injection(self, monkeypatch):
+         """A busy voice follow-up is transcribed and steered, never queued."""
+@@ -247,7 +294,7 @@ class TestBusySessionAck:
+         sk = build_session_key(event.source)
+         runner.adapters[event.source.platform] = adapter
+ 
+-        agent = MagicMock()
++        agent = _same_origin_agent()
+         agent.steer = MagicMock(return_value=True)
+         runner._running_agents[sk] = agent
+ 
+@@ -275,7 +322,7 @@ class TestBusySessionAck:
+         sk = build_session_key(event.source)
+         runner.adapters[event.source.platform] = adapter
+ 
+-        agent = MagicMock()
++        agent = _same_origin_agent()
+         agent.steer = MagicMock(return_value=False)  # rejected
+         runner._running_agents[sk] = agent
+ 
+@@ -347,7 +394,7 @@ class TestBusySessionAck:
+         sk = build_session_key(first.source)
+         runner.adapters[shared_platform] = adapter
+ 
+-        agent = MagicMock()
++        agent = _same_origin_agent()
+         agent._active_children = []  # real list → not demoted to queue
+         runner._running_agents[sk] = agent
+ 
+@@ -381,7 +428,7 @@ class TestBusySessionAck:
+         event = _make_event(text="yo")
+         sk = build_session_key(event.source)
+ 
+-        agent = MagicMock()
++        agent = _same_origin_agent()
+         agent.get_activity_summary.return_value = {
+             "api_call_count": 21,
+             "max_iterations": 60,
+@@ -423,7 +470,7 @@ class TestBusySessionOnboardingHint:
+         event = _make_event(text="ping")
+         sk = build_session_key(event.source)
+ 
+-        agent = MagicMock()
++        agent = _same_origin_agent()
+         agent.get_activity_summary.return_value = {
+             "api_call_count": 3, "max_iterations": 60,
+             "current_tool": None, "last_activity_ts": time.time(),
+@@ -462,12 +509,10 @@ class TestLongRunningNotificationOwnership:
+         runner = object.__new__(GatewayRunner)
+         runner._running_agents = {}
+ 
+-        original_agent = MagicMock()
+-        replacement_agent = MagicMock()
++        original_agent = _same_origin_agent()
++        replacement_agent = _same_origin_agent()
+         runner._running_agents["sess"] = replacement_agent
+ 
+         assert runner._should_emit_long_running_notification(
+             "sess", original_agent, executor_task=None
+         ) is False
+-
+-
+diff --git a/tests/gateway/test_multiplex_busy_input_mode.py b/tests/gateway/test_multiplex_busy_input_mode.py
+index 55b3930..ce429fe 100644
+--- a/tests/gateway/test_multiplex_busy_input_mode.py
++++ b/tests/gateway/test_multiplex_busy_input_mode.py
+@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ import pytest
+ 
++from agent.message_origin import GATEWAY_USER, build_message_origin_proof
+ from gateway.config import GatewayConfig, Platform, PlatformConfig
+ from gateway.platforms.base import (
+     BasePlatformAdapter,
+@@ -126,6 +127,9 @@ async def test_secondary_profile_busy_mode_controls_live_busy_behavior(
+     event = _event(profile="research")
+     session_key = runner._session_key_for_source(event.source)
+     agent = MagicMock()
++    agent._current_message_origin_proof = build_message_origin_proof(
++        GATEWAY_USER
++    )
+     agent._active_children = []
+     agent.steer.return_value = True
+     runner._running_agents[session_key] = agent
+@@ -163,6 +167,9 @@ async def test_secondary_profile_busy_mode_controls_priority_path(
+     event = _event(profile="research")
+     session_key = runner._session_key_for_source(event.source)
+     agent = MagicMock()
++    agent._current_message_origin_proof = build_message_origin_proof(
++        GATEWAY_USER
++    )
+     agent._active_children = []
+     agent.steer.return_value = True
+     runner._running_agents[session_key] = agent
+@@ -277,6 +284,9 @@ async def test_secondary_profile_busy_mode_controls_priority_restart_drain(
+     event = _event(profile="research")
+     session_key = runner._session_key_for_source(event.source)
+     agent = MagicMock()
++    agent._current_message_origin_proof = build_message_origin_proof(
++        GATEWAY_USER
++    )
+     agent._active_children = []
+     runner._running_agents[session_key] = agent
+ 
+@@ -313,6 +323,9 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
+     routed_source = _event(profile="research").source
+     routed_session_key = runner._session_key_for_source(routed_source)
+     agent = MagicMock()
++    agent._current_message_origin_proof = build_message_origin_proof(
++        GATEWAY_USER
++    )
+     agent._active_children = []
+     agent.steer.return_value = True
+     runner._running_agents[routed_session_key] = agent
+@@ -336,6 +349,9 @@ async def test_secondary_legacy_busy_text_mode_is_profile_specific(tmp_path):
+     event = _event(profile="research")
+     session_key = runner._session_key_for_source(event.source)
+     agent = MagicMock()
++    agent._current_message_origin_proof = build_message_origin_proof(
++        GATEWAY_USER
++    )
+     agent._active_children = []
+     runner._running_agents[session_key] = agent
+ 
+@@ -354,6 +370,9 @@ async def test_default_busy_mode_is_unchanged_by_secondary_profile(tmp_path, mon
+     event = _event(profile=None)
+     session_key = runner._session_key_for_source(event.source)
+     agent = MagicMock()
++    agent._current_message_origin_proof = build_message_origin_proof(
++        GATEWAY_USER
++    )
+     agent._active_children = []
+     runner._running_agents[session_key] = agent
+ 
+diff --git a/tests/gateway/test_steer_command.py b/tests/gateway/test_steer_command.py
+index 6dbe368..fbcc906 100644
+--- a/tests/gateway/test_steer_command.py
++++ b/tests/gateway/test_steer_command.py
+@@ -22,6 +22,11 @@ import pytest
+ from gateway.config import GatewayConfig, Platform, PlatformConfig
+ from gateway.platforms.base import MessageEvent
+ from gateway.session import SessionEntry, SessionSource, build_session_key
++from agent.message_origin import (
++    GATEWAY_USER,
++    GATEWAY_WAKEUP,
++    build_message_origin_proof,
++)
+ 
+ 
+ def _make_source() -> SessionSource:
+@@ -43,6 +48,14 @@ def _make_event(text: str, channel_context: str | None = None) -> MessageEvent:
+     )
+ 
+ 
++def _same_origin_agent():
++    agent = MagicMock()
++    agent._current_message_origin_proof = build_message_origin_proof(
++        GATEWAY_USER
++    )
++    return agent
++
++
+ def _make_runner(session_entry: SessionEntry):
+     from gateway.run import GatewayRunner
+ 
+@@ -98,7 +111,7 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
+     runner, adapter = _make_runner(_session_entry())
+     sk = build_session_key(_make_source())
+ 
+-    running_agent = MagicMock()
++    running_agent = _same_origin_agent()
+     running_agent.steer.return_value = True
+     runner._running_agents[sk] = running_agent
+ 
+@@ -117,6 +130,27 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
+     assert adapter._pending_messages == {}
+ 
+ 
++@pytest.mark.asyncio
++async def test_steer_command_queues_behind_cross_origin_wakeup_turn():
++    runner, adapter = _make_runner(_session_entry())
++    sk = build_session_key(_make_source())
++    running_agent = MagicMock()
++    running_agent._current_message_origin_proof = build_message_origin_proof(
++        GATEWAY_WAKEUP
++    )
++    running_agent.get_activity_summary.return_value = {
++        "seconds_since_activity": 0.0,
++        "current_tool": "shell",
++    }
++    runner._running_agents[sk] = running_agent
++
++    result = await runner._handle_message(_make_event("/steer human correction"))
++
++    assert result is not None and "queued" in result.lower()
++    running_agent.steer.assert_not_called()
++    assert adapter._pending_messages[sk].text == "human correction"
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("elapsed", [float("nan"), True, "not-a-number"])
+ async def test_steer_reaches_ancient_turn_via_fresh_timestamp_fallback(
+@@ -124,7 +158,7 @@ async def test_steer_reaches_ancient_turn_via_fresh_timestamp_fallback(
+ ):
+     runner, _adapter = _make_runner(_session_entry())
+     sk = build_session_key(_make_source())
+-    running_agent = MagicMock()
++    running_agent = _same_origin_agent()
+     running_agent.steer.return_value = True
+     running_agent.get_activity_summary.return_value = {
+         "seconds_since_activity": elapsed,
+diff --git a/tests/gateway/test_subagent_protection_30170.py b/tests/gateway/test_subagent_protection_30170.py
+index 3849326..4b98f3a 100644
+--- a/tests/gateway/test_subagent_protection_30170.py
++++ b/tests/gateway/test_subagent_protection_30170.py
+@@ -55,6 +55,10 @@ from gateway.platforms.base import (  # noqa: E402
+     build_session_key,
+ )
+ from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL  # noqa: E402
++from agent.message_origin import (  # noqa: E402
++    GATEWAY_USER,
++    build_message_origin_proof,
++)
+ 
+ 
+ # ──────────────────────────────────────────────────────────────────────
+@@ -108,6 +112,9 @@ def _make_parent_with_subagents(
+ ) -> MagicMock:
+     """A MagicMock shaped like an AIAgent that currently owns *children* subagents."""
+     parent = MagicMock()
++    parent._current_message_origin_proof = build_message_origin_proof(
++        GATEWAY_USER
++    )
+     parent._active_children = [MagicMock() for _ in range(children)]
+     parent._active_children_lock = threading.Lock() if with_lock else None
+     parent.get_activity_summary.return_value = {
+@@ -121,6 +128,9 @@ def _make_parent_with_subagents(
+ def _make_parent_no_subagents() -> MagicMock:
+     """A MagicMock shaped like an AIAgent that is NOT delegating."""
+     parent = MagicMock()
++    parent._current_message_origin_proof = build_message_origin_proof(
++        GATEWAY_USER
++    )
+     parent._active_children = []
+     parent._active_children_lock = threading.Lock()
+     parent.get_activity_summary.return_value = {
+@@ -241,4 +251,3 @@ class TestBusyHandlerDemotesInterruptForSubagents:
+ 
+         parent.steer.assert_called_once_with("course-correct")
+         parent.interrupt.assert_not_called()
+-
+diff --git a/tests/gateway/test_turn_context.py b/tests/gateway/test_turn_context.py
+index 48bfbf8..93090d5 100644
+--- a/tests/gateway/test_turn_context.py
++++ b/tests/gateway/test_turn_context.py
+@@ -18,6 +18,7 @@ import pytest
+ from gateway.config import Platform
+ from gateway.session import SessionSource
+ from gateway.turn_context import TurnContext
++from agent.message_origin import GATEWAY_USER, build_message_origin_proof
+ 
+ 
+ def _make_runner(ctx):
+@@ -85,6 +86,9 @@ class TestTurnRunner:
+                 self.session_completion_tokens = 0
+ 
+             def run_conversation(self, _message, **_kwargs):
++                assert self._current_message_origin_proof == (
++                    build_message_origin_proof(GATEWAY_USER)
++                )
+                 return {
+                     "final_response": "Context length exceeded. Cannot compress further.",
+                     "failed": True,
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 99572b5..efac53e 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -4631,8 +4631,19 @@ def test_startup_runtime_does_not_call_network_detector(monkeypatch):
+ 
+ 
+ def _session(agent=None, **extra):
++    resolved_agent = agent if agent is not None else types.SimpleNamespace()
++    try:
++        agent_vars = vars(resolved_agent)
++    except TypeError:
++        agent_vars = None
++    if agent_vars is not None and "_current_message_origin_proof" not in agent_vars:
++        from agent.message_origin import TUI_USER, build_message_origin_proof
++
++        resolved_agent._current_message_origin_proof = build_message_origin_proof(
++            TUI_USER
++        )
+     return {
+-        "agent": agent if agent is not None else types.SimpleNamespace(),
++        "agent": resolved_agent,
+         "session_key": "session-key",
+         "history": [],
+         "history_lock": threading.Lock(),
+@@ -11662,6 +11673,32 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
+     assert "interrupt_called" not in calls  # must NOT interrupt
+ 
+ 
++def test_session_steer_queues_when_active_turn_has_a_different_origin():
++    from agent.message_origin import CRON_AGENT, build_message_origin_proof
++
++    calls = []
++    agent = types.SimpleNamespace(
++        _current_message_origin_proof=build_message_origin_proof(CRON_AGENT),
++        steer=lambda text: calls.append(text) or True,
++    )
++    session = _session(agent=agent, running=True)
++    server._sessions["sid"] = session
++    try:
++        resp = server.handle_request(
++            {
++                "id": "1",
++                "method": "session.steer",
++                "params": {"session_id": "sid", "text": "human correction"},
++            }
++        )
++    finally:
++        server._sessions.pop("sid", None)
++
++    assert resp["result"]["status"] == "queued"
++    assert calls == []
++    assert session["queued_prompt"]["text"] == "human correction"
++
++
+ def test_session_steer_rejects_empty_text():
+     server._sessions["sid"] = _session(
+         agent=types.SimpleNamespace(steer=lambda t: True)
+@@ -16199,6 +16236,26 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
+         server._sessions.pop("sid-live", None)
+ 
+ 
++@pytest.mark.parametrize("mode", ["steer", "interrupt"])
++def test_busy_tui_prompt_queues_behind_cross_origin_turn(monkeypatch, mode):
++    from agent.message_origin import CRON_AGENT, build_message_origin_proof
++
++    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: mode)
++    agent = Mock()
++    agent._supports_active_turn_redirect = True
++    agent._current_message_origin_proof = build_message_origin_proof(CRON_AGENT)
++    session = _session(agent=agent, running=True)
++
++    response = server._handle_busy_submit(
++        "submit", "sid-cross-origin", session, "human correction", object()
++    )
++
++    assert response["result"]["status"] == "queued"
++    assert session["queued_prompt"]["text"] == "human correction"
++    agent.steer.assert_not_called()
++    agent.redirect.assert_not_called()
++
++
+ def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
+     monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+     server._sessions["sid-a"] = _session(
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 8a3d113..239b065 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -3625,6 +3625,16 @@ def _(rid, params: dict) -> dict:
+     agent = session.get("agent")
+     if agent is None or not hasattr(agent, "steer"):
+         return _err(rid, 4010, "agent does not support steer")
++    from agent.message_origin import (
++        busy_input_origin_matches,
++        message_origin_for_platform,
++    )
++
++    if not busy_input_origin_matches(agent, message_origin_for_platform("tui")):
++        with session["history_lock"]:
++            _enqueue_prompt(session, text, current_transport() or _stdio_transport)
++            session["last_active"] = time.time()
++        return _ok(rid, {"status": "queued", "text": text})
+     try:
+         accepted = agent.steer(text)
+     except Exception as exc:
+@@ -3669,6 +3679,16 @@ def _(rid, params: dict) -> dict:
+         or not hasattr(agent, "redirect")
+     ):
+         return _err(rid, 4010, "agent does not support active-turn redirect")
++    from agent.message_origin import (
++        busy_input_origin_matches,
++        message_origin_for_platform,
++    )
++
++    if not busy_input_origin_matches(agent, message_origin_for_platform("tui")):
++        with session["history_lock"]:
++            _enqueue_prompt(session, text, current_transport() or _stdio_transport)
++            session["last_active"] = time.time()
++        return _ok(rid, {"status": "queued", "text": text})
+     try:
+         accepted = agent.redirect(text)
+     except Exception as exc:
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 7d72f7e..7a67933 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -806,7 +806,18 @@ def _(rid, params: dict) -> dict:
+         if not arg:
+             return _err(rid, 4004, "usage: /steer <prompt>")
+         agent = session.get("agent") if session else None
+-        if agent and hasattr(agent, "steer"):
++        from agent.message_origin import (
++            busy_input_origin_matches,
++            message_origin_for_platform,
++        )
++
++        if (
++            agent
++            and busy_input_origin_matches(
++                agent, message_origin_for_platform("tui")
++            )
++            and hasattr(agent, "steer")
++        ):
+             try:
+                 accepted = agent.steer(arg)
+                 if accepted:
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 10567e0..4ece598 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -10229,7 +10229,22 @@ def _handle_busy_submit(
+             session["attached_images"] = []
+     text_only = not image_paths and _is_text_only_busy_payload(text)
+     plain_text = _coerce_message_text(text).strip() if text_only else ""
+-    if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
++    from agent.message_origin import (
++        busy_input_origin_matches,
++        message_origin_for_platform,
++    )
++
++    same_turn_origin = busy_input_origin_matches(
++        agent, message_origin_for_platform("tui")
++    )
++    if (
++        mode == "steer"
++        and same_turn_origin
++        and text_only
++        and plain_text
++        and agent is not None
++        and hasattr(agent, "steer")
++    ):
+         try:
+             if agent.steer(plain_text):
+                 with session["history_lock"]:
+@@ -10244,6 +10259,7 @@ def _handle_busy_submit(
+     # the proven interrupt + queue path below.
+     if (
+         mode == "interrupt"
++        and same_turn_origin
+         and text_only
+         and plain_text
+         and agent is not None

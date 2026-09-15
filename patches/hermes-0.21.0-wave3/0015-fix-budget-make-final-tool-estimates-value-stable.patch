@@ -1,0 +1,246 @@
+From e4676c1e6245fd4296d0cd6540e4b5517ecd9536 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 00:40:39 +0800
+Subject: [PATCH] fix(budget): make final tool estimates value stable
+
+---
+ agent/model_metadata.py            | 74 +++++++++++++++----------
+ tests/agent/test_model_metadata.py | 87 ++++++++++++++++++++++++++++++
+ tests/test_request_overlay.py      |  4 +-
+ 3 files changed, 134 insertions(+), 31 deletions(-)
+
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 2522a7c..9883551 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -4299,7 +4299,13 @@ def _tool_name_for_cache(tool: Any) -> str:
+ 
+ 
+ def _provider_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int | None:
+-    """Estimate known provider tool shapes or reject unknown schema buckets."""
++    """Value-stable estimate for known final provider tool payloads.
++
++    Final transport settlement must reflect the body about to reach the SDK.
++    It therefore deliberately bypasses the identity cache used by earlier
++    preflight estimates and applies the CJK-aware text estimator to the
++    serialized schema values.
++    """
+ 
+     for tool in tools:
+         if not isinstance(tool, dict):
+@@ -4326,30 +4332,16 @@ def _provider_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int | None:
+                 return None
+         if schema_keys - allowed_schema_keys:
+             return None
+-    return _estimate_tools_tokens_rough(tools)
+-
+-
+-def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
+-    if not tools:
+-        return 0
++    return sum(
++        estimate_tokens_rough(part)
++        for part in _tool_token_text_parts(tools)
++    )
+ 
+-    # Cache by list identity. Tools are rebuilt rarely (toolset changes),
+-    # but token estimates are requested frequently (preflight, compaction).
+-    key = id(tools)
+-    n = len(tools)
+-    first = _tool_name_for_cache(tools[0]) if n else ""
+-    last = _tool_name_for_cache(tools[-1]) if n else ""
+ 
+-    cached = _TOOLS_TOKENS_CACHE.get(key)
+-    if cached is not None:
+-        cached_n, cached_first, cached_last, cached_tokens = cached
+-        if cached_n == n and cached_first == first and cached_last == last:
+-            return cached_tokens
++def _tool_token_text_parts(tools: List[Dict[str, Any]]) -> List[str]:
++    """Return the provider-visible text/schema parts of known tool shapes."""
+ 
+-    # Fast, stable rough estimate: sum lengths of the major schema fields.
+-    # This avoids the pathological `str(tools)` path while still scaling with
+-    # schema size (descriptions + parameters dominate).
+-    total_chars = 0
++    parts: List[str] = []
+     for tool in tools:
+         if not isinstance(tool, dict):
+             continue
+@@ -4376,18 +4368,19 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
+             params = params or {}
+ 
+         if isinstance(name, str):
+-            total_chars += len(name)
++            parts.append(name)
+         if isinstance(desc, str):
+-            total_chars += len(desc)
+-        # Parameters can be nested; JSON is closer to over-the-wire size than repr().
++            parts.append(desc)
+         try:
+-            total_chars += len(json.dumps(params, ensure_ascii=False, separators=(",", ":")))
++            parts.append(
++                json.dumps(params, ensure_ascii=False, separators=(",", ":"))
++            )
+         except Exception:
+-            total_chars += len(str(params))
++            parts.append(str(params))
+         cache_control = tool.get("cache_control")
+         if cache_control is not None:
+             try:
+-                total_chars += len(
++                parts.append(
+                     json.dumps(
+                         cache_control,
+                         ensure_ascii=False,
+@@ -4395,7 +4388,30 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
+                     )
+                 )
+             except Exception:
+-                total_chars += len(str(cache_control))
++                parts.append(str(cache_control))
++    return parts
++
++
++def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
++    if not tools:
++        return 0
++
++    # Cache by list identity. Tools are rebuilt rarely (toolset changes),
++    # but token estimates are requested frequently (preflight, compaction).
++    key = id(tools)
++    n = len(tools)
++    first = _tool_name_for_cache(tools[0]) if n else ""
++    last = _tool_name_for_cache(tools[-1]) if n else ""
++
++    cached = _TOOLS_TOKENS_CACHE.get(key)
++    if cached is not None:
++        cached_n, cached_first, cached_last, cached_tokens = cached
++        if cached_n == n and cached_first == first and cached_last == last:
++            return cached_tokens
++
++    # The preflight path may cache by identity, but it shares the exact field
++    # selection with the uncached final-provider estimate above.
++    total_chars = sum(len(part) for part in _tool_token_text_parts(tools))
+ 
+     tokens = (total_chars + 3) // 4
+     # Bound the cache: drop the oldest entry when the cap is exceeded so a
+diff --git a/tests/agent/test_model_metadata.py b/tests/agent/test_model_metadata.py
+index 4e17f6d..701977b 100644
+--- a/tests/agent/test_model_metadata.py
++++ b/tests/agent/test_model_metadata.py
+@@ -163,6 +163,93 @@ class TestEstimateTokensRough:
+         assert estimate["estimate_source"] == "unknown"
+         assert estimate["estimate_confidence"] == "unknown"
+ 
++    def test_final_provider_tool_estimate_ignores_stale_identity_cache(self):
++        import agent.model_metadata as mm
++
++        tools = [
++            {
++                "type": "function",
++                "function": {
++                    "name": "first",
++                    "parameters": {"type": "object"},
++                },
++            },
++            {
++                "type": "function",
++                "function": {
++                    "name": "middle",
++                    "parameters": {"type": "object"},
++                },
++            },
++            {
++                "type": "function",
++                "function": {
++                    "name": "last",
++                    "parameters": {"type": "object"},
++                },
++            },
++        ]
++        before = estimate_provider_body_tokens_rough(
++            {"messages": [{"role": "user", "content": "hello"}], "tools": tools}
++        )["estimated_tokens"]
++        mm._TOOLS_TOKENS_CACHE[id(tools)] = (3, "first", "last", 1)
++        tools[1]["function"]["parameters"] = {
++            "type": "object",
++            "description": "中" * 10_000,
++        }
++
++        after = estimate_provider_body_tokens_rough(
++            {"messages": [{"role": "user", "content": "hello"}], "tools": tools}
++        )["estimated_tokens"]
++        mm._TOOLS_TOKENS_CACHE.pop(id(tools), None)
++
++        assert after > before + 9_000
++
++    @pytest.mark.parametrize(
++        "body",
++        [
++            {
++                "model": "claude-test",
++                "messages": [{"role": "user", "content": "hello"}],
++                "tools": [
++                    {
++                        "name": "lookup",
++                        "input_schema": {
++                            "type": "object",
++                            "description": "中" * 50_000,
++                        },
++                    }
++                ],
++            },
++            {
++                "modelId": "anthropic.claude-test-v1:0",
++                "messages": [{"role": "user", "content": [{"text": "hello"}]}],
++                "toolConfig": {
++                    "tools": [
++                        {
++                            "toolSpec": {
++                                "name": "lookup",
++                                "inputSchema": {
++                                    "json": {
++                                        "type": "object",
++                                        "description": "あ" * 50_000,
++                                    }
++                                },
++                            }
++                        }
++                    ]
++                },
++            },
++        ],
++        ids=("anthropic-cjk", "bedrock-cjk"),
++    )
++    def test_final_provider_tool_estimate_is_cjk_aware(self, body):
++        estimate = estimate_provider_body_tokens_rough(body)
++
++        assert estimate["estimated_tokens"] > 50_000
++        assert estimate["estimate_source"] == "hermes.provider_body.rough.v1"
++        assert estimate["estimate_confidence"] == "heuristic_with_margin"
++
+ 
+     def test_known_length(self):
+         assert estimate_tokens_rough("a" * 400) == 100
+diff --git a/tests/test_request_overlay.py b/tests/test_request_overlay.py
+index 35ae410..52c1e19 100644
+--- a/tests/test_request_overlay.py
++++ b/tests/test_request_overlay.py
+@@ -423,7 +423,7 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+                         "properties": {
+                             "payload": {
+                                 "type": "string",
+-                                "description": "x" * 50_000,
++                                "description": "中" * 50_000,
+                             }
+                         },
+                     },
+@@ -439,7 +439,7 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+         record.settle()
+ 
+         self.assertEqual(filtered["messages"][0]["content"], "current")
+-        self.assertGreater(record.provider_body_estimated_tokens or 0, 10_000)
++        self.assertGreater(record.provider_body_estimated_tokens or 0, 50_000)
+         self.assertEqual(
+             self.overlay.disposition,
+             OVERLAY_REMOVED_FINAL_BUDGET,

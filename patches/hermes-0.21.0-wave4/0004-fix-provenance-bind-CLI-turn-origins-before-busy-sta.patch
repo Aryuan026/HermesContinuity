@@ -1,0 +1,228 @@
+From b4587a9c9b6a3dc865cd4f7fc14ba4849a7dbbac Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Tue, 8 Sep 2026 19:47:39 +0800
+Subject: [PATCH] fix(provenance): bind CLI turn origins before busy state
+
+---
+ cli.py                                        | 21 ++++-
+ .../cli/test_cli_async_delegation_delivery.py | 41 +++++++++
+ tests/cli/test_cli_interrupt_ack_race.py      | 91 +++++++++++++++++++
+ 3 files changed, 150 insertions(+), 3 deletions(-)
+
+diff --git a/cli.py b/cli.py
+index e4402aa..faabe29 100644
+--- a/cli.py
++++ b/cli.py
+@@ -13558,7 +13558,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             self._pending_input.put(
+                 QueuedInput(
+                     synthetic_message,
+-                    build_message_origin_proof(SUBAGENT),
++                    (
++                        build_message_origin_proof(SUBAGENT)
++                        if event.get("type") == "async_delegation"
++                        else None
++                    ),
+                 )
+             )
+             complete_event_delivery(event, claim)
+@@ -17012,6 +17016,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                 staged_user_message,
+                 resolved_origin,
+             )
++            # Bind the selected agent's next-turn authority before any UI
++            # observer can see ``_agent_running``. Otherwise a queued turn can
++            # briefly inherit the previous turn's proof for steer/redirect.
++            agent._current_message_origin_proof = staged_user_message.get(
++                "_origin_proof"
++            )
+             agent._pending_cli_user_message = staged_user_message
+             self.conversation_history.append(staged_user_message)
+ 
+@@ -17025,6 +17035,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+         print(flush=True)
+         
+         try:
++            # Staging has already bound this exact agent and origin. Input that
++            # arrived earlier stayed on the next-turn queue.
++            self._agent_running = True
+             # Run the conversation with interrupt monitoring
+             result = None
+ 
+@@ -17705,6 +17718,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             print(f"Error: {e}")
+             return None
+         finally:
++            self._agent_running = False
+             # Stop the ambient thinking sound the moment the turn ends —
+             # every exit path (normal, error, interrupt) lands here.
+             if _thinking_started:
+@@ -21144,8 +21158,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                         n = len(submit_images)
+                         _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
+ 
+-                    # Regular chat - run agent
+-                    self._agent_running = True
++                    # Regular chat - run agent. ``chat()`` publishes
++                    # ``_agent_running`` only after the selected agent has the
++                    # queued input's exact origin bound.
+                     self._interactive_turn = True
+                     self._pet_turn_error = False
+                     self._pet_reasoning = False
+diff --git a/tests/cli/test_cli_async_delegation_delivery.py b/tests/cli/test_cli_async_delegation_delivery.py
+index b1cbcf8..1323f4c 100644
+--- a/tests/cli/test_cli_async_delegation_delivery.py
++++ b/tests/cli/test_cli_async_delegation_delivery.py
+@@ -51,6 +51,47 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
+     assert completed == [(event, "claim-token")]
+ 
+ 
++def test_cli_ordinary_process_notifications_stay_unclassified(monkeypatch):
++    cli = HermesCLI.__new__(HermesCLI)
++    cli.session_id = "visible-session"
++    cli._pending_input = queue.Queue()
++
++    events = [
++        {
++            "type": "completion",
++            "session_id": "proc_main",
++            "session_key": "visible-session",
++        },
++        {
++            "type": "watch_match",
++            "session_id": "proc_watch",
++            "session_key": "visible-session",
++        },
++    ]
++
++    class FakeRegistry:
++        def drain_notifications(self, *, session_key="", owns_event=None):
++            assert session_key == "visible-session"
++            assert all(owns_event(event) for event in events)
++            return [(event, event["type"]) for event in events]
++
++    monkeypatch.setattr(
++        "tools.process_registry.process_registry",
++        FakeRegistry(),
++    )
++
++    cli._drain_process_notifications("cli-idle")
++
++    assert cli._pending_input.get_nowait() == QueuedInput(
++        "completion",
++        origin_proof=None,
++    )
++    assert cli._pending_input.get_nowait() == QueuedInput(
++        "watch_match",
++        origin_proof=None,
++    )
++
++
+ def test_cli_completion_ownership_rejects_foreign_session():
+     cli = HermesCLI.__new__(HermesCLI)
+     cli.session_id = "visible-session"
+diff --git a/tests/cli/test_cli_interrupt_ack_race.py b/tests/cli/test_cli_interrupt_ack_race.py
+index b2df3c7..ac9dd69 100644
+--- a/tests/cli/test_cli_interrupt_ack_race.py
++++ b/tests/cli/test_cli_interrupt_ack_race.py
+@@ -263,6 +263,97 @@ def test_chat_stages_unclassified_plugin_input_but_keeps_human_defaults():
+     assert voice["_origin_proof"] == build_message_origin_proof(CLI_USER)
+ 
+ 
++def test_chat_binds_new_origin_before_publishing_running_state():
++    cli = _make_cli()
++
++    class _OriginProbeAgent(_StubAgent):
++        def __init__(self, session_id):
++            super().__init__(session_id, turn_seconds=0)
++            self._current_message_origin_proof = build_message_origin_proof(
++                CLI_USER
++            )
++            self.steer = MagicMock(return_value=True)
++
++        def run_conversation(self, **kwargs):
++            assert cli._agent_running is True
++            assert self._current_message_origin_proof == (
++                build_message_origin_proof(CRON_AGENT)
++            )
++            cli.process_command("/steer human correction")
++            return {
++                "final_response": "done",
++                "messages": [{"role": "assistant", "content": "done"}],
++                "api_calls": 1,
++                "completed": True,
++                "partial": True,
++                "response_previewed": True,
++            }
++
++    agent = _OriginProbeAgent(cli.session_id)
++    cli.agent = agent
++    cli._interrupt_queue = queue.Queue()
++    cli._pending_input = queue.Queue()
++
++    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
++         patch.object(cli, "_resolve_turn_agent_config", return_value={
++             "signature": cli._active_agent_route_signature,
++             "model": None, "runtime": None, "request_overrides": None,
++         }), \
++         patch.object(cli, "_init_agent", return_value=True):
++        cli.chat(
++            "scheduled turn",
++            message_origin_proof=build_message_origin_proof(CRON_AGENT),
++        )
++
++    agent.steer.assert_not_called()
++    assert cli._pending_input.get_nowait() == "human correction"
++    assert cli._agent_running is False
++
++
++def test_chat_keeps_same_origin_cli_steer_after_running_publication():
++    cli = _make_cli()
++
++    class _OriginProbeAgent(_StubAgent):
++        def __init__(self, session_id):
++            super().__init__(session_id, turn_seconds=0)
++            self._current_message_origin_proof = build_message_origin_proof(
++                CRON_AGENT
++            )
++            self.steer = MagicMock(return_value=True)
++
++        def run_conversation(self, **kwargs):
++            assert cli._agent_running is True
++            assert self._current_message_origin_proof == (
++                build_message_origin_proof(CLI_USER)
++            )
++            cli.process_command("/steer same human")
++            return {
++                "final_response": "done",
++                "messages": [{"role": "assistant", "content": "done"}],
++                "api_calls": 1,
++                "completed": True,
++                "partial": True,
++                "response_previewed": True,
++            }
++
++    agent = _OriginProbeAgent(cli.session_id)
++    cli.agent = agent
++    cli._interrupt_queue = queue.Queue()
++    cli._pending_input = queue.Queue()
++
++    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
++         patch.object(cli, "_resolve_turn_agent_config", return_value={
++             "signature": cli._active_agent_route_signature,
++             "model": None, "runtime": None, "request_overrides": None,
++         }), \
++         patch.object(cli, "_init_agent", return_value=True):
++        cli.chat("human turn")
++
++    agent.steer.assert_called_once_with("same human")
++    assert cli._pending_input.empty()
++    assert cli._agent_running is False
++
++
+ 
+ 
+ def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():
+-- 
+2.50.1 (Apple Git-155)
+

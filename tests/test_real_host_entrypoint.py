@@ -99,14 +99,16 @@ class RealHostEntrypointTests(unittest.TestCase):
         self.env.start()
         global AIAgent, PluginLlmCompleteResult, PluginLlmUsage, SessionDB
         global context_compressor, hermes_config, model_metadata, plugins
-        global relay_llm, relay_runtime
+        global relay_llm, relay_runtime, human_origin
         from agent import context_compressor, model_metadata, relay_llm, relay_runtime
+        from agent.message_origin import CLI_USER, build_message_origin_proof
         from agent.plugin_llm import PluginLlmCompleteResult, PluginLlmUsage
         from hermes_cli import config as hermes_config
         from hermes_cli import plugins
         from hermes_state import SessionDB
         from run_agent import AIAgent
 
+        human_origin = build_message_origin_proof(CLI_USER)
         hermes_config._config_cache = None
         plugins._reset_plugin_managers_for_tests()
         self.agents = []
@@ -119,12 +121,14 @@ class RealHostEntrypointTests(unittest.TestCase):
             "user",
             "A mouth recently asked about blue lanterns",
             timestamp=now - 120,
+            origin_proof=human_origin,
         )
         self.session_db.append_message(
             "mouth-a",
             "assistant",
             "A mouth received the blue-lantern answer",
             timestamp=now - 119,
+            origin_proof=human_origin,
         )
         self.session_db.create_session("mouth-b", "cli")
         for index in range(4):
@@ -133,12 +137,14 @@ class RealHostEntrypointTests(unittest.TestCase):
                 "user",
                 f"durable history user {index}: " + ("u" * 3_000),
                 timestamp=now - 10_000 + index * 2,
+                origin_proof=human_origin,
             )
             self.session_db.append_message(
                 "mouth-b",
                 "assistant",
                 f"durable history answer {index}: " + ("a" * 3_000),
                 timestamp=now - 9_999 + index * 2,
+                origin_proof=human_origin,
             )
 
     def tearDown(self) -> None:
@@ -281,6 +287,7 @@ class RealHostEntrypointTests(unittest.TestCase):
                 "What should this mouth remember?",
                 conversation_history=[],
                 task_id="entrypoint-turn-1",
+                message_origin_proof=human_origin,
             )
 
             self.assertEqual(result["final_response"], "entrypoint answer")
@@ -318,12 +325,14 @@ class RealHostEntrypointTests(unittest.TestCase):
                 "user",
                 "history added before process restart: " + ("r" * 3_000),
                 timestamp=now,
+                origin_proof=human_origin,
             )
             self.session_db.append_message(
                 "mouth-b",
                 "assistant",
                 "restart-safe history answer: " + ("s" * 3_000),
                 timestamp=now + 1,
+                origin_proof=human_origin,
             )
 
             plugins._reset_plugin_managers_for_tests()
@@ -336,6 +345,7 @@ class RealHostEntrypointTests(unittest.TestCase):
                 "Does the restarted mouth retain continuity?",
                 conversation_history=[],
                 task_id="entrypoint-turn-2",
+                message_origin_proof=human_origin,
             )
             self.assertEqual(restarted["final_response"], "entrypoint answer")
             self.assertEqual(len(provider_bodies), 2)
@@ -370,6 +380,7 @@ class RealHostEntrypointTests(unittest.TestCase):
                 "This provider call must not settle",
                 conversation_history=[],
                 task_id="entrypoint-turn-error",
+                message_origin_proof=human_origin,
             )
             self.assertFalse(failed["completed"])
             self.assertEqual(len(failed_provider_calls), 1)

@@ -1,0 +1,275 @@
+From 13900108780ae712059075200b243aa049c634cf Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Tue, 8 Sep 2026 21:32:37 +0800
+Subject: [PATCH] fix(provenance): keep host-injected context refs literal
+
+---
+ cli.py                                        | 44 +++++++--
+ gateway/run.py                                |  2 +-
+ tests/cli/test_cli_interrupt_ack_race.py      | 91 ++++++++++++++++++-
+ .../test_context_ref_expansion_runtime.py     | 37 ++++++++
+ 4 files changed, 164 insertions(+), 10 deletions(-)
+
+diff --git a/cli.py b/cli.py
+index 2907daa..558e5ee 100644
+--- a/cli.py
++++ b/cli.py
+@@ -16831,6 +16831,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             except Exception:
+                 pass
+ 
++    def _dispatch_process_loop_chat(
++        self,
++        message,
++        *,
++        images,
++        voice_input: bool,
++        message_origin_proof,
++        producer_enveloped: bool,
++    ) -> Optional[str]:
++        """Forward a prepared queue entry without dropping its content boundary."""
++        chat_kwargs = {
++            "images": images,
++            "voice_input": voice_input,
++            "allow_cli_content_expansion": not producer_enveloped,
++        }
++        if message_origin_proof is not _DEFAULT_CLI_MESSAGE_ORIGIN:
++            chat_kwargs["message_origin_proof"] = message_origin_proof
++        return self.chat(message, **chat_kwargs)
++
+     def chat(
+         self,
+         message,
+@@ -16838,6 +16857,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+         voice_input: bool = False,
+         *,
+         message_origin_proof=_DEFAULT_CLI_MESSAGE_ORIGIN,
++        allow_cli_content_expansion: bool = True,
+     ) -> Optional[str]:
+         """
+         Send a message to the agent and get a response.
+@@ -16855,6 +16875,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             images: Optional list of Path objects for attached images
+             voice_input: True when the message came from voice transcription
+                 (gates the concise voice-response prefix, #65827)
++            allow_cli_content_expansion: Whether CLI-only @ context references
++                may read or expand external content for this message. Host-queued
++                message envelopes disable this; keyboard, voice, and single-query
++                callers retain the interactive default.
+             
+         Returns:
+             The agent's response, or None on error
+@@ -16958,7 +16982,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                 )
+ 
+         # Expand @ context references (e.g. @file:main.py, @diff, @folder:src/)
+-        if isinstance(message, str) and "@" in message:
++        if (
++            allow_cli_content_expansion
++            and isinstance(message, str)
++            and "@" in message
++        ):
+             try:
+                 from agent.context_references import preprocess_context_references
+                 from agent.model_metadata import get_model_context_length
+@@ -21200,13 +21228,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     app.invalidate()  # Refresh status line
+ 
+                     try:
+-                        chat_kwargs = {
+-                            "images": submit_images or None,
+-                            "voice_input": is_voice_input,
+-                        }
+-                        if queued_origin is not _DEFAULT_CLI_MESSAGE_ORIGIN:
+-                            chat_kwargs["message_origin_proof"] = queued_origin
+-                        self.chat(user_input, **chat_kwargs)
++                        self._dispatch_process_loop_chat(
++                            user_input,
++                            images=submit_images or None,
++                            voice_input=is_voice_input,
++                            message_origin_proof=queued_origin,
++                            producer_enveloped=producer_enveloped,
++                        )
+                     finally:
+                         self._agent_running = False
+                         self._spinner_text = ""
+diff --git a/gateway/run.py b/gateway/run.py
+index b2a7790..3deb626 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -20092,7 +20092,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             else:
+                 message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+ 
+-        if "@" in message_text:
++        if event.allow_gateway_control and "@" in message_text:
+             try:
+                 from agent.context_references import preprocess_context_references_async
+                 from agent.model_metadata import get_model_context_length_async
+diff --git a/tests/cli/test_cli_interrupt_ack_race.py b/tests/cli/test_cli_interrupt_ack_race.py
+index 086ff7e..3910788 100644
+--- a/tests/cli/test_cli_interrupt_ack_race.py
++++ b/tests/cli/test_cli_interrupt_ack_race.py
+@@ -24,6 +24,7 @@ and clear the stale agent flag (only when the agent thread has exited).
+ from __future__ import annotations
+ 
+ import importlib
++import inspect
+ import queue
+ import sys
+ import threading
+@@ -302,7 +303,11 @@ def test_host_enveloped_control_text_stays_literal_with_its_origin():
+                 cli_globals["_unwrap_cli_queue_entry"](entry)
+             )
+             assert producer_enveloped is True
+-            cli.chat(payload, message_origin_proof=origin)
++            cli.chat(
++                payload,
++                message_origin_proof=origin,
++                allow_cli_content_expansion=not producer_enveloped,
++            )
+             cli.conversation_history = []
+ 
+     assert [message["content"] for message in agent.staged] == [
+@@ -319,6 +324,90 @@ def test_host_enveloped_control_text_stays_literal_with_its_origin():
+     )
+ 
+ 
++def test_host_enveloped_at_references_stay_literal_with_their_origin():
++    cli = _make_cli()
++    cli_globals = cli.__class__.chat.__globals__
++    agent = _CaptureStagingAgent(cli.session_id)
++    cli.agent = agent
++    cli._interrupt_queue = queue.Queue()
++    cases = [
++        QueuedInput("@file:sentinel.txt", None),
++        QueuedInput("@diff", None),
++        QueuedInput(
++            "@url:https://example.invalid",
++            build_message_origin_proof(CRON_AGENT),
++        ),
++        QueuedInput(
++            "@custom:item",
++            build_message_origin_proof(SUBAGENT),
++        ),
++    ]
++    preprocessor = MagicMock()
++
++    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
++         patch.object(cli, "_resolve_turn_agent_config", return_value={
++             "signature": cli._active_agent_route_signature,
++             "model": None, "runtime": None, "request_overrides": None,
++         }), \
++         patch.object(cli, "_init_agent", return_value=True), \
++         patch(
++             "agent.context_references.preprocess_context_references",
++             preprocessor,
++         ):
++        for entry in cases:
++            payload, origin, producer_enveloped = (
++                cli_globals["_unwrap_cli_queue_entry"](entry)
++            )
++            cli.chat(
++                payload,
++                message_origin_proof=origin,
++                allow_cli_content_expansion=not producer_enveloped,
++            )
++            cli.conversation_history = []
++
++    preprocessor.assert_not_called()
++    assert [message["content"] for message in agent.staged] == [
++        entry.payload for entry in cases
++    ]
++    for message in agent.staged[:2]:
++        assert MESSAGE_ORIGIN_DECLARED_FIELD in message
++        assert "_origin_proof" not in message
++    assert agent.staged[2]["_origin_proof"] == build_message_origin_proof(
++        CRON_AGENT
++    )
++    assert agent.staged[3]["_origin_proof"] == build_message_origin_proof(
++        SUBAGENT
++    )
++
++
++def test_process_loop_carries_queue_literal_capability_into_chat():
++    cli = _make_cli()
++    cli._pending_input = queue.Queue()
++    cli._pending_input.put(QueuedInput("@file:sentinel.txt", None))
++
++    entry = cli._pending_input.get_nowait()
++    payload, origin, producer_enveloped = (
++        cli.__class__.chat.__globals__["_unwrap_cli_queue_entry"](entry)
++    )
++    with patch.object(cli, "chat") as chat:
++        cli._dispatch_process_loop_chat(
++            payload,
++            images=None,
++            voice_input=False,
++            message_origin_proof=origin,
++            producer_enveloped=producer_enveloped,
++        )
++
++    chat.assert_called_once_with(
++        "@file:sentinel.txt",
++        images=None,
++        voice_input=False,
++        allow_cli_content_expansion=False,
++        message_origin_proof=None,
++    )
++    assert "self._dispatch_process_loop_chat(" in inspect.getsource(cli.run)
++
++
+ def test_keyboard_queue_command_keeps_human_control_authority():
+     cli = _make_cli()
+     cli_globals = cli.__class__.chat.__globals__
+diff --git a/tests/gateway/test_context_ref_expansion_runtime.py b/tests/gateway/test_context_ref_expansion_runtime.py
+index e0afc8c..8f49aa9 100644
+--- a/tests/gateway/test_context_ref_expansion_runtime.py
++++ b/tests/gateway/test_context_ref_expansion_runtime.py
+@@ -141,6 +141,43 @@ async def test_at_reference_reaches_preprocessor_with_real_context_length(
+     assert result == "[expanded body]"
+ 
+ 
++@pytest.mark.asyncio
++async def test_non_control_plugin_event_keeps_at_reference_literal(monkeypatch):
++    runner = _make_runner()
++    source = _source()
++    _patch_runtime_resolution(monkeypatch)
++    calls = []
++
++    async def _unexpected_preprocess(*args, **kwargs):
++        calls.append((args, kwargs))
++        raise AssertionError("non-control plugin text must not expand @ references")
++
++    import agent.context_references as ctx_mod
++
++    monkeypatch.setattr(
++        ctx_mod,
++        "preprocess_context_references_async",
++        _unexpected_preprocess,
++    )
++    message = "@file:sentinel.txt @diff @url:https://example.invalid @custom:item"
++    event = MessageEvent(
++        text=message,
++        source=source,
++        internal=True,
++        allow_gateway_control=False,
++        metadata={"hermes_plugin_injection": True},
++    )
++
++    result = await runner._prepare_inbound_message_text(
++        event=event,
++        source=source,
++        history=[],
++    )
++
++    assert calls == []
++    assert result == message
++
++
+ @pytest.mark.asyncio
+ async def test_at_reference_ignores_global_context_for_runtime_route_override(monkeypatch):
+     """Context expansion must not inherit a global pin from another route."""
+-- 
+2.50.1 (Apple Git-155)
+

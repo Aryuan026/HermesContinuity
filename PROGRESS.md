@@ -1,5 +1,35 @@
 # Progress
 
+## Current Wave 7 public replay candidate
+
+- Wave 5 Continuity is independently accepted at
+  `8eb44f3e8afe5d134691d258607ee67af518d706`, tree
+  `61b65180ef0c484657330b63222038dcf26888f6`. Wave 6 Global Hot is
+  independently accepted at `01918856aa46f80ca17dd67d079eed1b7261f85f`,
+  tree `5650584c434de4ba086e0f40d45a447ee40f9302`.
+- Copied the 35 accepted Hermes 0.21 patches byte-for-byte from their reviewed
+  Assembly owner into four versioned public directories. A digest manifest and
+  materializer require pure upstream `29112bef...`, all 35 exact bytes, and
+  assembled tree `5e82789d...` before tests can start. The twelve top-level
+  0.20.5 artifacts remain unchanged.
+- The public workflow now runs the complete changed-host seam selection, both
+  plugin suites, and the paired production `AIAgent.run_conversation` entry.
+  The old paired fixture now carries real H13 human proof instead of expecting
+  pre-H13 rows to qualify for Global Hot.
+- The workflow installs both checked-out exact Git revisions with official
+  `hermes plugins install --ref ... --no-enable`, verifies pinned metadata and
+  disabled list state, runs Continuity native Doctor and Global Hot joint
+  Doctor, removes in dependency-reverse order, and requires no remaining
+  plugin directory plus exact metadata `{}`.
+- Local replay of the published selection is `2247 passed`, `5` optional
+  skips, `1` unchanged upstream OAuth-mock deselection, and `23` subtests. The
+  materializer reconstructs the accepted tree exactly; both plugin suites and
+  the corrected paired entrypoint are Green against the same host.
+- This is a public-workflow candidate pending exact-head Actions and
+  independent review. Production plugin algorithms, host source, profile
+  configuration, target databases, services, enablement, deployment, network
+  providers, and real QQ/WeChat traffic remain unchanged.
+
 ## Current Wave 5 candidate
 
 - Lifecycle: active, Continuity-only external-review candidate. Wave 6 is not

@@ -1,0 +1,125 @@
+From 5c065be82349d5ab6de45261a31debecdaf86a32 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 23:15:13 +0800
+Subject: [PATCH] fix(overlay): remove owned context on scope drift
+
+---
+ hermes_cli/request_overlay.py |  4 +-
+ tests/test_request_overlay.py | 78 ++++++++++++++++++++++++++++++++++-
+ 2 files changed, 80 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/request_overlay.py b/hermes_cli/request_overlay.py
+index e75aee4..6156cbd 100644
+--- a/hermes_cli/request_overlay.py
++++ b/hermes_cli/request_overlay.py
+@@ -440,9 +440,11 @@ class RequestOverlay:
+             output_reserve_confidence: Any = None,
+         ) -> Any:
+             native = self.native_request(body, require_original_material=False)
+-            if native is None or not validator(body, native):
++            if native is None:
+                 self._set_disposition(OVERLAY_DRIFTED)
+                 raise ValueError("request_overlay_final_body_drift")
++            if not validator(body, native):
++                return self._filter_result(body, native, OVERLAY_DRIFTED)
+             if output_reserve_source in (None, "", "consumer"):
+                 try:
+                     reserve = reserve_tokens(body, context_window_tokens)
+diff --git a/tests/test_request_overlay.py b/tests/test_request_overlay.py
+index 6b98c8c..35ae410 100644
+--- a/tests/test_request_overlay.py
++++ b/tests/test_request_overlay.py
+@@ -605,16 +605,92 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+         self.assertEqual(record.provider_body_estimate_source, "unknown")
+         self.assertTrue(record.settled)
+ 
+-    def test_final_carrier_drift_is_visible_and_provider_is_not_blocked(self) -> None:
++    def test_final_carrier_drift_certifies_owned_overlay_removal(self) -> None:
+         record = _FilterRecord()
+         self.assertTrue(self.register(record, window=100_000))
+         changed = copy.deepcopy(self.overlay.request)
+         changed["messages"][0]["content"] = f"{BLOCK}\n\nreplacement"
+         filtered = record.filter_provider_body(changed)
++        self.assertEqual(filtered["messages"][0]["content"], "replacement")
++        self.assertFalse(record.ambiguous)
++        self.assertEqual(self.overlay.disposition, OVERLAY_DRIFTED)
++
++    def test_uncertain_overlay_removal_stays_ambiguous(self) -> None:
++        record = _FilterRecord()
++        self.assertTrue(self.register(record, window=100_000))
++        changed = copy.deepcopy(self.overlay.request)
++        changed["messages"][0]["content"] = "marker was destroyed"
++
++        filtered = record.filter_provider_body(changed)
++
+         self.assertEqual(filtered, changed)
+         self.assertTrue(record.ambiguous)
+         self.assertEqual(self.overlay.disposition, OVERLAY_DRIFTED)
+ 
++    def test_real_transport_removes_overlay_on_route_and_user_scope_drift(self) -> None:
++        from agent import relay_llm
++
++        for owners in (("late-transform", "overlay"), ("overlay", "late-transform")):
++            with self.subTest(owners=owners):
++                overlay = project(
++                    {
++                        "model": "model-a",
++                        "messages": [{"role": "user", "content": "current"}],
++                        "max_tokens": 32,
++                    }
++                )
++                record = middleware.TransportRecord()
++
++                def late_transform(body):
++                    transformed = copy.deepcopy(body)
++                    transformed["model"] = "model-b"
++                    content = transformed["messages"][0]["content"]
++                    transformed["messages"][0]["content"] = (
++                        "late-before\n"
++                        + content.replace("current", "replacement")
++                        + "\nlate-after"
++                    )
++                    transformed["late_field"] = "preserved"
++                    return transformed
++
++                for owner_name in owners:
++                    owner = middleware._CURRENT_MIDDLEWARE_OWNER.set(owner_name)
++                    try:
++                        if owner_name == "late-transform":
++                            record.register_provider_body_filter(late_transform)
++                        else:
++                            self.assertTrue(
++                                overlay.register_final_budget_guard(
++                                    record,
++                                    context_window_tokens=100_000,
++                                    reserve_tokens=lambda _body, _window: 32,
++                                    validator=lambda body, native: (
++                                        body.get("model") == "model-a"
++                                        and native["messages"][0]["content"]
++                                        == "current"
++                                    ),
++                                )
++                            )
++                    finally:
++                        middleware._CURRENT_MIDDLEWARE_OWNER.reset(owner)
++                record.mark_middleware_verified(overlay.request)
++
++                with middleware.transport_record_scope(record):
++                    with relay_llm.provider_body_scope(overlay.request) as filtered:
++                        pass
++                record.settle()
++
++                self.assertEqual(filtered["model"], "model-b")
++                self.assertEqual(filtered["late_field"], "preserved")
++                self.assertEqual(
++                    filtered["messages"][0]["content"],
++                    "late-before\nreplacement\nlate-after",
++                )
++                self.assertNotIn(NAMESPACE, str(filtered))
++                self.assertEqual(overlay.disposition, OVERLAY_DRIFTED)
++                self.assertFalse(record.ambiguous)
++                self.assertTrue(record.settled)
++
+     def test_composed_overlays_can_both_shrink_in_either_guard_order(self) -> None:
+         native = {
+             "messages": [{"role": "user", "content": "current"}],

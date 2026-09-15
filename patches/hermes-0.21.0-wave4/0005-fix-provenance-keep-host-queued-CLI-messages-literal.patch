@@ -1,0 +1,299 @@
+From 2cac00e0fdee2a0aeca8084439159d77625a5663 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Tue, 8 Sep 2026 20:49:46 +0800
+Subject: [PATCH] fix(provenance): keep host-queued CLI messages literal
+
+---
+ cli.py                                   |  52 ++++++++--
+ tests/cli/test_cli_interrupt_ack_race.py | 125 +++++++++++++++++++----
+ 2 files changed, 149 insertions(+), 28 deletions(-)
+
+diff --git a/cli.py b/cli.py
+index faabe29..2907daa 100644
+--- a/cli.py
++++ b/cli.py
+@@ -107,6 +107,14 @@ import queue
+ 
+ _DEFAULT_CLI_MESSAGE_ORIGIN = object()
+ 
++
++def _unwrap_cli_queue_entry(entry):
++    """Return payload, origin, and host-envelope control authority."""
++    if isinstance(entry, QueuedInput):
++        return entry.payload, entry.origin_proof, True
++    return entry, _DEFAULT_CLI_MESSAGE_ORIGIN, False
++
++
+ def CanonicalUsage(*args, **kwargs):
+     from agent.usage_pricing import CanonicalUsage as _CanonicalUsage
+ 
+@@ -21018,14 +21026,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                                 pass
+                         continue
+ 
+-                    queued_origin = _DEFAULT_CLI_MESSAGE_ORIGIN
+-                    if isinstance(user_input, QueuedInput):
+-                        queued_origin = user_input.origin_proof
+-                        user_input = user_input.payload
++                    user_input, queued_origin, producer_enveloped = (
++                        _unwrap_cli_queue_entry(user_input)
++                    )
++                    # A host envelope carries message data, never CLI composer
++                    # control text. Only bare keyboard/voice input may trigger
++                    # terminal cleanup, stop/resume, file/paste expansion,
++                    # bang shell, or slash/alias/skill dispatch below.
+ 
+                     # Voice-transcribed messages arrive wrapped in a sentinel
+                     # so only genuine STT output gets the voice prefix (#65827).
+-                    is_voice_input = isinstance(user_input, _VoiceInputMessage)
++                    is_voice_input = (
++                        not producer_enveloped
++                        and isinstance(user_input, _VoiceInputMessage)
++                    )
+                     if is_voice_input:
+                         user_input = user_input.text
+ 
+@@ -21033,7 +21047,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     # arbitrary launcher/script text that must be submitted
+                     # LITERALLY — skip slash routing, ! shell dispatch, and
+                     # file-drop detection for this one message.
+-                    is_seeded_query = isinstance(user_input, _SeededQueryMessage)
++                    is_seeded_query = (
++                        not producer_enveloped
++                        and isinstance(user_input, _SeededQueryMessage)
++                    )
+                     if is_seeded_query:
+                         seeded = user_input
+                         user_input = (
+@@ -21054,7 +21071,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     if isinstance(user_input, tuple):
+                         user_input, submit_images = user_input
+ 
+-                    if isinstance(user_input, str):
++                    if isinstance(user_input, str) and not producer_enveloped:
+                         user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
+                         user_input, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(user_input)
+                         if _had_mouse_reports:
+@@ -21065,7 +21082,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     # of sending the word to the agent. Voice transcripts are
+                     # already stop-checked at the transcription points, so this
+                     # only intercepts typed input.
+-                    if not is_voice_input and self._typed_voice_stop(user_input):
++                    if (
++                        not producer_enveloped
++                        and not is_voice_input
++                        and self._typed_voice_stop(user_input)
++                    ):
+                         continue
+                     
+                     # Check for commands — but detect dragged/pasted file paths first.
+@@ -21073,7 +21094,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     # literal text: no file-drop detection, no !/slash dispatch.
+                     _file_drop = (
+                         _detect_file_drop(user_input)
+-                        if isinstance(user_input, str) and not is_seeded_query
++                        if (
++                            isinstance(user_input, str)
++                            and not producer_enveloped
++                            and not is_seeded_query
++                        )
+                         else None
+                     )
+                     if _file_drop:
+@@ -21095,6 +21120,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     # the digit isn't sent to the agent as a message.
+                     if (
+                         not _file_drop
++                        and not producer_enveloped
+                         and self._pending_resume_sessions
+                         and isinstance(user_input, str)
+                         and self._consume_pending_resume_selection(user_input)
+@@ -21107,6 +21133,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     # turn is spent. See handle_bang_shell().
+                     if (
+                         not _file_drop
++                        and not producer_enveloped
+                         and not is_seeded_query
+                         and isinstance(user_input, str)
+                         and self.handle_bang_shell(user_input)
+@@ -21115,6 +21142,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+ 
+                     if (
+                         not _file_drop
++                        and not producer_enveloped
+                         and not is_seeded_query
+                         and isinstance(user_input, str)
+                         and _looks_like_slash_command(user_input)
+@@ -21147,7 +21175,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     
+                     # Expand paste references back to full content
+                     _paste_ref_re = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
+-                    paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
++                    paste_refs = (
++                        list(_paste_ref_re.finditer(user_input))
++                        if isinstance(user_input, str) and not producer_enveloped
++                        else []
++                    )
+                     if paste_refs:
+                         user_input = self._expand_paste_references(user_input)
+                     print()
+diff --git a/tests/cli/test_cli_interrupt_ack_race.py b/tests/cli/test_cli_interrupt_ack_race.py
+index ac9dd69..086ff7e 100644
+--- a/tests/cli/test_cli_interrupt_ack_race.py
++++ b/tests/cli/test_cli_interrupt_ack_race.py
+@@ -36,6 +36,7 @@ from agent.message_origin import (
+     CRON_AGENT,
+     MESSAGE_ORIGIN_DECLARED_FIELD,
+     QueuedInput,
++    SUBAGENT,
+     build_message_origin_proof,
+ )
+ 
+@@ -129,6 +130,23 @@ class _StubAgent:
+         self._interrupt_message = None
+ 
+ 
++class _CaptureStagingAgent(_StubAgent):
++    def __init__(self, session_id):
++        super().__init__(session_id, turn_seconds=0)
++        self.staged = []
++
++    def run_conversation(self, **kwargs):
++        self.staged.append(dict(self._pending_cli_user_message))
++        return {
++            "final_response": "done",
++            "messages": [{"role": "assistant", "content": "done"}],
++            "api_calls": 1,
++            "completed": True,
++            "partial": True,
++            "response_previewed": True,
++        }
++
++
+ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
+     cli = _make_cli()
+     agent = _StubAgent(cli.session_id)
+@@ -222,24 +240,7 @@ def test_interrupt_requeue_never_merges_different_origin_states():
+ 
+ def test_chat_stages_unclassified_plugin_input_but_keeps_human_defaults():
+     cli = _make_cli()
+-
+-    class _StagingAgent(_StubAgent):
+-        def __init__(self, session_id):
+-            super().__init__(session_id, turn_seconds=0)
+-            self.staged = []
+-
+-        def run_conversation(self, **kwargs):
+-            self.staged.append(dict(self._pending_cli_user_message))
+-            return {
+-                "final_response": "done",
+-                "messages": [{"role": "assistant", "content": "done"}],
+-                "api_calls": 1,
+-                "completed": True,
+-                "partial": True,
+-                "response_previewed": True,
+-            }
+-
+-    agent = _StagingAgent(cli.session_id)
++    agent = _CaptureStagingAgent(cli.session_id)
+     cli.agent = agent
+     cli._interrupt_queue = queue.Queue()
+     cli._pending_input = queue.Queue()
+@@ -263,6 +264,94 @@ def test_chat_stages_unclassified_plugin_input_but_keeps_human_defaults():
+     assert voice["_origin_proof"] == build_message_origin_proof(CLI_USER)
+ 
+ 
++def test_host_enveloped_control_text_stays_literal_with_its_origin():
++    cli = _make_cli()
++    cli_globals = cli.__class__.chat.__globals__
++    agent = _CaptureStagingAgent(cli.session_id)
++    cli.agent = agent
++    cli._interrupt_queue = queue.Queue()
++    cases = [
++        QueuedInput("/queue webhook payload", None),
++        QueuedInput("/steer webhook payload", None),
++        QueuedInput("!echo webhook payload", None),
++        QueuedInput("stop", None),
++        QueuedInput("1", None),
++        QueuedInput("/tmp/webhook.txt", None),
++        QueuedInput(
++            "[Pasted text #1: 1 lines → /tmp/webhook.txt]",
++            None,
++        ),
++        QueuedInput(
++            "/queue scheduled payload",
++            build_message_origin_proof(CRON_AGENT),
++        ),
++        QueuedInput(
++            "/steer delegated payload",
++            build_message_origin_proof(SUBAGENT),
++        ),
++    ]
++
++    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
++         patch.object(cli, "_resolve_turn_agent_config", return_value={
++             "signature": cli._active_agent_route_signature,
++             "model": None, "runtime": None, "request_overrides": None,
++         }), \
++         patch.object(cli, "_init_agent", return_value=True):
++        for entry in cases:
++            payload, origin, producer_enveloped = (
++                cli_globals["_unwrap_cli_queue_entry"](entry)
++            )
++            assert producer_enveloped is True
++            cli.chat(payload, message_origin_proof=origin)
++            cli.conversation_history = []
++
++    assert [message["content"] for message in agent.staged] == [
++        entry.payload for entry in cases
++    ]
++    for message in agent.staged[:7]:
++        assert MESSAGE_ORIGIN_DECLARED_FIELD in message
++        assert "_origin_proof" not in message
++    assert agent.staged[7]["_origin_proof"] == build_message_origin_proof(
++        CRON_AGENT
++    )
++    assert agent.staged[8]["_origin_proof"] == build_message_origin_proof(
++        SUBAGENT
++    )
++
++
++def test_keyboard_queue_command_keeps_human_control_authority():
++    cli = _make_cli()
++    cli_globals = cli.__class__.chat.__globals__
++    cli._pending_input = queue.Queue()
++
++    payload, origin, producer_enveloped = cli_globals["_unwrap_cli_queue_entry"](
++        "/queue human payload"
++    )
++    assert payload == "/queue human payload"
++    assert origin is cli_globals["_DEFAULT_CLI_MESSAGE_ORIGIN"]
++    assert producer_enveloped is False
++
++    assert cli.process_command(payload) is True
++    requeued = cli._pending_input.get_nowait()
++    assert requeued == "human payload"
++    assert not isinstance(requeued, QueuedInput)
++
++    agent = _CaptureStagingAgent(cli.session_id)
++    cli.agent = agent
++    cli._interrupt_queue = queue.Queue()
++    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
++         patch.object(cli, "_resolve_turn_agent_config", return_value={
++             "signature": cli._active_agent_route_signature,
++             "model": None, "runtime": None, "request_overrides": None,
++         }), \
++         patch.object(cli, "_init_agent", return_value=True):
++        cli.chat(requeued)
++
++    assert agent.staged[0]["_origin_proof"] == build_message_origin_proof(
++        CLI_USER
++    )
++
++
+ def test_chat_binds_new_origin_before_publishing_running_state():
+     cli = _make_cli()
+ 
+-- 
+2.50.1 (Apple Git-155)
+

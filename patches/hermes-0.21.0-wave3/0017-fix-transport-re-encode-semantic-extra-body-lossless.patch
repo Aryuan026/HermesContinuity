@@ -1,0 +1,237 @@
+From 4250b46f2151f413717380475f3496c2e5bdc112 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 09:45:08 +0800
+Subject: [PATCH] fix(transport): re-encode semantic extra body losslessly
+
+---
+ agent/relay_llm.py                            | 40 +++++++++++++----
+ .../test_transport_successor_attempts.py      | 45 ++++++++++++++++++-
+ tests/agent/test_transport_truth.py           | 30 ++++++++-----
+ 3 files changed, 93 insertions(+), 22 deletions(-)
+
+diff --git a/agent/relay_llm.py b/agent/relay_llm.py
+index 6b8d830..f6415d3 100644
+--- a/agent/relay_llm.py
++++ b/agent/relay_llm.py
+@@ -32,6 +32,7 @@ class _ProviderBodyCodec:
+     """Private SDK-kwargs projection state for one provider attempt."""
+ 
+     top_level_keys: frozenset[str] | None
++    extra_body_keys: set[str]
+     sdk_controls: dict[str, Any]
+ 
+ 
+@@ -98,20 +99,28 @@ def _provider_body_projection(
+     }
+     if not merge_extra_body:
+         if "extra_body" in base:
+-            return None, _ProviderBodyCodec(None, sdk_controls)
+-        return base, _ProviderBodyCodec(None, sdk_controls)
++            return None, _ProviderBodyCodec(None, set(), sdk_controls)
++        return base, _ProviderBodyCodec(None, set(), sdk_controls)
+     extra_body = base.pop("extra_body", None)
+     if extra_body is None:
+-        return base, _ProviderBodyCodec(None, sdk_controls)
++        return base, _ProviderBodyCodec(frozenset(base), set(), sdk_controls)
+     if not isinstance(extra_body, dict):
+-        return None, _ProviderBodyCodec(None, sdk_controls)
++        return None, _ProviderBodyCodec(None, set(), sdk_controls)
+     top_level_keys = frozenset(base)
+     semantic = dict(base)
+     semantic.update(extra_body)
+-    return semantic, _ProviderBodyCodec(top_level_keys, sdk_controls)
++    return semantic, _ProviderBodyCodec(
++        top_level_keys,
++        set(extra_body),
++        sdk_controls,
++    )
+ 
+ 
+-def _merge_provider_extra_body(body: dict[str, Any]) -> dict[str, Any] | None:
++def _merge_provider_extra_body(
++    body: dict[str, Any],
++    *,
++    extra_body_keys: set[str],
++) -> dict[str, Any] | None:
+     """Apply OpenAI SDK ``extra_body`` precedence to one transform result."""
+ 
+     if "extra_body" not in body:
+@@ -119,6 +128,7 @@ def _merge_provider_extra_body(body: dict[str, Any]) -> dict[str, Any] | None:
+     extra_body = body.get("extra_body")
+     if not isinstance(extra_body, dict):
+         return None
++    extra_body_keys.update(extra_body)
+     semantic = {key: value for key, value in body.items() if key != "extra_body"}
+     semantic.update(extra_body)
+     return semantic
+@@ -142,7 +152,7 @@ def _provider_sdk_body(
+         extra_body = {
+             key: value
+             for key, value in semantic.items()
+-            if key not in codec.top_level_keys
++            if key in codec.extra_body_keys or key not in codec.top_level_keys
+         }
+         if extra_body:
+             final_body["extra_body"] = extra_body
+@@ -183,7 +193,14 @@ def provider_body_scope(
+         filtered = record.begin_provider_body_attempt(
+             provider_body,
+             transform_normalizer=(
+-                _merge_provider_extra_body if merge_extra_body else None
++                (
++                    lambda candidate: _merge_provider_extra_body(
++                        candidate,
++                        extra_body_keys=codec.extra_body_keys,
++                    )
++                )
++                if merge_extra_body
++                else None
+             ),
+         )
+         if filtered is not None:
+@@ -314,7 +331,12 @@ class ProviderBodyStreamAttempt:
+                 filtered = record.begin_provider_body_attempt(
+                     provider_body,
+                     transform_normalizer=(
+-                        _merge_provider_extra_body
++                        (
++                            lambda candidate: _merge_provider_extra_body(
++                                candidate,
++                                extra_body_keys=codec.extra_body_keys,
++                            )
++                        )
+                         if self._merge_extra_body
+                         else None
+                     ),
+diff --git a/tests/agent/test_transport_successor_attempts.py b/tests/agent/test_transport_successor_attempts.py
+index 98e031b..2c64706 100644
+--- a/tests/agent/test_transport_successor_attempts.py
++++ b/tests/agent/test_transport_successor_attempts.py
+@@ -1128,6 +1128,43 @@ def test_openai_extra_body_budget_guard_filters_actual_http_json():
+     assert record.settled is True
+ 
+ 
++def test_late_unknown_extra_body_extension_round_trips_through_openai_sdk():
++    request = {
++        "model": "gpt-test",
++        "messages": [{"role": "user", "content": "hello"}],
++    }
++    record = TransportRecord()
++    owner = _CURRENT_MIDDLEWARE_OWNER.set("late-provider-extension")
++    try:
++        record.register_provider_body_filter(
++            lambda body: {
++                **body,
++                "extra_body": {
++                    "provider_extension": {"mode": "fast"},
++                },
++            }
++        )
++    finally:
++        _CURRENT_MIDDLEWARE_OWNER.reset(owner)
++    record.mark_middleware_verified(request)
++    wire_bodies = []
++    client = _openai_mock_client(wire_bodies)
++
++    with transport_record_scope(record):
++        cch._dispatch_nonstreaming_api_request(
++            SimpleNamespace(api_mode="chat_completions", provider="openai"),
++            request,
++            make_client=lambda *_args, **_kwargs: client,
++        )
++    record.settle()
++
++    assert wire_bodies[0]["provider_extension"] == {"mode": "fast"}
++    assert record.provider_body == wire_bodies[0]
++    assert record.capture_count == 1
++    assert record.ambiguous is False
++    assert record.settled is True
++
++
+ def test_codex_late_extra_body_relocation_stays_visible_to_final_guards(monkeypatch):
+     from agent import codex_runtime, relay_llm
+ 
+@@ -1227,8 +1264,12 @@ def test_late_transform_extra_body_is_normalized_before_final_budget_guard():
+ 
+     assert NAMESPACE not in str(sdk_calls[0])
+     assert sdk_calls[0]["input"][-1]["content"][-1]["text"] == "current"
+-    assert sdk_calls[0]["tools"][0]["name"] == "late_large_tool"
+-    assert record.provider_body == sdk_calls[0]
++    assert sdk_calls[0]["extra_body"]["tools"][0]["name"] == "late_large_tool"
++    semantic_sdk_body = {
++        key: value for key, value in sdk_calls[0].items() if key != "extra_body"
++    }
++    semantic_sdk_body.update(sdk_calls[0]["extra_body"])
++    assert record.provider_body == semantic_sdk_body
+     assert overlay.disposition == OVERLAY_REMOVED_FINAL_BUDGET
+     assert record.capture_count == 1
+     assert record.ambiguous is False
+diff --git a/tests/agent/test_transport_truth.py b/tests/agent/test_transport_truth.py
+index b987a1f..61d77ec 100644
+--- a/tests/agent/test_transport_truth.py
++++ b/tests/agent/test_transport_truth.py
+@@ -20,6 +20,16 @@ def _register_test_filter(record, callback):
+         middleware._CURRENT_MIDDLEWARE_OWNER.reset(token)
+ 
+ 
++def _semantic_sdk_body(kwargs):
++    body = {
++        key: value
++        for key, value in kwargs.items()
++        if key not in {"timeout", "extra_headers", "extra_query", "extra_body"}
++    }
++    body.update(kwargs.get("extra_body") or {})
++    return body
++
++
+ def _response(text: str = "done") -> SimpleNamespace:
+     return SimpleNamespace(
+         id="response-1",
+@@ -682,10 +692,8 @@ def test_anthropic_nonstream_records_late_sanitized_sdk_body(monkeypatch):
+         "parallel_tool_calls",
+     }.intersection(sdk_calls[0])
+     assert sdk_calls[0]["timeout"] == 1800.0
+-    assert sdk_calls[0]["metadata"] == {"filtered": True}
+-    assert record.provider_body == {
+-        key: value for key, value in sdk_calls[0].items() if key != "timeout"
+-    }
++    assert sdk_calls[0]["extra_body"]["metadata"] == {"filtered": True}
++    assert record.provider_body == _semantic_sdk_body(sdk_calls[0])
+     assert record.capture_count == 1
+     assert record.settled is True
+ 
+@@ -811,10 +819,8 @@ def test_openai_stream_records_final_sdk_kwargs_not_client_timeout(monkeypatch):
+     assert isinstance(provider_calls[0]["timeout"], Timeout)
+     assert provider_calls[0]["stream"] is True
+     assert provider_calls[0]["stream_options"] == {"include_usage": True}
+-    assert provider_calls[0]["temperature"] == 0.25
+-    assert record.provider_body == {
+-        key: value for key, value in provider_calls[0].items() if key != "timeout"
+-    }
++    assert provider_calls[0]["extra_body"]["temperature"] == 0.25
++    assert record.provider_body == _semantic_sdk_body(provider_calls[0])
+     assert record.capture_count == 1
+     assert record.settled is True
+ 
+@@ -894,8 +900,10 @@ def test_anthropic_stream_records_final_sanitized_sdk_kwargs(monkeypatch):
+     record.settle()
+ 
+     assert response is final_message
+-    assert provider_calls == [{**request, "metadata": {"filtered": True}}]
+-    assert record.provider_body == provider_calls[0]
++    assert provider_calls == [
++        {**request, "extra_body": {"metadata": {"filtered": True}}}
++    ]
++    assert record.provider_body == _semantic_sdk_body(provider_calls[0])
+     assert record.capture_count == 1
+     assert record.settled is True
+ 
+@@ -966,7 +974,7 @@ def test_codex_stream_does_not_accept_body_before_terminal_truth(monkeypatch):
+             "input": "hello",
+             "timeout": 1800.0,
+             "stream": True,
+-            "temperature": 0.25,
++            "extra_body": {"temperature": 0.25},
+         }
+     ]
+     assert record.provider_body is None

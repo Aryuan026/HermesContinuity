@@ -1,0 +1,608 @@
+From 4e8c41d7e0ca43f9f44715fb16afcda3f482c37b Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Wed, 2 Sep 2026 09:29:56 +0800
+Subject: [PATCH] fix(budget): account Bedrock native tool and output buckets
+
+---
+ agent/model_metadata.py             |  91 ++++++++++++++++-
+ hermes_cli/middleware.py            |  31 ++++++
+ hermes_cli/request_overlay.py       |  40 +++++++-
+ tests/agent/test_model_metadata.py  |  43 ++++++++
+ tests/agent/test_transport_truth.py |  91 +++++++++++++++++
+ tests/test_request_overlay.py       | 153 ++++++++++++++++++++++++++++
+ 6 files changed, 445 insertions(+), 4 deletions(-)
+
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index a1f4754..78f547c 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -4148,8 +4148,63 @@ def estimate_provider_body_tokens_rough(body: Any) -> dict[str, Any]:
+             "estimated_tokens": None,
+             "estimate_source": "unknown",
+             "estimate_confidence": "unknown",
++            "output_reserve_tokens": None,
++            "output_reserve_source": "unknown",
++            "output_reserve_confidence": "unknown",
+         }
+ 
++    bedrock_native = "modelId" in body and any(
++        key in body for key in ("messages", "system", "toolConfig", "inferenceConfig")
++    )
++    output_reserve_tokens = None
++    output_reserve_source = "consumer"
++    output_reserve_confidence = "consumer"
++    if bedrock_native:
++        known_bedrock_keys = {
++            "modelId",
++            "messages",
++            "system",
++            "toolConfig",
++            "inferenceConfig",
++            "guardrailConfig",
++            "performanceConfig",
++            "serviceTier",
++            "requestMetadata",
++            "additionalModelResponseFieldPaths",
++        }
++        if any(key not in known_bedrock_keys for key in body):
++            return {
++                "estimated_tokens": None,
++                "estimate_source": "unknown",
++                "estimate_confidence": "unknown",
++                "output_reserve_tokens": None,
++                "output_reserve_source": "unknown",
++                "output_reserve_confidence": "unknown",
++            }
++        inference_config = body.get("inferenceConfig")
++        if inference_config is None:
++            inference_config = {}
++        if not isinstance(inference_config, dict) or any(
++            key not in {"maxTokens", "temperature", "topP", "stopSequences"}
++            for key in inference_config
++        ):
++            return {
++                "estimated_tokens": None,
++                "estimate_source": "unknown",
++                "estimate_confidence": "unknown",
++                "output_reserve_tokens": None,
++                "output_reserve_source": "unknown",
++                "output_reserve_confidence": "unknown",
++            }
++        max_tokens = inference_config.get("maxTokens")
++        if type(max_tokens) is int and max_tokens >= 0:
++            output_reserve_tokens = max_tokens
++            output_reserve_source = "bedrock.inferenceConfig.maxTokens"
++            output_reserve_confidence = "authoritative"
++        else:
++            output_reserve_source = "unknown"
++            output_reserve_confidence = "unknown"
++
+     total = 0
+     for key in ("messages", "input"):
+         value = body.get(key)
+@@ -4166,12 +4221,35 @@ def estimate_provider_body_tokens_rough(body: Any) -> dict[str, Any]:
+         total += _estimate_tools_tokens_rough(tools)
+     elif tools:
+         total += estimate_tokens_rough(str(tools))
++    if bedrock_native:
++        tool_config = body.get("toolConfig")
++        if tool_config is not None:
++            if (
++                not isinstance(tool_config, dict)
++                or any(key not in {"tools", "toolChoice"} for key in tool_config)
++                or not isinstance(tool_config.get("tools"), list)
++            ):
++                return {
++                    "estimated_tokens": None,
++                    "estimate_source": "unknown",
++                    "estimate_confidence": "unknown",
++                    "output_reserve_tokens": output_reserve_tokens,
++                    "output_reserve_source": output_reserve_source,
++                    "output_reserve_confidence": output_reserve_confidence,
++                }
++            total += _estimate_tools_tokens_rough(tool_config["tools"])
++        stop_sequences = (body.get("inferenceConfig") or {}).get("stopSequences")
++        if stop_sequences:
++            total += estimate_tokens_rough(str(stop_sequences))
+ 
+     estimated = int(total * 1.15) + (64 if total else 0)
+     return {
+         "estimated_tokens": estimated,
+         "estimate_source": "hermes.provider_body.rough.v1",
+         "estimate_confidence": "heuristic_with_margin",
++        "output_reserve_tokens": output_reserve_tokens,
++        "output_reserve_source": output_reserve_source,
++        "output_reserve_confidence": output_reserve_confidence,
+     }
+ 
+ 
+@@ -4190,6 +4268,8 @@ def _tool_name_for_cache(tool: Any) -> str:
+     if not isinstance(tool, dict):
+         return ""
+     fn = tool.get("function")
++    if not isinstance(fn, dict):
++        fn = tool.get("toolSpec")
+     if isinstance(fn, dict):
+         name = fn.get("name")
+         if isinstance(name, str):
+@@ -4223,10 +4303,19 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
+         if not isinstance(tool, dict):
+             continue
+         fn = tool.get("function")
++        if not isinstance(fn, dict):
++            fn = tool.get("toolSpec")
+         if isinstance(fn, dict):
+             name = fn.get("name") or ""
+             desc = fn.get("description") or ""
+-            params = fn.get("parameters") or {}
++            params = fn.get("parameters")
++            if params is None:
++                input_schema = fn.get("inputSchema")
++                if isinstance(input_schema, dict) and "json" in input_schema:
++                    params = input_schema.get("json")
++                else:
++                    params = input_schema
++            params = params or {}
+         else:
+             name = tool.get("name") or ""
+             desc = tool.get("description") or ""
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index dfa5fdf..720ead4 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -159,6 +159,9 @@ class TransportRecord:
+         self._provider_body_estimated_tokens: int | None = None
+         self._provider_body_estimate_source = "unknown"
+         self._provider_body_estimate_confidence = "unknown"
++        self._provider_body_output_reserve_tokens: int | None = None
++        self._provider_body_output_reserve_source = "unknown"
++        self._provider_body_output_reserve_confidence = "unknown"
+ 
+     @property
+     def middleware_verified_request(self) -> Dict[str, Any] | None:
+@@ -223,6 +226,21 @@ class TransportRecord:
+         with self._lock:
+             return self._provider_body_estimate_confidence
+ 
++    @property
++    def provider_body_output_reserve_tokens(self) -> int | None:
++        with self._lock:
++            return self._provider_body_output_reserve_tokens
++
++    @property
++    def provider_body_output_reserve_source(self) -> str:
++        with self._lock:
++            return self._provider_body_output_reserve_source
++
++    @property
++    def provider_body_output_reserve_confidence(self) -> str:
++        with self._lock:
++            return self._provider_body_output_reserve_confidence
++
+     def register_provider_body_filter(
+         self,
+         callback: Callable[[Dict[str, Any]], Any],
+@@ -467,6 +485,16 @@ class TransportRecord:
+             self._provider_body_estimate_confidence = str(
+                 estimate.get("estimate_confidence") or "unknown"
+             )
++            reserve = estimate.get("output_reserve_tokens")
++            self._provider_body_output_reserve_tokens = (
++                reserve if isinstance(reserve, int) and reserve >= 0 else None
++            )
++            self._provider_body_output_reserve_source = str(
++                estimate.get("output_reserve_source") or "unknown"
++            )
++            self._provider_body_output_reserve_confidence = str(
++                estimate.get("output_reserve_confidence") or "unknown"
++            )
+ 
+     def _mark_ambiguous(self) -> None:
+         with self._lock:
+@@ -569,6 +597,9 @@ def _provider_body_estimate(body: Any) -> Dict[str, Any]:
+             "estimated_tokens": None,
+             "estimate_source": "unknown",
+             "estimate_confidence": "unknown",
++            "output_reserve_tokens": None,
++            "output_reserve_source": "unknown",
++            "output_reserve_confidence": "unknown",
+         }
+ 
+ 
+diff --git a/hermes_cli/request_overlay.py b/hermes_cli/request_overlay.py
+index e3fade3..e75aee4 100644
+--- a/hermes_cli/request_overlay.py
++++ b/hermes_cli/request_overlay.py
+@@ -435,14 +435,28 @@ class RequestOverlay:
+             estimated_tokens: Any = None,
+             estimate_source: Any = None,
+             estimate_confidence: Any = None,
++            output_reserve_tokens: Any = None,
++            output_reserve_source: Any = None,
++            output_reserve_confidence: Any = None,
+         ) -> Any:
+             native = self.native_request(body, require_original_material=False)
+             if native is None or not validator(body, native):
+                 self._set_disposition(OVERLAY_DRIFTED)
+                 raise ValueError("request_overlay_final_body_drift")
+-            try:
+-                reserve = reserve_tokens(body, context_window_tokens)
+-            except Exception:
++            if output_reserve_source in (None, "", "consumer"):
++                try:
++                    reserve = reserve_tokens(body, context_window_tokens)
++                except Exception:
++                    reserve = None
++            elif (
++                str(output_reserve_source or "")
++                == "bedrock.inferenceConfig.maxTokens"
++                and str(output_reserve_confidence or "") == "authoritative"
++                and type(output_reserve_tokens) is int
++                and output_reserve_tokens >= 0
++            ):
++                reserve = output_reserve_tokens
++            else:
+                 reserve = None
+             estimate_valid = bool(
+                 type(estimated_tokens) is int
+@@ -519,6 +533,26 @@ class RequestOverlayFilterResult:
+     def _commit(self) -> None:
+         self._overlay._set_disposition(self._disposition)
+ 
++    def _accept(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> bool:
++        """Compatibility helper for non-physical test doubles.
++
++        The real transport uses ``_validate`` plus deferred ``_commit`` so a
++        rejected SDK candidate cannot publish a disposition.  Older isolated
++        plugin fakes still model a single successful candidate synchronously.
++        """
++
++        try:
++            from hermes_cli.middleware import current_transport_record
++
++            if current_transport_record() is not None:
++                return False
++        except ImportError:
++            pass
++        if not self._validate(before, after):
++            return False
++        self._commit()
++        return True
++
+ 
+ def _blocked(
+     request: dict[str, Any],
+diff --git a/tests/agent/test_model_metadata.py b/tests/agent/test_model_metadata.py
+index 7cb6b68..7fd93fd 100644
+--- a/tests/agent/test_model_metadata.py
++++ b/tests/agent/test_model_metadata.py
+@@ -74,6 +74,49 @@ class TestEstimateTokensRough:
+         assert estimate["estimate_source"] == "hermes.provider_body.rough.v1"
+         assert estimate["estimate_confidence"] == "heuristic_with_margin"
+ 
++    def test_provider_body_estimator_covers_bedrock_tools_and_output_reserve(self):
++        estimate = estimate_provider_body_tokens_rough(
++            {
++                "modelId": "anthropic.claude-test-v1:0",
++                "messages": [{"role": "user", "content": [{"text": "hello"}]}],
++                "toolConfig": {
++                    "tools": [
++                        {
++                            "toolSpec": {
++                                "name": "large_tool",
++                                "description": "x" * 50_000,
++                                "inputSchema": {"json": {"type": "object"}},
++                            }
++                        }
++                    ]
++                },
++                "inferenceConfig": {"maxTokens": 16_384},
++            }
++        )
++
++        assert estimate["estimated_tokens"] > 10_000
++        assert estimate["estimate_source"] == "hermes.provider_body.rough.v1"
++        assert estimate["estimate_confidence"] == "heuristic_with_margin"
++        assert estimate["output_reserve_tokens"] == 16_384
++        assert (
++            estimate["output_reserve_source"]
++            == "bedrock.inferenceConfig.maxTokens"
++        )
++        assert estimate["output_reserve_confidence"] == "authoritative"
++
++    def test_provider_body_estimator_rejects_unknown_bedrock_token_bucket(self):
++        estimate = estimate_provider_body_tokens_rough(
++            {
++                "modelId": "anthropic.claude-test-v1:0",
++                "messages": [{"role": "user", "content": [{"text": "hello"}]}],
++                "additionalModelRequestFields": {"prompt": "unaccounted"},
++            }
++        )
++
++        assert estimate["estimated_tokens"] is None
++        assert estimate["estimate_source"] == "unknown"
++        assert estimate["estimate_confidence"] == "unknown"
++
+ 
+     def test_known_length(self):
+         assert estimate_tokens_rough("a" * 400) == 100
+diff --git a/tests/agent/test_transport_truth.py b/tests/agent/test_transport_truth.py
+index ad724fc..707a0fc 100644
+--- a/tests/agent/test_transport_truth.py
++++ b/tests/agent/test_transport_truth.py
+@@ -224,6 +224,97 @@ def test_direct_stream_fallback_settles_only_before_post_and_calls_provider_once
+     )
+ 
+ 
++def test_conversation_loop_marks_native_gemini_unsupported_before_execution(
++    monkeypatch,
++):
++    agent = _agent(monkeypatch)
++    provider_requests = []
++    execution_records = []
++    post_records = []
++
++    class GeminiFacade:
++        _hermes_provider_body_truth_supported = False
++
++        def create(self, **body):
++            provider_requests.append(body)
++            return _response()
++
++    facade = GeminiFacade()
++    agent.client = SimpleNamespace(
++        chat=SimpleNamespace(completions=facade),
++    )
++
++    def provider(request, *, on_first_delta=None):
++        del on_first_delta
++        return relay_llm.call_provider_body(facade.create, request)
++
++    def execution(*, request, next_call, transport_record, **_kwargs):
++        execution_records.append(transport_record)
++        try:
++            transport_record.register_provider_body_filter(lambda body: body)
++        except RuntimeError as exc:
++            assert "no final-body truth seam" in str(exc)
++        else:  # pragma: no cover - defensive
++            raise AssertionError("native Gemini must reject final-body filters")
++        native = dict(request)
++        native["messages"] = [
++            {
++                **message,
++                "content": str(message.get("content") or "").replace(
++                    "[PLUGIN OVERLAY]\n",
++                    "",
++                ),
++            }
++            for message in request["messages"]
++        ]
++        return next_call(native)
++
++    _install_callbacks(
++        monkeypatch,
++        execution,
++        lambda **kwargs: post_records.append(kwargs["transport_record"]),
++    )
++    monkeypatch.setattr(
++        middleware,
++        "_get_middleware_owner",
++        lambda *_args, **_kwargs: "native-gemini-test",
++    )
++    monkeypatch.setattr(
++        relay_runtime,
++        "resolve_execution_context",
++        lambda _session_id: (None, None, None),
++    )
++    agent._interruptible_streaming_api_call = provider
++    original_builder = agent._build_api_kwargs
++    agent._build_api_kwargs = lambda messages: {
++        **original_builder(messages),
++        "messages": [
++            *messages[:-1],
++            {
++                **messages[-1],
++                "content": f"[PLUGIN OVERLAY]\n{messages[-1]['content']}",
++            },
++        ],
++    }
++
++    result = agent.run_conversation(
++        "hello",
++        conversation_history=[],
++        task_id="task-native-gemini-unsupported",
++    )
++
++    assert result["final_response"] == "done"
++    assert len(provider_requests) == 1
++    assert "[PLUGIN OVERLAY]" not in str(provider_requests[0])
++    assert len(execution_records) == 1
++    assert execution_records[0].provider_body_supported is False
++    assert execution_records[0].provider_body is None
++    assert execution_records[0].capture_count == 0
++    assert execution_records[0].ambiguous is True
++    assert execution_records[0].settled is False
++    assert post_records == [execution_records[0]]
++
++
+ def test_lean_auxiliary_call_isolated_before_foreground_overlay_and_settlement(
+     monkeypatch,
+ ):
+diff --git a/tests/test_request_overlay.py b/tests/test_request_overlay.py
+index 2c7f1c1..c677d6e 100644
+--- a/tests/test_request_overlay.py
++++ b/tests/test_request_overlay.py
+@@ -46,6 +46,9 @@ class _FilterRecord:
+             "estimated_tokens": 1,
+             "estimate_source": "hermes.provider_body.rough.v1",
+             "estimate_confidence": "heuristic_with_margin",
++            "output_reserve_tokens": None,
++            "output_reserve_source": "consumer",
++            "output_reserve_confidence": "consumer",
+         }
+ 
+     def register_provider_body_filter(self, callback, *, phase="transform"):
+@@ -471,6 +474,97 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+             OVERLAY_REMOVED_ESTIMATE_UNPROVEN,
+         )
+ 
++    def test_bedrock_nested_output_reserve_controls_final_budget(self) -> None:
++        from agent import relay_llm
++        from agent.model_metadata import estimate_provider_body_tokens_rough
++
++        overlay = project(
++            {
++                "modelId": "anthropic.claude-test-v1:0",
++                "messages": [{"role": "user", "content": "current"}],
++                "toolConfig": {
++                    "tools": [
++                        {
++                            "toolSpec": {
++                                "name": "large_tool",
++                                "description": "x" * 20_000,
++                                "inputSchema": {"json": {"type": "object"}},
++                            }
++                        }
++                    ]
++                },
++                "inferenceConfig": {"maxTokens": 16_384},
++            }
++        )
++        estimate = estimate_provider_body_tokens_rough(overlay.request)
++        window = estimate["estimated_tokens"] + 8_000
++        record = middleware.TransportRecord()
++        owner = middleware._CURRENT_MIDDLEWARE_OWNER.set("bedrock-budget-owner")
++        try:
++            self.assertTrue(
++                overlay.register_final_budget_guard(
++                    record,
++                    context_window_tokens=window,
++                    reserve_tokens=lambda _body, _window: 4_096,
++                    validator=lambda _body, native: (
++                        native["messages"][-1]["content"] == "current"
++                    ),
++                )
++            )
++        finally:
++            middleware._CURRENT_MIDDLEWARE_OWNER.reset(owner)
++        record.mark_middleware_verified(overlay.request)
++
++        with middleware.transport_record_scope(record):
++            with relay_llm.provider_body_scope(overlay.request) as filtered:
++                self.assertEqual(filtered["messages"][-1]["content"], "current")
++        record.settle()
++
++        self.assertEqual(overlay.disposition, OVERLAY_REMOVED_FINAL_BUDGET)
++        self.assertEqual(record.provider_body_output_reserve_tokens, 16_384)
++        self.assertEqual(
++            record.provider_body_output_reserve_source,
++            "bedrock.inferenceConfig.maxTokens",
++        )
++        self.assertTrue(record.settled)
++
++    def test_unknown_bedrock_bucket_removes_overlay_as_unproven(self) -> None:
++        from agent import relay_llm
++
++        overlay = project(
++            {
++                "modelId": "anthropic.claude-test-v1:0",
++                "messages": [{"role": "user", "content": "current"}],
++                "inferenceConfig": {"maxTokens": 16},
++                "additionalModelRequestFields": {"prompt": "unaccounted"},
++            }
++        )
++        record = middleware.TransportRecord()
++        owner = middleware._CURRENT_MIDDLEWARE_OWNER.set("bedrock-unknown-owner")
++        try:
++            self.assertTrue(
++                overlay.register_final_budget_guard(
++                    record,
++                    context_window_tokens=100_000,
++                    reserve_tokens=lambda _body, _window: 4_096,
++                    validator=lambda _body, native: (
++                        native["messages"][-1]["content"] == "current"
++                    ),
++                )
++            )
++        finally:
++            middleware._CURRENT_MIDDLEWARE_OWNER.reset(owner)
++        record.mark_middleware_verified(overlay.request)
++
++        with middleware.transport_record_scope(record):
++            with relay_llm.provider_body_scope(overlay.request) as filtered:
++                self.assertEqual(filtered["messages"][-1]["content"], "current")
++        record.settle()
++
++        self.assertEqual(overlay.disposition, OVERLAY_REMOVED_ESTIMATE_UNPROVEN)
++        self.assertEqual(record.provider_body_estimate_source, "unknown")
++        self.assertTrue(record.settled)
++
+     def test_final_carrier_drift_is_visible_and_provider_is_not_blocked(self) -> None:
+         record = _FilterRecord()
+         self.assertTrue(self.register(record, window=100_000))
+@@ -542,6 +636,65 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+                     OVERLAY_REMOVED_FINAL_BUDGET,
+                 )
+ 
++    def test_real_transport_commits_two_owned_overlays_in_either_order(self) -> None:
++        from agent import relay_llm
++
++        native = {
++            "messages": [{"role": "user", "content": "current"}],
++            "max_tokens": 32,
++        }
++        for owners in (("first", "second"), ("second", "first")):
++            with self.subTest(owners=owners):
++                first = project_request_overlay(
++                    native,
++                    marker_namespace="[FIRST QUOTED REFERENCE",
++                    end_boundary="[END FIRST QUOTED REFERENCE]",
++                    marker="[FIRST QUOTED REFERENCE marker=one]",
++                    body="first\n[END FIRST QUOTED REFERENCE]",
++                )
++                second = project_request_overlay(
++                    first.request,
++                    marker_namespace="[SECOND QUOTED REFERENCE",
++                    end_boundary="[END SECOND QUOTED REFERENCE]",
++                    marker="[SECOND QUOTED REFERENCE marker=two]",
++                    body="second\n[END SECOND QUOTED REFERENCE]",
++                )
++                overlays = {"first": first, "second": second}
++                record = middleware.TransportRecord()
++                for owner_name in owners:
++                    owner = middleware._CURRENT_MIDDLEWARE_OWNER.set(owner_name)
++                    try:
++                        self.assertTrue(
++                            overlays[owner_name].register_final_budget_guard(
++                                record,
++                                context_window_tokens=1,
++                                reserve_tokens=lambda _body, _window: 32,
++                                validator=lambda _body, candidate: candidate[
++                                    "messages"
++                                ][0]["content"].endswith("current"),
++                            )
++                        )
++                    finally:
++                        middleware._CURRENT_MIDDLEWARE_OWNER.reset(owner)
++                record.mark_middleware_verified(second.request)
++
++                with middleware.transport_record_scope(record):
++                    with relay_llm.provider_body_scope(second.request) as filtered:
++                        self.assertEqual(filtered, native)
++                record.settle()
++
++                self.assertEqual(record.provider_body, native)
++                self.assertEqual(record.capture_count, 1)
++                self.assertTrue(record.settled)
++                self.assertEqual(
++                    first.disposition,
++                    OVERLAY_REMOVED_FINAL_BUDGET,
++                )
++                self.assertEqual(
++                    second.disposition,
++                    OVERLAY_REMOVED_FINAL_BUDGET,
++                )
++
+     def test_disposition_commits_only_after_host_acceptance(self) -> None:
+         record = _FilterRecord()
+         self.assertTrue(self.register(record, window=100_000))

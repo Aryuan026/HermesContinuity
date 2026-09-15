@@ -82,8 +82,10 @@ a checkpoint or delivery receipt.
 The current revision requires the documented Hermes 0.21 host, including H13
 durable origin proof and group classification. Plugin registration fails
 visibly when that classifier or another required runtime seam is absent. The
-twelve ordered patches under `patches/` remain the reproducible 0.20.5
-predecessor record only; applying them to 0.21 is unsupported.
+35 patches in the four `hermes-0.21.0-wave*` directories reconstruct that host
+from exact upstream; their digest manifest and final Git tree are both checked
+before public tests. The twelve top-level patches remain the reproducible
+0.20.5 predecessor record only; applying them to 0.21 is unsupported.
 
 Report vulnerabilities through a private GitHub security advisory. Do not put
 conversation content, credentials, local paths, or runtime database excerpts in

@@ -1,0 +1,909 @@
+From 12274702cc0adc64d7a83531652445305dcb8cc6 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 17:34:42 +0800
+Subject: [PATCH 10/10] fix(qqbot): settle media ownership after delivery
+
+---
+ gateway/platforms/base.py                     |  13 +
+ gateway/platforms/qqbot/adapter.py            |  31 ++-
+ gateway/run.py                                | 157 +++++++++--
+ gateway/turn_context.py                       |   2 +-
+ tests/gateway/test_qqbot.py                   |  41 ++-
+ .../test_qqbot_interim_media_delivery.py      | 251 ++++++++++++++++--
+ tests/gateway/test_run_progress_topics.py     |  23 +-
+ 7 files changed, 478 insertions(+), 40 deletions(-)
+
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 3ad1ea1..ad38692 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -2590,6 +2590,14 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
+         return
+ 
+ 
++MEDIA_DELIVERY_NOT_DELIVERED = "not_delivered"
++MEDIA_DELIVERY_AMBIGUOUS = "ambiguous"
++
++
++class MediaDeliveryNotAttemptedError(RuntimeError):
++    """A media send failed before the provider delivery call began."""
++
++
+ @dataclass
+ class SendResult:
+     """Result of sending a message."""
+@@ -2622,6 +2630,11 @@ class SendResult:
+     # ``None`` (unset / not classified).  Producers should set this via
+     # :func:`classify_send_error`.
+     error_kind: Optional[str] = None
++    # Media-only delivery truth for failed sends.  ``not_delivered`` proves
++    # that the provider's visible send call did not begin; ``ambiguous`` means
++    # it may have accepted the attachment before the response was lost.  An
++    # unset value is deliberately treated as ambiguous by reservation owners.
++    delivery_disposition: Optional[str] = None
+ 
+ 
+ # Machine-readable send-failure categories.  Kept platform-neutral so every
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index d84ab46..b131b64 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -63,6 +63,8 @@ except ImportError:
+ from gateway.config import Platform, PlatformConfig
+ from gateway.platforms.base import (
+     BasePlatformAdapter,
++    MEDIA_DELIVERY_AMBIGUOUS,
++    MEDIA_DELIVERY_NOT_DELIVERED,
+     MessageEvent,
+     MessageType,
+     SendResult,
+@@ -2487,7 +2489,11 @@ class QQAdapter(BasePlatformAdapter):
+ 
+         if not self.is_connected:
+             if not await self._wait_for_reconnection():
+-                return SendResult(success=False, error="Not connected", retryable=True)
++                return SendResult(
++                    success=False,
++                    error="Not connected",
++                    retryable=True,
++                )
+ 
+         if not content or not content.strip():
+             return SendResult(success=True)
+@@ -2914,7 +2920,12 @@ class QQAdapter(BasePlatformAdapter):
+         """
+         if not self.is_connected:
+             if not await self._wait_for_reconnection():
+-                return SendResult(success=False, error="Not connected", retryable=True)
++                return SendResult(
++                    success=False,
++                    error="Not connected",
++                    retryable=True,
++                    delivery_disposition=MEDIA_DELIVERY_NOT_DELIVERED,
++                )
+ 
+         chat_type = self._guess_chat_type(chat_id)
+         if chat_type == "guild":
+@@ -2922,8 +2933,10 @@ class QQAdapter(BasePlatformAdapter):
+             return SendResult(
+                 success=False,
+                 error="Guild media send not supported via this path",
++                delivery_disposition=MEDIA_DELIVERY_NOT_DELIVERED,
+             )
+ 
++        send_started = False
+         try:
+             if self._is_url(media_source):
+                 # URL upload — let the platform fetch it directly.
+@@ -2957,6 +2970,7 @@ class QQAdapter(BasePlatformAdapter):
+                 return SendResult(
+                     success=False,
+                     error=f"Upload returned no file_info: {upload}",
++                    delivery_disposition=MEDIA_DELIVERY_NOT_DELIVERED,
+                 )
+ 
+             # Send media message
+@@ -2971,6 +2985,7 @@ class QQAdapter(BasePlatformAdapter):
+             if reply_to:
+                 body["msg_id"] = reply_to
+ 
++            send_started = True
+             send_data = await self._api_request(
+                 "POST",
+                 (
+@@ -2999,6 +3014,7 @@ class QQAdapter(BasePlatformAdapter):
+                     f"({exc.file_size_human}). Retry tomorrow."
+                 ),
+                 retryable=False,
++                delivery_disposition=MEDIA_DELIVERY_NOT_DELIVERED,
+             )
+         except UploadFileTooLargeError as exc:
+             logger.warning(
+@@ -3012,10 +3028,19 @@ class QQAdapter(BasePlatformAdapter):
+                     f"QQ per-file upload limit ({exc.limit_human})."
+                 ),
+                 retryable=False,
++                delivery_disposition=MEDIA_DELIVERY_NOT_DELIVERED,
+             )
+         except Exception as exc:
+             logger.error("[%s] Media send failed: %s", self._log_tag, exc)
+-            return SendResult(success=False, error=str(exc) or type(exc).__name__)
++            return SendResult(
++                success=False,
++                error=str(exc) or type(exc).__name__,
++                delivery_disposition=(
++                    MEDIA_DELIVERY_AMBIGUOUS
++                    if send_started
++                    else MEDIA_DELIVERY_NOT_DELIVERED
++                ),
++            )
+ 
+     async def _upload_local_file(
+             self,
+diff --git a/gateway/run.py b/gateway/run.py
+index ba183e0..411f557 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -3012,6 +3012,8 @@ from gateway.turn_context import TurnContext
+ from gateway.platforms.base import (
+     BasePlatformAdapter,
+     EphemeralReply,
++    MEDIA_DELIVERY_NOT_DELIVERED,
++    MediaDeliveryNotAttemptedError,
+     MessageEvent,
+     MessageType,
+     _prefix_within_utf16_limit,
+@@ -5946,7 +5948,7 @@ class TurnRunner:
+                                     metadata=ctx._status_thread_metadata,
+                                     event_message_id=ctx.event_message_id,
+                                     send_text=False,
+-                                    media_claims=ctx.media_delivery_claims,
++                                    media_reservations=ctx.media_delivery_reservations,
+                                     run_generation=ctx.run_generation,
+                                 ),
+                                 ctx._loop_for_step,
+@@ -7303,7 +7305,11 @@ class TurnRunner:
+             "session_id": effective_session_id,
+             "response_previewed": result.get("response_previewed", False),
+             "response_transformed": result.get("response_transformed", False),
+-            "_media_delivery_claims": ctx.media_delivery_claims,
++            "_media_delivery_reservations": (
++                ctx.media_delivery_reservations
++                if ctx.source.platform == Platform.QQBOT
++                else None
++            ),
+             # Pass through the agent_persisted flag so the persistence block
+             # above can correctly determine whether the codex app-server path
+             # self-persisted (it didn't — see codex_runtime.py).  Default
+@@ -22811,7 +22817,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             response,
+                             event,
+                             _media_adapter,
+-                            media_claims=agent_result.get("_media_delivery_claims"),
++                            media_reservations=agent_result.get(
++                                "_media_delivery_reservations"
++                            ),
+                             run_generation=run_generation,
+                         )
+                 # Streaming already delivered the body text, but the footer was
+@@ -22850,7 +22858,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         response,
+                         event,
+                         _media_adapter,
+-                        media_claims=agent_result.get("_media_delivery_claims"),
++                        media_reservations=agent_result.get(
++                            "_media_delivery_reservations"
++                        ),
+                         run_generation=run_generation,
+                     )
+                     _unused_media, response = _media_adapter.extract_media(response)
+@@ -24247,7 +24257,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         event_message_id: Optional[str] = None,
+         send_text: bool = True,
+         deliver_media: bool = True,
+-        media_claims: Optional[set] = None,
++        media_reservations: Optional[dict] = None,
+         run_generation: Optional[int] = None,
+     ) -> None:
+         """Deliver interim QQ text and explicit attachments without path leaks."""
+@@ -24274,7 +24284,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 event,
+                 adapter,
+                 thread_metadata=metadata,
+-                media_claims=media_claims,
++                media_reservations=media_reservations,
++                final_delivery=False,
+                 run_generation=run_generation,
+             )
+ 
+@@ -24284,8 +24295,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         event: MessageEvent,
+         adapter,
+         thread_metadata: Optional[Dict[str, Any]] = None,
+-        media_claims: Optional[set] = None,
++        media_reservations: Optional[dict] = None,
+         run_generation: Optional[int] = None,
++        final_delivery: bool = True,
+     ) -> None:
+         """Extract explicit MEDIA: tags from a response and deliver them.
+ 
+@@ -24344,8 +24356,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
+             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+ 
+-            if media_claims is not None:
+-                unclaimed_media = []
++            if media_reservations is not None:
+                 for media_path, is_voice in media_files:
+                     ext = Path(media_path).suffix.lower()
+                     if force_document_attachments:
+@@ -24368,11 +24379,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         str(Path(media_path).resolve(strict=False)),
+                         delivery_mode,
+                     )
+-                    if identity in media_claims:
++                    reservation = await self._reserve_media_delivery(
++                        media_reservations,
++                        identity,
++                    )
++                    if reservation is None:
+                         continue
+-                    media_claims.add(identity)
+-                    unclaimed_media.append((media_path, is_voice))
+-                media_files = unclaimed_media
++                    if delivery_mode == "image":
++                        send_media = lambda path=media_path: adapter.send_image_file(
++                            chat_id=event.source.chat_id,
++                            image_path=path,
++                            metadata=_thread_meta,
++                        )
++                    elif delivery_mode in {"voice", "audio"}:
++                        send_media = lambda path=media_path, voice=is_voice: adapter.send_voice(
++                            chat_id=event.source.chat_id,
++                            audio_path=path,
++                            metadata=_thread_meta,
++                            is_voice=voice,
++                        )
++                    elif delivery_mode == "video":
++                        send_media = lambda path=media_path: adapter.send_video(
++                            chat_id=event.source.chat_id,
++                            video_path=path,
++                            metadata=_thread_meta,
++                        )
++                    else:
++                        send_media = lambda path=media_path: adapter.send_document(
++                            chat_id=event.source.chat_id,
++                            file_path=path,
++                            metadata=_thread_meta,
++                        )
++                    await self._run_reserved_media_delivery(
++                        adapter=adapter,
++                        event=event,
++                        media_path=media_path,
++                        is_voice=is_voice,
++                        metadata=_thread_meta,
++                        reservation=reservation,
++                        send_media=send_media,
++                        final_delivery=final_delivery,
++                    )
++                return
+ 
+             # Partition out images so they can be sent as a single batch
+             # (e.g. Signal's multi-attachment RPC). When [[as_document]] was
+@@ -24428,6 +24476,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         except Exception as e:
+             logger.warning("Post-stream media extraction failed: %s", e)
+ 
++    @staticmethod
++    async def _reserve_media_delivery(
++        reservations: dict,
++        identity: tuple,
++    ) -> Optional[asyncio.Future]:
++        """Wait for the current owner and reserve only undelivered media."""
++        loop = asyncio.get_running_loop()
++        while True:
++            current = reservations.get(identity)
++            if current is None:
++                reservation = loop.create_future()
++                reservations[identity] = reservation
++                return reservation
++            disposition = await asyncio.shield(current)
++            if disposition != "definite_failed":
++                return None
++            reservation = loop.create_future()
++            if reservations.get(identity) is current:
++                reservations[identity] = reservation
++                return reservation
++
++    @staticmethod
++    async def _run_reserved_media_delivery(
++        *,
++        adapter,
++        event: MessageEvent,
++        media_path: str,
++        is_voice: bool,
++        metadata: Dict[str, Any],
++        reservation: asyncio.Future,
++        send_media: Callable[[], Awaitable[Any]],
++        final_delivery: bool,
++    ) -> None:
++        disposition = "ambiguous"
++        error = None
++        try:
++            result = await send_media()
++            if getattr(result, "success", False):
++                disposition = "delivered"
++            elif (
++                getattr(result, "delivery_disposition", None)
++                == MEDIA_DELIVERY_NOT_DELIVERED
++            ):
++                disposition = "definite_failed"
++                error = getattr(result, "error", None)
++            else:
++                error = getattr(result, "error", None)
++        except MediaDeliveryNotAttemptedError as exc:
++            disposition = "definite_failed"
++            error = str(exc)
++        except asyncio.CancelledError:
++            if not reservation.done():
++                reservation.set_result("ambiguous")
++            raise
++        except Exception as exc:
++            error = str(exc) or type(exc).__name__
++        if not reservation.done():
++            reservation.set_result(disposition)
++        if disposition == "definite_failed" and final_delivery:
++            await adapter._notify_media_delivery_failure(
++                event.source.chat_id,
++                media_path,
++                is_voice=is_voice,
++                metadata=metadata,
++            )
++        elif disposition == "ambiguous":
++            logger.warning(
++                "[%s] Media delivery outcome is ambiguous for %s: %s",
++                adapter.name,
++                Path(media_path).name,
++                error or "provider returned no delivery truth",
++            )
++
+     async def _deliver_queued_first_response(
+         self,
+         response: str,
+@@ -24438,7 +24559,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         text_already_delivered: bool = False,
+         deliver_media: bool = True,
+         stream_consumer=None,
+-        media_claims: Optional[set] = None,
++        media_reservations: Optional[dict] = None,
+         run_generation: Optional[int] = None,
+     ) -> None:
+         """Deliver a queued response using the normal text+attachment split."""
+@@ -24502,7 +24623,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             synthetic_event,
+             adapter,
+             thread_metadata=metadata,
+-            media_claims=media_claims,
++            media_reservations=media_reservations,
+             run_generation=run_generation,
+         )
+ 
+@@ -31698,7 +31819,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                                 text_already_delivered=_already_streamed,
+                                 deliver_media=not _delivery_result.get("failed"),
+                                 stream_consumer=_sc,
+-                                media_claims=turn_ctx.media_delivery_claims,
++                                media_reservations=(
++                                    turn_ctx.media_delivery_reservations
++                                    if source.platform == Platform.QQBOT
++                                    else None
++                                ),
+                                 run_generation=turn_ctx.run_generation,
+                             )
+                         except Exception as e:
+diff --git a/gateway/turn_context.py b/gateway/turn_context.py
+index c2d0cd7..b48a24a 100644
+--- a/gateway/turn_context.py
++++ b/gateway/turn_context.py
+@@ -113,7 +113,7 @@ class TurnContext:
+     tools_holder: list = field(default_factory=lambda: [None])
+     stream_consumer_holder: list = field(default_factory=lambda: [None])
+     streaming_tts_consumer_holder: list = field(default_factory=lambda: [None])
+-    media_delivery_claims: set = field(default_factory=set)
++    media_delivery_reservations: dict = field(default_factory=dict)
+ 
+     # --- voice-ack wiring --------------------------------------------------
+     _voice_ack_fired: list = field(default_factory=lambda: [False])
+diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
+index 7ea3ceb..be352fc 100644
+--- a/tests/gateway/test_qqbot.py
++++ b/tests/gateway/test_qqbot.py
+@@ -67,6 +67,46 @@ class TestQQAdapterInit:
+         assert adapter._markdown_support is True
+ 
+ 
++class TestQQMediaDeliveryTruth:
++    def _connected_adapter(self):
++        from gateway.platforms.qqbot import QQAdapter
++
++        adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
++        adapter._running = True
++        adapter._ws = SimpleNamespace(closed=False)
++        return adapter
++
++    @pytest.mark.asyncio
++    async def test_upload_failure_is_definitely_not_delivered(self):
++        adapter = self._connected_adapter()
++
++        async def upload_without_file(*_args, **_kwargs):
++            return {}
++
++        adapter._upload_media = upload_without_file
++        result = await adapter.send_document("chat", "https://example.test/a.pdf")
++
++        assert result.success is False
++        assert result.delivery_disposition == "not_delivered"
++
++    @pytest.mark.asyncio
++    async def test_final_send_timeout_is_ambiguous(self):
++        adapter = self._connected_adapter()
++
++        async def uploaded(*_args, **_kwargs):
++            return {"file_info": "token"}
++
++        async def timeout(*_args, **_kwargs):
++            raise TimeoutError("provider response lost")
++
++        adapter._upload_media = uploaded
++        adapter._api_request = timeout
++        result = await adapter.send_document("chat", "https://example.test/a.pdf")
++
++        assert result.success is False
++        assert result.delivery_disposition == "ambiguous"
++
++
+ # ---------------------------------------------------------------------------
+ # _coerce_list
+ # ---------------------------------------------------------------------------
+@@ -1270,4 +1310,3 @@ class TestReadEventsClosedWsGuard:
+         adapter._ws = SimpleNamespace(closed=True)
+         with pytest.raises(RuntimeError):
+             asyncio.run(adapter._read_events())
+-
+diff --git a/tests/gateway/test_qqbot_interim_media_delivery.py b/tests/gateway/test_qqbot_interim_media_delivery.py
+index cbedca1..9a68ed7 100644
+--- a/tests/gateway/test_qqbot_interim_media_delivery.py
++++ b/tests/gateway/test_qqbot_interim_media_delivery.py
+@@ -1,12 +1,18 @@
+ """QQ interim responses keep text clean and deliver explicit media natively."""
+ 
++import asyncio
++
+ from types import SimpleNamespace
+ from unittest.mock import AsyncMock
+ 
+ import pytest
+ 
+ from gateway.config import Platform
+-from gateway.platforms.base import BasePlatformAdapter, SendResult
++from gateway.platforms.base import (
++    BasePlatformAdapter,
++    MediaDeliveryNotAttemptedError,
++    SendResult,
++)
+ from gateway.run import GatewayRunner
+ from gateway.session import SessionSource
+ 
+@@ -36,7 +42,9 @@ def _adapter():
+         send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
++        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
+         send_multiple_images=AsyncMock(return_value=SendResult(success=True, message_id="image")),
++        _notify_media_delivery_failure=AsyncMock(),
+     )
+ 
+ 
+@@ -132,7 +140,7 @@ async def test_interim_and_streamed_final_claim_same_image_once(
+     media_file = _allowed_media_path(tmp_path, monkeypatch, "chart.png")
+     adapter = _adapter()
+     runner = _runner()
+-    claims = set()
++    reservations = {}
+     response = f"Here is the chart.\nMEDIA:{media_file}"
+     event = SimpleNamespace(source=_source())
+ 
+@@ -142,7 +150,7 @@ async def test_interim_and_streamed_final_claim_same_image_once(
+         _source(),
+         adapter,
+         send_text=False,
+-        media_claims=claims,
++        media_reservations=reservations,
+         run_generation=7,
+     )
+     final = lambda: GatewayRunner._deliver_media_from_response(
+@@ -150,14 +158,14 @@ async def test_interim_and_streamed_final_claim_same_image_once(
+         response,
+         event,
+         adapter,
+-        media_claims=claims,
++        media_reservations=reservations,
+         run_generation=7,
+     )
+ 
+     await (final() if final_first else interim())
+     await (interim() if final_first else final())
+ 
+-    adapter.send_multiple_images.assert_awaited_once()
++    adapter.send_image_file.assert_awaited_once()
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -175,7 +183,7 @@ async def test_media_claim_identity_preserves_delivery_mode(
+     media_file = _allowed_media_path(tmp_path, monkeypatch, name)
+     adapter = _adapter()
+     runner = _runner()
+-    claims = set()
++    reservations = {}
+     response = f"{directive}MEDIA:{media_file}"
+     event = SimpleNamespace(source=_source())
+ 
+@@ -185,7 +193,7 @@ async def test_media_claim_identity_preserves_delivery_mode(
+         _source(),
+         adapter,
+         send_text=False,
+-        media_claims=claims,
++        media_reservations=reservations,
+         run_generation=11,
+     )
+     await GatewayRunner._deliver_media_from_response(
+@@ -193,7 +201,7 @@ async def test_media_claim_identity_preserves_delivery_mode(
+         response,
+         event,
+         adapter,
+-        media_claims=claims,
++        media_reservations=reservations,
+         run_generation=11,
+     )
+ 
+@@ -206,7 +214,7 @@ async def test_final_delivers_attachment_not_seen_by_interim(tmp_path, monkeypat
+     second = _allowed_media_path(tmp_path, monkeypatch, "second.pdf")
+     adapter = _adapter()
+     runner = _runner()
+-    claims = set()
++    reservations = {}
+ 
+     await GatewayRunner._deliver_interim_assistant_response(
+         runner,
+@@ -214,7 +222,7 @@ async def test_final_delivers_attachment_not_seen_by_interim(tmp_path, monkeypat
+         _source(),
+         adapter,
+         send_text=False,
+-        media_claims=claims,
++        media_reservations=reservations,
+         run_generation=13,
+     )
+     await GatewayRunner._deliver_media_from_response(
+@@ -222,11 +230,11 @@ async def test_final_delivers_attachment_not_seen_by_interim(tmp_path, monkeypat
+         f"Final.\nMEDIA:{first}\nMEDIA:{second}",
+         SimpleNamespace(source=_source()),
+         adapter,
+-        media_claims=claims,
++        media_reservations=reservations,
+         run_generation=13,
+     )
+ 
+-    adapter.send_multiple_images.assert_awaited_once()
++    adapter.send_image_file.assert_awaited_once()
+     adapter.send_document.assert_awaited_once()
+     assert adapter.send_document.await_args.kwargs["file_path"] == str(second)
+ 
+@@ -236,7 +244,7 @@ async def test_non_stream_interim_leaves_media_to_final_owner(tmp_path, monkeypa
+     media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
+     adapter = _adapter()
+     runner = _runner()
+-    claims = set()
++    reservations = {}
+     response = f"Report ready.\nMEDIA:{media_file}"
+ 
+     await GatewayRunner._deliver_interim_assistant_response(
+@@ -245,7 +253,7 @@ async def test_non_stream_interim_leaves_media_to_final_owner(tmp_path, monkeypa
+         _source(),
+         adapter,
+         deliver_media=False,
+-        media_claims=claims,
++        media_reservations=reservations,
+         run_generation=17,
+     )
+     await GatewayRunner._deliver_media_from_response(
+@@ -253,9 +261,222 @@ async def test_non_stream_interim_leaves_media_to_final_owner(tmp_path, monkeypa
+         response,
+         SimpleNamespace(source=_source()),
+         adapter,
+-        media_claims=claims,
++        media_reservations=reservations,
+         run_generation=17,
+     )
+ 
+     adapter.send.assert_awaited_once()
+     adapter.send_document.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_definite_interim_failure_allows_final_takeover(tmp_path, monkeypatch):
++    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
++    adapter = _adapter()
++    adapter.send_document.side_effect = [
++        SendResult(
++            success=False,
++            error="not connected",
++            delivery_disposition="not_delivered",
++        ),
++        SendResult(success=True, message_id="final-doc"),
++    ]
++    reservations = {}
++    response = f"Report ready.\nMEDIA:{media_file}"
++
++    await GatewayRunner._deliver_interim_assistant_response(
++        _runner(),
++        response,
++        _source(),
++        adapter,
++        send_text=False,
++        media_reservations=reservations,
++        run_generation=19,
++    )
++    await GatewayRunner._deliver_media_from_response(
++        _runner(),
++        response,
++        SimpleNamespace(source=_source()),
++        adapter,
++        media_reservations=reservations,
++        run_generation=19,
++    )
++
++    assert adapter.send_document.await_count == 2
++    assert {future.result() for future in reservations.values()} == {"delivered"}
++    adapter._notify_media_delivery_failure.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_definite_final_failure_emits_failure_notice(tmp_path, monkeypatch):
++    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
++    adapter = _adapter()
++    adapter.send_document.return_value = SendResult(
++        success=False,
++        error="unsupported target",
++        delivery_disposition="not_delivered",
++    )
++    reservations = {}
++
++    await GatewayRunner._deliver_media_from_response(
++        _runner(),
++        f"Report ready.\nMEDIA:{media_file}",
++        SimpleNamespace(source=_source()),
++        adapter,
++        media_reservations=reservations,
++        run_generation=23,
++    )
++
++    adapter.send_document.assert_awaited_once()
++    adapter._notify_media_delivery_failure.assert_awaited_once()
++    assert {future.result() for future in reservations.values()} == {
++        "definite_failed"
++    }
++
++
++@pytest.mark.asyncio
++async def test_pre_api_exception_allows_final_takeover(tmp_path, monkeypatch):
++    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
++    adapter = _adapter()
++    adapter.send_document.side_effect = [
++        MediaDeliveryNotAttemptedError("client unavailable"),
++        SendResult(success=True, message_id="final-doc"),
++    ]
++    reservations = {}
++    response = f"Report ready.\nMEDIA:{media_file}"
++
++    await GatewayRunner._deliver_interim_assistant_response(
++        _runner(),
++        response,
++        _source(),
++        adapter,
++        send_text=False,
++        media_reservations=reservations,
++        run_generation=29,
++    )
++    await GatewayRunner._deliver_media_from_response(
++        _runner(),
++        response,
++        SimpleNamespace(source=_source()),
++        adapter,
++        media_reservations=reservations,
++        run_generation=29,
++    )
++
++    assert adapter.send_document.await_count == 2
++    assert {future.result() for future in reservations.values()} == {"delivered"}
++
++
++@pytest.mark.asyncio
++async def test_ambiguous_timeout_is_not_retried_by_final(tmp_path, monkeypatch):
++    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
++    adapter = _adapter()
++    adapter.send_document.side_effect = TimeoutError("provider response lost")
++    reservations = {}
++    response = f"Report ready.\nMEDIA:{media_file}"
++
++    await GatewayRunner._deliver_interim_assistant_response(
++        _runner(),
++        response,
++        _source(),
++        adapter,
++        send_text=False,
++        media_reservations=reservations,
++        run_generation=31,
++    )
++    await GatewayRunner._deliver_media_from_response(
++        _runner(),
++        response,
++        SimpleNamespace(source=_source()),
++        adapter,
++        media_reservations=reservations,
++        run_generation=31,
++    )
++
++    adapter.send_document.assert_awaited_once()
++    assert {future.result() for future in reservations.values()} == {"ambiguous"}
++
++
++@pytest.mark.asyncio
++async def test_final_waits_for_pending_interim_attempt(tmp_path, monkeypatch):
++    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
++    adapter = _adapter()
++    started = asyncio.Event()
++    release = asyncio.Event()
++
++    async def delayed_success(**_kwargs):
++        started.set()
++        await release.wait()
++        return SendResult(success=True, message_id="interim-doc")
++
++    adapter.send_document.side_effect = delayed_success
++    reservations = {}
++    response = f"Report ready.\nMEDIA:{media_file}"
++    interim = asyncio.create_task(
++        GatewayRunner._deliver_interim_assistant_response(
++            _runner(),
++            response,
++            _source(),
++            adapter,
++            send_text=False,
++            media_reservations=reservations,
++            run_generation=37,
++        )
++    )
++    await started.wait()
++    final = asyncio.create_task(
++        GatewayRunner._deliver_media_from_response(
++            _runner(),
++            response,
++            SimpleNamespace(source=_source()),
++            adapter,
++            media_reservations=reservations,
++            run_generation=37,
++        )
++    )
++    await asyncio.sleep(0)
++
++    assert adapter.send_document.await_count == 1
++    assert not final.done()
++    release.set()
++    await asyncio.gather(interim, final)
++    assert adapter.send_document.await_count == 1
++
++
++@pytest.mark.asyncio
++async def test_image_results_are_committed_per_attachment(tmp_path, monkeypatch):
++    first = _allowed_media_path(tmp_path, monkeypatch, "first.png")
++    second = _allowed_media_path(tmp_path, monkeypatch, "second.png")
++    adapter = _adapter()
++    adapter.send_image_file.side_effect = [
++        SendResult(success=True, message_id="first"),
++        SendResult(
++            success=False,
++            error="upload rejected",
++            delivery_disposition="not_delivered",
++        ),
++        SendResult(success=True, message_id="second-final"),
++    ]
++    reservations = {}
++    response = f"MEDIA:{first}\nMEDIA:{second}"
++
++    await GatewayRunner._deliver_interim_assistant_response(
++        _runner(),
++        response,
++        _source(),
++        adapter,
++        send_text=False,
++        media_reservations=reservations,
++        run_generation=41,
++    )
++    await GatewayRunner._deliver_media_from_response(
++        _runner(),
++        response,
++        SimpleNamespace(source=_source()),
++        adapter,
++        media_reservations=reservations,
++        run_generation=41,
++    )
++
++    assert adapter.send_image_file.await_count == 3
++    assert {future.result() for future in reservations.values()} == {"delivered"}
+diff --git a/tests/gateway/test_run_progress_topics.py b/tests/gateway/test_run_progress_topics.py
+index aecb6eb..49f4a36 100644
+--- a/tests/gateway/test_run_progress_topics.py
++++ b/tests/gateway/test_run_progress_topics.py
+@@ -77,6 +77,7 @@ class MediaCaptureProgressAdapter(ProgressCaptureAdapter):
+     def __init__(self, platform=Platform.TELEGRAM):
+         super().__init__(platform=platform)
+         self.image_batches = []
++        self.image_files = []
+ 
+     async def send_multiple_images(
+         self, chat_id, images, metadata=None, human_delay=0.0
+@@ -89,6 +90,18 @@ class MediaCaptureProgressAdapter(ProgressCaptureAdapter):
+             }
+         )
+ 
++    async def send_image_file(
++        self, chat_id, image_path, caption=None, reply_to=None, metadata=None, **kwargs
++    ) -> SendResult:
++        self.image_files.append(
++            {
++                "chat_id": chat_id,
++                "image_path": image_path,
++                "metadata": metadata,
++            }
++        )
++        return SendResult(success=True, message_id="image")
++
+ 
+ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
+     """Adapter with a tiny platform limit to exercise progress rollover."""
+@@ -1355,7 +1368,9 @@ async def test_run_agent_queued_message_delivers_streamed_first_response_media(
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_qq_turnrunner_preview_and_final_share_media_claims(monkeypatch, tmp_path):
++async def test_qq_turnrunner_preview_and_final_share_media_reservation(
++    monkeypatch, tmp_path
++):
+     media_path = tmp_path / "previewed-final.png"
+     media_path.write_bytes(b"media")
+     QQPreviewedMediaAgent.media_path = media_path
+@@ -1373,7 +1388,7 @@ async def test_qq_turnrunner_preview_and_final_share_media_claims(monkeypatch, t
+         adapter_cls=MediaCaptureProgressAdapter,
+     )
+     await asyncio.sleep(0)
+-    assert len(adapter.image_batches) == 1
++    assert len(adapter.image_files) == 1
+ 
+     source = SessionSource(
+         platform=Platform.QQBOT,
+@@ -1386,10 +1401,10 @@ async def test_qq_turnrunner_preview_and_final_share_media_claims(monkeypatch, t
+         result["final_response"],
+         MessageEvent(text="", source=source),
+         adapter,
+-        media_claims=result["_media_delivery_claims"],
++        media_reservations=result["_media_delivery_reservations"],
+     )
+ 
+-    assert len(adapter.image_batches) == 1
++    assert len(adapter.image_files) == 1
+ 
+ 
+ @pytest.mark.asyncio
+-- 
+2.50.1 (Apple Git-155)
+

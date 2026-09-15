@@ -1,0 +1,842 @@
+From 98206156a21de08a48e7b12728f5346ea121e36a Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Wed, 2 Sep 2026 09:22:30 +0800
+Subject: [PATCH 5/8] fix(transport): model explicit SDK fallbacks as successor
+ attempts
+
+---
+ agent/anthropic_adapter.py                    |   3 +-
+ agent/chat_completion_helpers.py              |   5 +-
+ agent/relay_llm.py                            |  39 ++-
+ hermes_cli/middleware.py                      | 146 ++++++++++-
+ hermes_cli/request_overlay.py                 |   6 +-
+ .../test_transport_successor_attempts.py      | 234 ++++++++++++++++++
+ tests/agent/test_transport_truth.py           |   3 +-
+ tests/test_middleware.py                      |  17 +-
+ tests/test_request_overlay.py                 |  71 +++++-
+ 9 files changed, 489 insertions(+), 35 deletions(-)
+ create mode 100644 tests/agent/test_transport_successor_attempts.py
+
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index b2e62fc..4a35bee 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -1182,7 +1182,7 @@ def create_anthropic_message(
+         stream_kwargs = dict(api_kwargs)
+         stream_kwargs.pop("stream", None)
+         try:
+-            with relay_llm.call_provider_body(stream_fn, stream_kwargs) as stream:
++            with relay_llm.provider_body_context(stream_fn, stream_kwargs) as stream:
+                 if callable(on_response):
+                     try:
+                         on_response(getattr(stream, "response", None))
+@@ -1213,6 +1213,7 @@ def create_anthropic_message(
+                 log_prefix,
+                 exc,
+             )
++            relay_llm.allow_provider_successor()
+ 
+     create_kwargs = dict(api_kwargs)
+     create_kwargs.pop("stream", None)
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 983a706..6d25b14 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -975,6 +975,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+                 _bedrock_exc, api_kwargs
+             )
+             if _retry_kwargs is not None:
++                relay_llm.allow_provider_successor()
+                 raw_response = relay_llm.call_provider_body(
+                     client.converse,
+                     _retry_kwargs,
+@@ -3601,6 +3602,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                             _bedrock_exc, final_kwargs
+                         )
+                         if _retry_kwargs is not None:
++                            relay_llm.allow_provider_successor()
+                             return relay_llm.call_provider_body(
+                                 client.converse_stream,
+                                 _retry_kwargs,
+@@ -3610,6 +3612,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                         # the real provider request and terminal response still
+                         # share one lifecycle boundary.
+                         if is_streaming_access_denied_error(_bedrock_exc):
++                            relay_llm.allow_provider_successor()
+                             agent._disable_streaming = True
+                             agent._safe_print(
+                                 "\n⚠  AWS IAM denied bedrock:InvokeModelWithResponseStream — "
+@@ -4713,7 +4716,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                 final_kwargs,
+                 log_prefix=getattr(agent, "log_prefix", ""),
+             )
+-            manager = relay_llm.call_provider_body(
++            manager = relay_llm.provider_body_context(
+                 request_client.messages.stream,
+                 final_kwargs,
+             )
+diff --git a/agent/relay_llm.py b/agent/relay_llm.py
+index 6e4e195..8ba8f59 100644
+--- a/agent/relay_llm.py
++++ b/agent/relay_llm.py
+@@ -36,7 +36,7 @@ def _capture_provider_body(body: dict[str, Any]) -> None:
+ 
+ @contextmanager
+ def provider_body_scope(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+-    """Filter and capture final SDK JSON kwargs, hiding client-only timeout."""
++    """Run one physical SDK attempt, hiding client-only timeout from truth."""
+ 
+     from hermes_cli.middleware import current_transport_record
+ 
+@@ -45,17 +45,24 @@ def provider_body_scope(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+     provider_body = {key: value for key, value in body.items() if key != "timeout"}
+     record = current_transport_record()
+     if record is not None:
+-        filtered = record.filter_provider_body(provider_body)
++        filtered = record.begin_provider_body_attempt(provider_body)
+         if filtered is not None:
+             provider_body = filtered
+-    _capture_provider_body(provider_body)
+     final_body = dict(provider_body)
+     if has_client_timeout:
+         final_body["timeout"] = client_timeout
+     from hermes_cli.middleware import transport_record_scope
+ 
+-    with transport_record_scope(None):
+-        yield final_body
++    try:
++        with transport_record_scope(None):
++            yield final_body
++    except BaseException:
++        if record is not None:
++            record.reject_provider_body_attempt()
++        raise
++    else:
++        if record is not None:
++            record.accept_provider_body_attempt(provider_body)
+ 
+ 
+ def call_provider_body(
+@@ -68,6 +75,28 @@ def call_provider_body(
+         return callback(**final_body)
+ 
+ 
++@contextmanager
++def provider_body_context(
++    callback: Callable[..., Any],
++    body: dict[str, Any],
++) -> Iterator[Any]:
++    """Keep one provider attempt open through an SDK context manager."""
++
++    with provider_body_scope(body) as final_body:
++        with callback(**final_body) as resource:
++            yield resource
++
++
++def allow_provider_successor() -> None:
++    """Continue only after a provider-specific pre-accept rejection proof."""
++
++    from hermes_cli.middleware import current_transport_record
++
++    record = current_transport_record()
++    if record is not None:
++        record.allow_provider_successor()
++
++
+ def _without_transport_record(callback: Callable[..., Any], *args: Any) -> Any:
+     from hermes_cli.middleware import transport_record_scope
+ 
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index 55cc068..eaa8841 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -130,8 +130,15 @@ class RequestMiddlewareResult:
+     trace: List[Dict[str, Any]] = field(default_factory=list)
+ 
+ 
++@dataclass
++class _ProviderAttempt:
++    body: Dict[str, Any] | None
++    estimate: Dict[str, Any]
++    pending_acceptances: List[Any] = field(default_factory=list)
++
++
+ class TransportRecord:
+-    """Process-private truth for one physical provider attempt."""
++    """Process-private truth for one logical execution and its SDK attempts."""
+ 
+     schema_version = TRANSPORT_SCHEMA_VERSION
+ 
+@@ -145,7 +152,9 @@ class TransportRecord:
+         self._provider_body_filters: List[
+             tuple[str, str, Callable[[Dict[str, Any]], Any]]
+         ] = []
+-        self._provider_body_filters_applied = False
++        self._provider_attempt_count = 0
++        self._active_provider_attempt: _ProviderAttempt | None = None
++        self._failed_provider_attempt_pending_retry = False
+         self._provider_body_estimated_tokens: int | None = None
+         self._provider_body_estimate_source = "unknown"
+         self._provider_body_estimate_confidence = "unknown"
+@@ -165,6 +174,11 @@ class TransportRecord:
+         with self._lock:
+             return self._capture_count
+ 
++    @property
++    def provider_attempt_count(self) -> int:
++        with self._lock:
++            return self._provider_attempt_count
++
+     @property
+     def ambiguous(self) -> bool:
+         with self._lock:
+@@ -232,7 +246,7 @@ class TransportRecord:
+                 "provider-body filter phase must be 'transform' or 'final_guard'"
+             )
+         with self._lock:
+-            if self._capture_count or self._provider_body_filters_applied:
++            if self._capture_count or self._provider_attempt_count:
+                 raise RuntimeError("provider-body filter registration is closed")
+             if any(
+                 existing_owner == owner
+@@ -243,15 +257,29 @@ class TransportRecord:
+                 )
+             self._provider_body_filters.append((owner, phase, callback))
+ 
+-    def filter_provider_body(self, body: Any) -> Dict[str, Any] | None:
+-        """Apply final-body filters once, isolating every plugin failure."""
++    def begin_provider_body_attempt(self, body: Any) -> Dict[str, Any] | None:
++        """Build one filtered SDK candidate without committing its outcome."""
++
+         initial = _provider_filter_snapshot(body)
+         with self._lock:
+-            if self._provider_body_filters_applied:
++            if (
++                self._active_provider_attempt is not None
++                or self._provider_body is not None
++            ):
++                self._ambiguous = True
++                self._settled = False
++                raise RuntimeError("provider attempt is already active or settled")
++            if self._failed_provider_attempt_pending_retry:
+                 self._ambiguous = True
+                 self._settled = False
+-                return initial
+-            self._provider_body_filters_applied = True
++                raise RuntimeError(
++                    "provider successor requires explicit pre-accept rejection proof"
++                )
++            self._provider_attempt_count += 1
++            self._active_provider_attempt = _ProviderAttempt(
++                body=None,
++                estimate=_provider_body_estimate(None),
++            )
+             filters = sorted(
+                 self._provider_body_filters,
+                 key=lambda item: item[1] == PROVIDER_BODY_FILTER_FINAL_GUARD,
+@@ -260,16 +288,24 @@ class TransportRecord:
+ 
+         if initial is None:
+             self._mark_ambiguous()
+-            self._store_provider_body_estimate(_provider_body_estimate(None))
+             return None
+         if not filters:
+-            self._store_provider_body_estimate(_provider_body_estimate(initial))
++            self._store_active_provider_attempt(
++                initial,
++                _provider_body_estimate(initial),
++                [],
++            )
+             return initial
+         if preexisting_ambiguity:
+-            self._store_provider_body_estimate(_provider_body_estimate(initial))
++            self._store_active_provider_attempt(
++                initial,
++                _provider_body_estimate(initial),
++                [],
++            )
+             return initial
+ 
+         current = initial
++        pending_acceptances: List[Any] = []
+         for _owner, phase, callback in filters:
+             working = deepcopy(current)
+             estimate = _provider_body_estimate(current)
+@@ -292,7 +328,7 @@ class TransportRecord:
+                 continue
+             if phase == PROVIDER_BODY_FILTER_FINAL_GUARD:
+                 overlay_accepted = (
+-                    overlay_result._accept(current, accepted)
++                    overlay_result._validate(current, accepted)
+                     if overlay_result is not None
+                     else None
+                 )
+@@ -313,10 +349,91 @@ class TransportRecord:
+                     )
+                     self._mark_ambiguous()
+                     continue
++                if overlay_result is not None:
++                    pending_acceptances.append(overlay_result)
+             current = accepted
+-        self._store_provider_body_estimate(_provider_body_estimate(current))
++        self._store_active_provider_attempt(
++            current,
++            _provider_body_estimate(current),
++            pending_acceptances,
++        )
+         return current
+ 
++    def accept_provider_body_attempt(self, body: Any) -> None:
++        """Commit the SDK candidate only after its provider call returned."""
++
++        snapshot = _transport_snapshot(body)
++        with self._lock:
++            attempt = self._active_provider_attempt
++            self._active_provider_attempt = None
++            if (
++                attempt is None
++                or snapshot is None
++                or attempt.body is None
++                or snapshot != attempt.body
++            ):
++                self._ambiguous = True
++                self._settled = False
++                return
++            self._capture_count += 1
++            if self._capture_count != 1:
++                self._ambiguous = True
++                self._settled = False
++                return
++            self._provider_body = snapshot
++            self._failed_provider_attempt_pending_retry = False
++            pending_acceptances = tuple(attempt.pending_acceptances)
++            estimate = attempt.estimate
++        self._store_provider_body_estimate(estimate)
++        for acceptance in pending_acceptances:
++            try:
++                acceptance._commit()
++            except Exception:
++                self._mark_ambiguous()
++
++    def reject_provider_body_attempt(self) -> None:
++        """Discard a failed SDK candidate and require proof before fallback."""
++
++        with self._lock:
++            if self._active_provider_attempt is None:
++                self._ambiguous = True
++                self._settled = False
++                return
++            self._active_provider_attempt = None
++            self._failed_provider_attempt_pending_retry = True
++            self._settled = False
++
++    def allow_provider_successor(self) -> None:
++        """Authorize a successor after the host classified a pre-accept rejection."""
++
++        with self._lock:
++            if (
++                not self._failed_provider_attempt_pending_retry
++                or self._active_provider_attempt is not None
++                or self._provider_body is not None
++            ):
++                self._ambiguous = True
++                self._settled = False
++                raise RuntimeError("no rejected provider attempt awaits a successor")
++            self._failed_provider_attempt_pending_retry = False
++
++    def _store_active_provider_attempt(
++        self,
++        body: Dict[str, Any],
++        estimate: Dict[str, Any],
++        pending_acceptances: List[Any],
++    ) -> None:
++        with self._lock:
++            if self._active_provider_attempt is None:
++                self._ambiguous = True
++                self._settled = False
++                return
++            self._active_provider_attempt = _ProviderAttempt(
++                body=deepcopy(body),
++                estimate=dict(estimate),
++                pending_acceptances=list(pending_acceptances),
++            )
++
+     def _store_provider_body_estimate(self, estimate: Dict[str, Any]) -> None:
+         with self._lock:
+             tokens = estimate.get("estimated_tokens")
+@@ -352,6 +469,7 @@ class TransportRecord:
+     def capture_provider_body(self, body: Any) -> None:
+         snapshot = _transport_snapshot(body)
+         with self._lock:
++            self._provider_attempt_count += 1
+             self._capture_count += 1
+             if self._capture_count != 1 or snapshot is None:
+                 self._ambiguous = True
+@@ -366,6 +484,8 @@ class TransportRecord:
+                 and self._middleware_verified_request is not None
+                 and self._provider_body is not None
+                 and self._capture_count == 1
++                and self._active_provider_attempt is None
++                and not self._failed_provider_attempt_pending_retry
+             )
+ 
+ 
+diff --git a/hermes_cli/request_overlay.py b/hermes_cli/request_overlay.py
+index dc6f4de..e3fade3 100644
+--- a/hermes_cli/request_overlay.py
++++ b/hermes_cli/request_overlay.py
+@@ -492,7 +492,7 @@ class RequestOverlayFilterResult:
+         self._after_sha256 = canonical_request_sha256(after)
+         self._disposition = disposition
+ 
+-    def _accept(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> bool:
++    def _validate(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> bool:
+         try:
+             if (
+                 canonical_request_sha256(before) != self._before_sha256
+@@ -514,9 +514,11 @@ class RequestOverlayFilterResult:
+                 return False
+         except (TypeError, ValueError):
+             return False
+-        self._overlay._set_disposition(self._disposition)
+         return True
+ 
++    def _commit(self) -> None:
++        self._overlay._set_disposition(self._disposition)
++
+ 
+ def _blocked(
+     request: dict[str, Any],
+diff --git a/tests/agent/test_transport_successor_attempts.py b/tests/agent/test_transport_successor_attempts.py
+new file mode 100644
+index 0000000..d0808b6
+--- /dev/null
++++ b/tests/agent/test_transport_successor_attempts.py
+@@ -0,0 +1,234 @@
++from __future__ import annotations
++
++from copy import deepcopy
++from types import SimpleNamespace
++
++from agent import chat_completion_helpers as cch
++from hermes_cli.middleware import (
++    TransportRecord,
++    _CURRENT_MIDDLEWARE_OWNER,
++    transport_record_scope,
++)
++from hermes_cli.request_overlay import (
++    OVERLAY_PENDING,
++    OVERLAY_REMOVED_FINAL_BUDGET,
++    project_request_overlay,
++)
++
++
++NAMESPACE = "[SUCCESSOR QUOTED REFERENCE"
++END = "[END SUCCESSOR QUOTED REFERENCE]"
++MARKER = f"{NAMESPACE} marker=one]"
++BODY = f"quoted material\n{END}"
++
++
++def _guarded_request(extra: dict | None = None):
++    request = {
++        "messages": [{"role": "user", "content": "current"}],
++        **(extra or {}),
++    }
++    overlay = project_request_overlay(
++        request,
++        marker_namespace=NAMESPACE,
++        end_boundary=END,
++        marker=MARKER,
++        body=BODY,
++    )
++    record = TransportRecord()
++    owner = _CURRENT_MIDDLEWARE_OWNER.set("successor-test")
++    try:
++        assert overlay.register_final_budget_guard(
++            record,
++            context_window_tokens=1,
++            reserve_tokens=lambda _body, _window: 0,
++            validator=lambda _body, native: (
++                native["messages"][-1]["content"] == "current"
++            ),
++        )
++    finally:
++        _CURRENT_MIDDLEWARE_OWNER.reset(owner)
++    record.mark_middleware_verified(overlay.request)
++    return overlay, record
++
++
++def _assert_selected_successor(overlay, record, provider_bodies):
++    assert len(provider_bodies) == 2
++    assert all(NAMESPACE not in body["messages"][-1]["content"] for body in provider_bodies)
++    assert overlay.disposition == OVERLAY_REMOVED_FINAL_BUDGET
++    assert record.provider_attempt_count == 2
++    assert record.capture_count == 1
++    assert record.provider_body == provider_bodies[-1]
++    assert record.ambiguous is False
++    assert record.settled is True
++
++
++def test_bedrock_nonstream_cachepoint_retry_reapplies_guard(monkeypatch):
++    overlay, record = _guarded_request(
++        {"__bedrock_region__": "us-east-1", "__bedrock_converse__": True}
++    )
++    provider_bodies = []
++
++    class Client:
++        def converse(self, **body):
++            provider_bodies.append(deepcopy(body))
++            if len(provider_bodies) == 1:
++                raise RuntimeError("cachePoint rejected")
++            return {"ok": True}
++
++    client = Client()
++    monkeypatch.setattr(
++        "agent.bedrock_adapter._get_bedrock_runtime_client", lambda _region: client
++    )
++    monkeypatch.setattr(
++        "agent.bedrock_adapter.recover_from_cache_point_rejection",
++        lambda _exc, body: deepcopy(body),
++    )
++    monkeypatch.setattr(
++        "agent.bedrock_adapter.normalize_converse_response", lambda response: response
++    )
++
++    agent = SimpleNamespace(api_mode="bedrock_converse", provider="bedrock")
++    with transport_record_scope(record):
++        response = cch._dispatch_nonstreaming_api_request(
++            agent,
++            deepcopy(overlay.request),
++            make_client=lambda *_args, **_kwargs: None,
++        )
++    record.settle()
++
++    assert response == {"ok": True}
++    _assert_selected_successor(overlay, record, provider_bodies)
++
++
++class _StreamingBedrockAgent:
++    api_mode = "bedrock_converse"
++    provider = "bedrock"
++    model = "test-model"
++    session_id = "successor-session"
++    _current_api_request_id = "request-1"
++    _fallback_index = 0
++    is_subagent = False
++    _interrupt_requested = False
++    _disable_streaming = False
++    _consecutive_stale_streams = 0
++    reasoning_callback = None
++    stream_delta_callback = None
++
++    def _has_stream_consumers(self):
++        return False
++
++    def _buffer_status(self, *_args, **_kwargs):
++        return None
++
++    def _claim_stream_writer(self):
++        return 1
++
++    def _fire_stream_delta(self, _text):
++        return None
++
++    def _fire_tool_gen_started(self, _name):
++        return None
++
++    def _fire_reasoning_delta(self, _text):
++        return None
++
++    def _safe_print(self, *_args, **_kwargs):
++        return None
++
++
++def _run_bedrock_stream_successor(monkeypatch, *, fallback_to_converse: bool):
++    overlay, record = _guarded_request(
++        {"__bedrock_region__": "us-east-1", "__bedrock_converse__": True}
++    )
++    provider_bodies = []
++    response = SimpleNamespace(choices=[object()])
++
++    class Client:
++        def converse_stream(self, **body):
++            provider_bodies.append(deepcopy(body))
++            if len(provider_bodies) == 1:
++                raise RuntimeError("stream rejected")
++            return {"stream": []}
++
++        def converse(self, **body):
++            provider_bodies.append(deepcopy(body))
++            return {"native": True}
++
++    client = Client()
++    monkeypatch.setattr(
++        "agent.bedrock_adapter._get_bedrock_runtime_client", lambda _region: client
++    )
++    monkeypatch.setattr(
++        "agent.bedrock_adapter.recover_from_cache_point_rejection",
++        (
++            (lambda _exc, _body: None)
++            if fallback_to_converse
++            else (lambda _exc, body: deepcopy(body))
++        ),
++    )
++    monkeypatch.setattr(
++        "agent.bedrock_adapter.is_streaming_access_denied_error",
++        lambda _exc: fallback_to_converse,
++    )
++    monkeypatch.setattr(
++        "agent.bedrock_adapter.is_stale_connection_error", lambda _exc: False
++    )
++    monkeypatch.setattr(
++        "agent.bedrock_adapter.normalize_converse_response", lambda _raw: response
++    )
++    monkeypatch.setattr(
++        "agent.bedrock_adapter.stream_converse_with_callbacks",
++        lambda *_args, **_kwargs: response,
++    )
++
++    with transport_record_scope(record):
++        result = cch.interruptible_streaming_api_call(
++            _StreamingBedrockAgent(),
++            deepcopy(overlay.request),
++        )
++    record.settle()
++
++    assert result is response
++    _assert_selected_successor(overlay, record, provider_bodies)
++
++
++def test_bedrock_stream_cachepoint_retry_reapplies_guard(monkeypatch):
++    _run_bedrock_stream_successor(monkeypatch, fallback_to_converse=False)
++
++
++def test_bedrock_stream_to_converse_fallback_reapplies_guard(monkeypatch):
++    _run_bedrock_stream_successor(monkeypatch, fallback_to_converse=True)
++
++
++def test_anthropic_stream_to_create_fallback_reapplies_guard():
++    from agent.anthropic_adapter import create_anthropic_message
++
++    overlay, record = _guarded_request({"model": "test", "max_tokens": 16})
++    provider_bodies = []
++
++    class RejectedStream:
++        def __enter__(self):
++            raise RuntimeError("stream not supported")
++
++        def __exit__(self, *_args):
++            return False
++
++    class Messages:
++        def stream(self, **body):
++            provider_bodies.append(deepcopy(body))
++            return RejectedStream()
++
++        def create(self, **body):
++            provider_bodies.append(deepcopy(body))
++            return "ok"
++
++    assert overlay.disposition == OVERLAY_PENDING
++    with transport_record_scope(record):
++        result = create_anthropic_message(
++            SimpleNamespace(messages=Messages()),
++            deepcopy(overlay.request),
++        )
++    record.settle()
++
++    assert result == "ok"
++    _assert_selected_successor(overlay, record, provider_bodies)
+diff --git a/tests/agent/test_transport_truth.py b/tests/agent/test_transport_truth.py
+index 5bb3223..ad724fc 100644
+--- a/tests/agent/test_transport_truth.py
++++ b/tests/agent/test_transport_truth.py
+@@ -390,7 +390,8 @@ def test_provider_error_never_settles_or_fires_post(monkeypatch):
+     assert result["completed"] is False
+     assert len(provider_calls) == 1
+     assert len(execution_records) == 1
+-    assert execution_records[0].provider_body == provider_calls[0]
++    assert execution_records[0].provider_body is None
++    assert execution_records[0].provider_attempt_count == 1
+     assert execution_records[0].settled is False
+     assert post_records == []
+ 
+diff --git a/tests/test_middleware.py b/tests/test_middleware.py
+index e449431..edf0e14 100644
+--- a/tests/test_middleware.py
++++ b/tests/test_middleware.py
+@@ -450,6 +450,7 @@ def test_transport_record_multiple_physical_captures_fail_closed():
+ 
+     record.capture_provider_body(request)
+ 
++    assert record.provider_attempt_count == 2
+     assert record.capture_count == 2
+     assert record.ambiguous is True
+     assert record.settled is False
+@@ -493,7 +494,8 @@ def test_transport_capture_failure_never_blocks_provider(monkeypatch):
+ 
+     assert (first, second) == ("first", "second")
+     assert len(provider_calls) == 2
+-    assert record.capture_count == 2
++    assert record.provider_attempt_count == 2
++    assert record.capture_count == 1
+     assert record.ambiguous is True
+     assert record.settled is False
+ 
+@@ -541,8 +543,9 @@ def test_moa_prepared_request_is_explicitly_unsupported_transport_truth(monkeypa
+     record.settle()
+ 
+     assert inner_calls == [inner]
+-    assert record.capture_count == 1
+-    assert record.provider_body == {"messages": []}
++    assert record.provider_attempt_count == 1
++    assert record.capture_count == 0
++    assert record.provider_body is None
+     assert record.ambiguous is True
+     assert record.settled is False
+ 
+@@ -757,10 +760,16 @@ def test_plugin_owned_provider_body_filters_compose_once_before_sdk(monkeypatch)
+ 
+ 
+ def test_transport_estimates_provider_body_without_registered_filters():
++    from agent import relay_llm
++
+     request = {"messages": [{"role": "user", "content": "hello"}]}
+     record = middleware.TransportRecord()
+ 
+-    assert record.filter_provider_body(request) == request
++    record.mark_middleware_verified(request)
++    with middleware.transport_record_scope(record):
++        with relay_llm.provider_body_scope(request) as filtered:
++            assert filtered == request
++    record.settle()
+     assert record.provider_body_estimated_tokens is not None
+     assert record.provider_body_estimate_source == "hermes.provider_body.rough.v1"
+     assert record.provider_body_estimate_confidence == "heuristic_with_margin"
+diff --git a/tests/test_request_overlay.py b/tests/test_request_overlay.py
+index 5bf8a1e..4a33ca7 100644
+--- a/tests/test_request_overlay.py
++++ b/tests/test_request_overlay.py
+@@ -63,9 +63,10 @@ class _FilterRecord:
+                 self.ambiguous = True
+                 continue
+             accepted = copy.deepcopy(result.body)
+-            if not result._accept(current, accepted):
++            if not result._validate(current, accepted):
+                 self.ambiguous = True
+                 continue
++            result._commit()
+             current = accepted
+         return current
+ 
+@@ -370,6 +371,8 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+         self.assertEqual(self.overlay.disposition, OVERLAY_REMOVED_FINAL_BUDGET)
+ 
+     def test_real_transport_accepts_only_the_owned_overlay_disposition(self) -> None:
++        from agent import relay_llm
++
+         for window, expected_content, expected_disposition in (
+             (100_000, self.overlay.request["messages"][0]["content"], OVERLAY_KEPT),
+             (1, "current", OVERLAY_REMOVED_FINAL_BUDGET),
+@@ -379,7 +382,11 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+                 record = middleware.TransportRecord()
+                 self.assertTrue(self.register_with_host_record(record, window=window))
+ 
+-                filtered = record.filter_provider_body(self.overlay.request)
++                record.mark_middleware_verified(self.overlay.request)
++                with middleware.transport_record_scope(record):
++                    with relay_llm.provider_body_scope(self.overlay.request) as filtered:
++                        pass
++                record.settle()
+ 
+                 self.assertEqual(filtered["messages"][0]["content"], expected_content)
+                 self.assertEqual(self.overlay.disposition, expected_disposition)
+@@ -390,6 +397,8 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+                 )
+ 
+     def test_real_transport_preserves_late_transform_in_both_registration_orders(self) -> None:
++        from agent import relay_llm
++
+         for order in (("overlay", "transform"), ("transform", "overlay")):
+             with self.subTest(order=order):
+                 self.setUp()
+@@ -425,7 +434,11 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+                     else:
+                         register_transform()
+ 
+-                filtered = record.filter_provider_body(self.overlay.request)
++                record.mark_middleware_verified(self.overlay.request)
++                with middleware.transport_record_scope(record):
++                    with relay_llm.provider_body_scope(self.overlay.request) as filtered:
++                        pass
++                record.settle()
+ 
+                 self.assertEqual(filtered["messages"][0]["content"], "current")
+                 self.assertEqual(filtered["tools"][0]["function"]["name"], "late_tool")
+@@ -531,19 +544,61 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+ 
+         self.assertIsInstance(proposal, RequestOverlayFilterResult)
+         self.assertEqual(self.overlay.disposition, OVERLAY_PENDING)
+-        self.assertTrue(proposal._accept(self.overlay.request, proposal.body))
++        self.assertTrue(proposal._validate(self.overlay.request, proposal.body))
++        self.assertEqual(self.overlay.disposition, OVERLAY_PENDING)
++        proposal._commit()
+         self.assertEqual(self.overlay.disposition, OVERLAY_KEPT)
+ 
+     def test_rejected_host_acceptance_keeps_body_and_pending_disposition(self) -> None:
+-        record = _FilterRecord()
+-        self.assertTrue(self.register(record, window=1))
+-        with patch.object(RequestOverlayFilterResult, "_accept", return_value=False):
+-            filtered = record.filter_provider_body(self.overlay.request)
++        record = middleware.TransportRecord()
++        self.assertTrue(self.register_with_host_record(record, window=1))
++        from agent import relay_llm
++
++        record.mark_middleware_verified(self.overlay.request)
++        with patch.object(RequestOverlayFilterResult, "_validate", return_value=False):
++            with middleware.transport_record_scope(record):
++                with relay_llm.provider_body_scope(self.overlay.request) as filtered:
++                    pass
++        record.settle()
+ 
+         self.assertEqual(filtered, self.overlay.request)
+         self.assertTrue(record.ambiguous)
+         self.assertEqual(self.overlay.disposition, OVERLAY_PENDING)
+ 
++    def test_successor_attempt_reapplies_guard_and_commits_only_selected_body(self) -> None:
++        from agent import relay_llm
++
++        record = middleware.TransportRecord()
++        self.assertTrue(self.register_with_host_record(record, window=1))
++        record.mark_middleware_verified(self.overlay.request)
++        provider_bodies = []
++
++        def rejected(**body):
++            provider_bodies.append(body)
++            raise RuntimeError("provider rejected before accepting request")
++
++        with middleware.transport_record_scope(record):
++            with self.assertRaisesRegex(RuntimeError, "provider rejected"):
++                relay_llm.call_provider_body(rejected, self.overlay.request)
++            self.assertEqual(self.overlay.disposition, OVERLAY_PENDING)
++            relay_llm.allow_provider_successor()
++            result = relay_llm.call_provider_body(
++                lambda **body: provider_bodies.append(body) or "ok",
++                self.overlay.request,
++            )
++        record.settle()
++
++        self.assertEqual(result, "ok")
++        self.assertEqual(
++            [body["messages"][0]["content"] for body in provider_bodies],
++            ["current", "current"],
++        )
++        self.assertEqual(record.provider_attempt_count, 2)
++        self.assertEqual(record.capture_count, 1)
++        self.assertEqual(record.provider_body, provider_bodies[-1])
++        self.assertEqual(self.overlay.disposition, OVERLAY_REMOVED_FINAL_BUDGET)
++        self.assertTrue(record.settled)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

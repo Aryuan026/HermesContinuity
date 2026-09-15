@@ -1,0 +1,192 @@
+From 40efdba5aaa57ce3911cabef657f3492d8cbdb37 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 23:11:31 +0800
+Subject: [PATCH] fix(codex): fail closed for SDK transform bypass
+
+---
+ agent/codex_runtime.py                        |  22 ++--
+ agent/conversation_loop.py                    |  12 ++-
+ .../test_transport_successor_attempts.py      | 101 ++++++++++++++++++
+ 3 files changed, 128 insertions(+), 7 deletions(-)
+
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index 3b922b7..5f21301 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -1560,9 +1560,7 @@ def _bypass_sdk_request_transform(stream_kwargs: dict) -> dict:
+     the transform.  Set HERMES_CODEX_SDK_TRANSFORM=1 to restore the pre-fix
+     behavior.
+     """
+-    if os.environ.get("HERMES_CODEX_SDK_TRANSFORM", "").strip().lower() in {
+-        "1", "true", "yes", "on"
+-    }:
++    if not codex_sdk_transform_bypass_required(stream_kwargs):
+         return stream_kwargs
+ 
+     moved = {
+@@ -1571,9 +1569,6 @@ def _bypass_sdk_request_transform(stream_kwargs: dict) -> dict:
+         if isinstance(stream_kwargs.get(field), (dict, list))
+         and _is_plain_json_data(stream_kwargs[field])
+     }
+-    if not moved:
+-        return stream_kwargs
+-
+     bypassed = {
+         key: value for key, value in stream_kwargs.items() if key not in moved
+     }
+@@ -1587,6 +1582,21 @@ def _bypass_sdk_request_transform(stream_kwargs: dict) -> dict:
+     return bypassed
+ 
+ 
++def codex_sdk_transform_bypass_required(stream_kwargs: dict) -> bool:
++    """Whether Codex will move semantic body fields behind ``extra_body``."""
++
++    if os.environ.get("HERMES_CODEX_SDK_TRANSFORM", "").strip().lower() in {
++        "1", "true", "yes", "on"
++    }:
++        return False
++
++    return any(
++        isinstance(stream_kwargs.get(field), (dict, list))
++        and _is_plain_json_data(stream_kwargs[field])
++        for field in _SDK_TRANSFORM_BYPASS_FIELDS
++    )
++
++
+ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+     """Execute one streaming Responses API request and return the final response.
+ 
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 69b2aea..d4a0f47 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -3335,9 +3335,19 @@ def run_conversation(
+                     "completions",
+                     None,
+                 )
++                _codex_body_truth_supported = True
++                if agent.api_mode == "codex_responses":
++                    from agent.codex_runtime import (
++                        codex_sdk_transform_bypass_required,
++                    )
++
++                    _codex_body_truth_supported = not (
++                        codex_sdk_transform_bypass_required(api_kwargs)
++                    )
+                 _transport_record = TransportRecord(
+                     provider_body_supported=(
+-                        getattr(
++                        _codex_body_truth_supported
++                        and getattr(
+                             _client_completions,
+                             "_hermes_provider_body_truth_supported",
+                             True,
+diff --git a/tests/agent/test_transport_successor_attempts.py b/tests/agent/test_transport_successor_attempts.py
+index b4ec71c..a9cb123 100644
+--- a/tests/agent/test_transport_successor_attempts.py
++++ b/tests/agent/test_transport_successor_attempts.py
+@@ -589,3 +589,104 @@ def test_codex_mid_iteration_failure_does_not_retry_same_record(monkeypatch):
+     assert record.ambiguous is True
+     assert record.settled is False
+     assert overlay.disposition == OVERLAY_PENDING
++
++
++def test_codex_list_payload_bypass_is_unsupported_and_overlay_is_removed(
++    monkeypatch,
++):
++    from agent import codex_runtime, relay_llm
++
++    monkeypatch.delenv("HERMES_CODEX_SDK_TRANSFORM", raising=False)
++    request = {
++        "model": "gpt-test",
++        "input": [
++            {
++                "role": "user",
++                "content": [{"type": "input_text", "text": "current"}],
++            }
++        ],
++        "tools": [
++            {
++                "type": "function",
++                "name": "large_tool",
++                "parameters": {
++                    "type": "object",
++                    "description": "x" * 20_000,
++                },
++            }
++        ],
++        "extra_body": {"metadata": {"owner": "caller"}},
++    }
++    overlay = project_request_overlay(
++        request,
++        marker_namespace=NAMESPACE,
++        end_boundary=END,
++        marker=MARKER,
++        body=BODY,
++    )
++    assert codex_runtime.codex_sdk_transform_bypass_required(overlay.request)
++
++    record = TransportRecord(provider_body_supported=False)
++    owner = _CURRENT_MIDDLEWARE_OWNER.set("codex-bypass-overlay")
++    try:
++        assert not overlay.register_final_budget_guard(
++            record,
++            context_window_tokens=100_000,
++            reserve_tokens=lambda _body, _window: 0,
++            validator=lambda _body, _native: True,
++        )
++    finally:
++        _CURRENT_MIDDLEWARE_OWNER.reset(owner)
++    native = overlay.native_request(overlay.request)
++    assert native is not None
++    bypassed = codex_runtime._bypass_sdk_request_transform(
++        {**native, "stream": True}
++    )
++    assert "input" not in bypassed
++    assert "tools" not in bypassed
++    assert bypassed["extra_body"]["metadata"] == {"owner": "caller"}
++    assert NAMESPACE not in str(bypassed["extra_body"]["input"])
++
++    provider_bodies = []
++    attempt = None
++    with transport_record_scope(record):
++        attempt = relay_llm.ProviderBodyStreamAttempt(
++            lambda **body: provider_bodies.append(deepcopy(body))
++            or iter(_codex_terminal_events()),
++            bypassed,
++        )
++        list(attempt.open())
++        attempt.accept()
++    record.settle()
++
++    assert len(provider_bodies) == 1
++    assert NAMESPACE not in str(provider_bodies[0])
++    assert record.provider_body is None
++    assert record.capture_count == 0
++    assert record.ambiguous is True
++    assert record.settled is False
++    assert overlay.disposition == OVERLAY_PENDING
++
++
++def test_codex_bypass_preserves_existing_extra_body_precedence(monkeypatch):
++    from agent.codex_runtime import _bypass_sdk_request_transform
++
++    monkeypatch.delenv("HERMES_CODEX_SDK_TRANSFORM", raising=False)
++    top_level_input = [{"role": "user", "content": "top-level"}]
++    override_input = [{"role": "user", "content": "explicit-override"}]
++    bypassed = _bypass_sdk_request_transform(
++        {
++            "model": "gpt-test",
++            "input": top_level_input,
++            "tools": [{"type": "function", "name": "tool"}],
++            "extra_body": {
++                "input": override_input,
++                "metadata": {"owner": "caller"},
++            },
++        }
++    )
++
++    assert "input" not in bypassed
++    assert "tools" not in bypassed
++    assert bypassed["extra_body"]["input"] == override_input
++    assert bypassed["extra_body"]["metadata"] == {"owner": "caller"}

@@ -1,0 +1,390 @@
+From 4a41ea9834bb41f2ba4dbc8bd3a309c4b0d19c80 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 09:43:00 +0800
+Subject: [PATCH] fix(transport): preserve SDK controls and Anthropic extra
+ body
+
+---
+ agent/anthropic_adapter.py                    |  12 +-
+ agent/chat_completion_helpers.py              |   1 +
+ agent/relay_llm.py                            |  68 ++++---
+ .../test_transport_successor_attempts.py      | 168 ++++++++++++++++++
+ 4 files changed, 221 insertions(+), 28 deletions(-)
+
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index 4a35bee..c561ac1 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -1182,7 +1182,11 @@ def create_anthropic_message(
+         stream_kwargs = dict(api_kwargs)
+         stream_kwargs.pop("stream", None)
+         try:
+-            with relay_llm.provider_body_context(stream_fn, stream_kwargs) as stream:
++            with relay_llm.provider_body_context(
++                stream_fn,
++                stream_kwargs,
++                merge_extra_body=True,
++            ) as stream:
+                 if callable(on_response):
+                     try:
+                         on_response(getattr(stream, "response", None))
+@@ -1217,4 +1221,8 @@ def create_anthropic_message(
+ 
+     create_kwargs = dict(api_kwargs)
+     create_kwargs.pop("stream", None)
+-    return relay_llm.call_provider_body(messages_api.create, create_kwargs)
++    return relay_llm.call_provider_body(
++        messages_api.create,
++        create_kwargs,
++        merge_extra_body=True,
++    )
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 66c25eb..d407d36 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -4732,6 +4732,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                 request_client.messages.stream,
+                 final_kwargs,
+                 enter_context=True,
++                merge_extra_body=True,
+             )
+             provider_body_stream_attempt["value"] = attempt
+             return attempt.open()
+diff --git a/agent/relay_llm.py b/agent/relay_llm.py
+index 542cfe2..6b8d830 100644
+--- a/agent/relay_llm.py
++++ b/agent/relay_llm.py
+@@ -24,6 +24,15 @@ _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(
+ _RELAY_INTERNAL_PROVIDER_HEADERS = frozenset(
+     {"x-dynamo-parent-session-id", "x-dynamo-session-id"}
+ )
++_SDK_REQUEST_CONTROL_KEYS = frozenset({"timeout", "extra_headers", "extra_query"})
++
++
++@dataclass(frozen=True)
++class _ProviderBodyCodec:
++    """Private SDK-kwargs projection state for one provider attempt."""
++
++    top_level_keys: frozenset[str] | None
++    sdk_controls: dict[str, Any]
+ 
+ 
+ def _stream_failure_proves_not_dispatched(exc: BaseException) -> bool:
+@@ -76,25 +85,30 @@ def _provider_body_projection(
+     body: dict[str, Any],
+     *,
+     merge_extra_body: bool,
+-) -> tuple[dict[str, Any] | None, frozenset[str] | None, Any, bool]:
++) -> tuple[dict[str, Any] | None, _ProviderBodyCodec]:
+     """Project SDK kwargs into the semantic JSON body seen by the provider."""
+ 
+-    client_timeout = body.get("timeout")
+-    has_client_timeout = "timeout" in body
++    sdk_controls = {
++        key: value for key, value in body.items() if key in _SDK_REQUEST_CONTROL_KEYS
++    }
+     base = {
+         key: value
+         for key, value in body.items()
+-        if key not in {"extra_body", "timeout"}
++        if key not in _SDK_REQUEST_CONTROL_KEYS
+     }
+-    if not merge_extra_body or "extra_body" not in body:
+-        return base, None, client_timeout, has_client_timeout
+-    extra_body = body.get("extra_body")
++    if not merge_extra_body:
++        if "extra_body" in base:
++            return None, _ProviderBodyCodec(None, sdk_controls)
++        return base, _ProviderBodyCodec(None, sdk_controls)
++    extra_body = base.pop("extra_body", None)
++    if extra_body is None:
++        return base, _ProviderBodyCodec(None, sdk_controls)
+     if not isinstance(extra_body, dict):
+-        return None, None, client_timeout, has_client_timeout
++        return None, _ProviderBodyCodec(None, sdk_controls)
+     top_level_keys = frozenset(base)
+     semantic = dict(base)
+     semantic.update(extra_body)
+-    return semantic, top_level_keys, client_timeout, has_client_timeout
++    return semantic, _ProviderBodyCodec(top_level_keys, sdk_controls)
+ 
+ 
+ def _merge_provider_extra_body(body: dict[str, Any]) -> dict[str, Any] | None:
+@@ -113,25 +127,26 @@ def _merge_provider_extra_body(body: dict[str, Any]) -> dict[str, Any] | None:
+ def _provider_sdk_body(
+     semantic: dict[str, Any],
+     *,
+-    top_level_keys: frozenset[str] | None,
+-    client_timeout: Any,
+-    has_client_timeout: bool,
++    codec: _ProviderBodyCodec,
+ ) -> dict[str, Any]:
+     """Encode a filtered semantic body back into equivalent SDK kwargs."""
+ 
+-    if top_level_keys is None:
++    if codec.top_level_keys is None:
+         final_body = dict(semantic)
+     else:
+         final_body = {
+-            key: value for key, value in semantic.items() if key in top_level_keys
++            key: value
++            for key, value in semantic.items()
++            if key in codec.top_level_keys
+         }
+         extra_body = {
+-            key: value for key, value in semantic.items() if key not in top_level_keys
++            key: value
++            for key, value in semantic.items()
++            if key not in codec.top_level_keys
+         }
+         if extra_body:
+             final_body["extra_body"] = extra_body
+-    if has_client_timeout:
+-        final_body["timeout"] = client_timeout
++    final_body.update(codec.sdk_controls)
+     return final_body
+ 
+ 
+@@ -145,7 +160,7 @@ def provider_body_scope(
+ 
+     from hermes_cli.middleware import current_transport_record
+ 
+-    provider_body, top_level_keys, client_timeout, has_client_timeout = (
++    provider_body, codec = (
+         _provider_body_projection(body, merge_extra_body=merge_extra_body)
+     )
+     record = current_transport_record()
+@@ -175,9 +190,7 @@ def provider_body_scope(
+             provider_body = filtered
+     final_body = _provider_sdk_body(
+         provider_body,
+-        top_level_keys=top_level_keys,
+-        client_timeout=client_timeout,
+-        has_client_timeout=has_client_timeout,
++        codec=codec,
+     )
+     from hermes_cli.middleware import transport_record_scope
+ 
+@@ -224,10 +237,15 @@ def call_provider_body(
+ def provider_body_context(
+     callback: Callable[..., Any],
+     body: dict[str, Any],
++    *,
++    merge_extra_body: bool = False,
+ ) -> Iterator[Any]:
+     """Keep one provider attempt open through an SDK context manager."""
+ 
+-    with provider_body_scope(body) as final_body:
++    with provider_body_scope(
++        body,
++        merge_extra_body=merge_extra_body,
++    ) as final_body:
+         with callback(**final_body) as resource:
+             yield resource
+ 
+@@ -273,7 +291,7 @@ class ProviderBodyStreamAttempt:
+ 
+         from hermes_cli.middleware import transport_record_scope
+ 
+-        provider_body, top_level_keys, client_timeout, has_client_timeout = (
++        provider_body, codec = (
+             _provider_body_projection(
+                 self._body,
+                 merge_extra_body=self._merge_extra_body,
+@@ -306,9 +324,7 @@ class ProviderBodyStreamAttempt:
+             self._provider_body = dict(provider_body)
+             final_body = _provider_sdk_body(
+                 provider_body,
+-                top_level_keys=top_level_keys,
+-                client_timeout=client_timeout,
+-                has_client_timeout=has_client_timeout,
++                codec=codec,
+             )
+         try:
+             with transport_record_scope(None):
+diff --git a/tests/agent/test_transport_successor_attempts.py b/tests/agent/test_transport_successor_attempts.py
+index e97c30b..98e031b 100644
+--- a/tests/agent/test_transport_successor_attempts.py
++++ b/tests/agent/test_transport_successor_attempts.py
+@@ -63,6 +63,95 @@ def _openai_mock_client(wire_bodies):
+     )
+ 
+ 
++def _anthropic_mock_client(wire_requests):
++    from anthropic import Anthropic
++
++    assert version("anthropic") == "0.87.0"
++
++    def handler(request):
++        body = json.loads(request.content)
++        wire_requests.append(
++            {
++                "body": body,
++                "beta": request.headers.get("anthropic-beta"),
++                "query": dict(request.url.params),
++            }
++        )
++        if body.get("stream"):
++            events = [
++                (
++                    "message_start",
++                    {
++                        "type": "message_start",
++                        "message": {
++                            "id": "msg_1",
++                            "type": "message",
++                            "role": "assistant",
++                            "model": "claude-opus-4-6",
++                            "content": [],
++                            "stop_reason": None,
++                            "stop_sequence": None,
++                            "usage": {"input_tokens": 1, "output_tokens": 0},
++                        },
++                    },
++                ),
++                (
++                    "content_block_start",
++                    {
++                        "type": "content_block_start",
++                        "index": 0,
++                        "content_block": {"type": "text", "text": ""},
++                    },
++                ),
++                (
++                    "content_block_delta",
++                    {
++                        "type": "content_block_delta",
++                        "index": 0,
++                        "delta": {"type": "text_delta", "text": "done"},
++                    },
++                ),
++                ("content_block_stop", {"type": "content_block_stop", "index": 0}),
++                (
++                    "message_delta",
++                    {
++                        "type": "message_delta",
++                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
++                        "usage": {"output_tokens": 1},
++                    },
++                ),
++                ("message_stop", {"type": "message_stop"}),
++            ]
++            content = "".join(
++                f"event: {event}\ndata: {json.dumps(data)}\n\n"
++                for event, data in events
++            )
++            return httpx.Response(
++                200,
++                content=content,
++                headers={"content-type": "text/event-stream"},
++            )
++        return httpx.Response(
++            200,
++            json={
++                "id": "msg_1",
++                "type": "message",
++                "role": "assistant",
++                "model": "claude-opus-4-6",
++                "content": [{"type": "text", "text": "done"}],
++                "stop_reason": "end_turn",
++                "stop_sequence": None,
++                "usage": {"input_tokens": 1, "output_tokens": 1},
++            },
++        )
++
++    return Anthropic(
++        api_key="test-key",
++        base_url="https://provider.invalid",
++        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
++    )
++
++
+ def _guarded_request(extra: dict | None = None):
+     request = {
+         "messages": [{"role": "user", "content": "current"}],
+@@ -872,6 +961,85 @@ def test_openai_extra_body_capture_matches_actual_http_json():
+     assert record.settled is True
+ 
+ 
++@pytest.mark.parametrize("prefer_stream", [False, True], ids=("create", "stream"))
++@pytest.mark.parametrize("with_record", [False, True], ids=("native", "recorded"))
++def test_anthropic_fast_mode_extra_body_and_sdk_controls_round_trip(
++    prefer_stream,
++    with_record,
++):
++    from agent.anthropic_adapter import create_anthropic_message
++    from hermes_cli.middleware import transport_record_scope
++
++    wire_requests = []
++    client = _anthropic_mock_client(wire_requests)
++    request = {
++        "model": "claude-opus-4-6",
++        "max_tokens": 16,
++        "messages": [{"role": "user", "content": "hello"}],
++        "extra_body": {"speed": "fast"},
++        "extra_headers": {"anthropic-beta": "fast-mode-2026-02-01"},
++        "extra_query": {"trace": "fast-mode"},
++    }
++    record = TransportRecord() if with_record else None
++    if record is not None:
++        record.mark_middleware_verified(request)
++        with transport_record_scope(record):
++            create_anthropic_message(
++                client,
++                deepcopy(request),
++                prefer_stream=prefer_stream,
++            )
++        record.settle()
++    else:
++        create_anthropic_message(
++            client,
++            deepcopy(request),
++            prefer_stream=prefer_stream,
++        )
++
++    wire = wire_requests[0]
++    assert wire["body"]["speed"] == "fast"
++    assert wire["beta"] == "fast-mode-2026-02-01"
++    assert wire["query"] == {"trace": "fast-mode"}
++    if record is not None:
++        expected_body = dict(wire["body"])
++        expected_body.pop("stream", None)
++        assert record.provider_body == expected_body
++        assert "extra_body" not in record.provider_body
++        assert "extra_headers" not in record.provider_body
++        assert "extra_query" not in record.provider_body
++        assert "fast-mode-2026-02-01" not in repr(record.provider_body)
++        assert record.capture_count == 1
++        assert record.ambiguous is False
++        assert record.settled is True
++
++
++def test_opaque_extra_body_is_preserved_when_semantic_merge_is_disabled():
++    from agent import relay_llm
++
++    request = {
++        "model": "provider-test",
++        "messages": [{"role": "user", "content": "hello"}],
++        "extra_body": {"provider_extension": {"mode": "opaque"}},
++        "extra_headers": {"x-provider-mode": "opaque"},
++    }
++
++    with relay_llm.provider_body_scope(request) as sdk_kwargs:
++        assert sdk_kwargs == request
++
++    record = TransportRecord()
++    record.mark_middleware_verified(request)
++    with transport_record_scope(record):
++        with relay_llm.provider_body_scope(request) as sdk_kwargs:
++            assert sdk_kwargs == request
++    record.settle()
++
++    assert record.provider_body is None
++    assert record.capture_count == 0
++    assert record.ambiguous is True
++    assert record.settled is False
++
++
+ def test_openai_extra_body_message_shadow_cannot_settle_overlay_receipt():
+     request = {
+         "model": "gpt-test",

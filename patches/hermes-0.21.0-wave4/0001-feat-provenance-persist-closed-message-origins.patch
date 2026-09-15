@@ -1,0 +1,2225 @@
+From 571e397833874c1a3445d3983ef23510e1d0aa98 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 11:23:03 +0800
+Subject: [PATCH] feat(provenance): persist closed message origins
+
+---
+ agent/conversation_compression.py             |   7 +
+ agent/conversation_loop.py                    |   2 +
+ agent/message_metadata.py                     |   2 +-
+ agent/message_origin.py                       | 234 ++++++++++++++++++
+ agent/turn_context.py                         |  22 ++
+ cli.py                                        |  10 +
+ cron/scheduler.py                             |   3 +
+ gateway/platforms/api_server.py               | 174 ++++++++++++-
+ gateway/platforms/api_server_runs.py          |  38 ++-
+ gateway/run.py                                |  30 ++-
+ gateway/session.py                            |   1 +
+ gateway/shutdown_flush.py                     |  36 ++-
+ gateway/slash_commands.py                     |   3 +
+ gateway/turn_context.py                       |   2 +
+ gateway/wake.py                               |  24 ++
+ hermes_cli/subcommands/peer.py                |  12 +-
+ run_agent.py                                  |  10 +
+ tests/agent/test_message_origin.py            | 207 ++++++++++++++++
+ .../agent/test_synthetic_turn_display_kind.py |  47 ++++
+ .../agent/transports/test_chat_completions.py |  13 +-
+ tests/cron/test_cron_bot_chat_delivery.py     |   2 +
+ tests/gateway/test_api_server_runs.py         |  47 ++++
+ ...test_internal_notification_marker_82888.py |  47 ++++
+ tests/gateway/test_peer_dm_hidden_e2e.py      |   7 +
+ tests/gateway/test_shutdown_flush.py          |  47 +++-
+ tests/hermes_cli/test_peer_cmd.py             |  11 +
+ tests/test_gateway_wakeup_origin.py           | 231 +++++++++++++++++
+ tests/test_hermes_state_time_window.py        |  70 +++++-
+ tests/test_tui_gateway_server.py              |   7 +-
+ tui_gateway/methods_session.py                |   3 +
+ tui_gateway/server.py                         |   3 +
+ 31 files changed, 1313 insertions(+), 39 deletions(-)
+ create mode 100644 agent/message_origin.py
+ create mode 100644 tests/agent/test_message_origin.py
+ create mode 100644 tests/test_gateway_wakeup_origin.py
+
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 19056ad..5bdaf19 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -3118,6 +3118,13 @@ def compress_context(
+         prompt — the session is NOT rotated.  Callers should detect the
+         no-op via ``len(returned) == len(input)`` and stop the retry loop.
+     """
++    from agent.message_origin import stamp_turn_message_origins
++
++    stamp_turn_message_origins(
++        messages,
++        getattr(agent, "_persist_user_message_idx", None),
++        getattr(agent, "_current_message_origin_proof", None),
++    )
+     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
+         agent.context_compressor
+     )
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index d4a0f47..412707f 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1935,6 +1935,7 @@ def run_conversation(
+     persist_user_timestamp: Optional[float] = None,
+     persist_user_display_kind: Optional[str] = None,
+     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
++    message_origin_proof: Optional[Dict[str, Any]] = None,
+     moa_config: Optional[dict[str, Any]] = None,
+ ) -> Dict[str, Any]:
+     """
+@@ -2012,6 +2013,7 @@ def run_conversation(
+         persist_user_timestamp,
+         persist_user_display_kind=persist_user_display_kind,
+         persist_user_display_metadata=persist_user_display_metadata,
++        message_origin_proof=message_origin_proof,
+         restore_or_build_system_prompt=_restore_or_build_system_prompt,
+         install_safe_stdio=_install_safe_stdio,
+         sanitize_surrogates=_sanitize_surrogates,
+diff --git a/agent/message_metadata.py b/agent/message_metadata.py
+index 284edc5..6074c7d 100644
+--- a/agent/message_metadata.py
++++ b/agent/message_metadata.py
+@@ -8,7 +8,7 @@ from typing import Any, MutableMapping, Optional, TypeVar
+ 
+ # These fields describe Hermes' durable record, not provider-visible message
+ # content. They must not influence context-pressure decisions.
+-PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({"timestamp"})
++PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({"timestamp", "_origin_proof"})
+ 
+ _Message = TypeVar("_Message", bound=MutableMapping[str, Any])
+ 
+diff --git a/agent/message_origin.py b/agent/message_origin.py
+new file mode 100644
+index 0000000..92ead74
+--- /dev/null
++++ b/agent/message_origin.py
+@@ -0,0 +1,234 @@
++"""Closed, host-owned provenance for durable conversation messages."""
++
++from __future__ import annotations
++
++import os
++from collections.abc import Mapping, MutableMapping, Sequence
++from typing import Any, Optional
++
++
++MESSAGE_ORIGIN_SCHEMA = "hermes.message_origin.v1"
++INTERNAL_ORIGIN_HEADER = "X-Hermes-Internal-Origin"
++CLI_ORIGIN_ENV = "HERMES_INTERNAL_MESSAGE_ORIGIN"
++CRON_BOT_CHAT_CLAIM = "cron.bot_chat"
++PEER_DM_CLAIM = "bot_peer_dm"
++PEER_RUN_CLAIM = "bot_peer_run"
++
++HUMAN = "human"
++SCHEDULED = "scheduled"
++INTERNAL = "internal"
++DELEGATED = "delegated"
++
++CLI_USER = "cli.user"
++TUI_USER = "tui.user"
++GATEWAY_USER = "gateway.user"
++API_USER = "api.user"
++CRON_AGENT = "cron.agent"
++CRON_BOT_CHAT = "cron.bot_chat"
++GATEWAY_WAKEUP = "gateway.wakeup"
++GATEWAY_INTERNAL = "gateway.internal"
++PEER_DM = "peer.dm"
++PEER_RUN = "peer.run"
++ROOM_DISPATCH = "room.dispatch"
++SUBAGENT = "subagent"
++
++_WRITER_KINDS = {
++    CLI_USER: HUMAN,
++    TUI_USER: HUMAN,
++    GATEWAY_USER: HUMAN,
++    API_USER: HUMAN,
++    CRON_AGENT: SCHEDULED,
++    CRON_BOT_CHAT: SCHEDULED,
++    GATEWAY_WAKEUP: SCHEDULED,
++    GATEWAY_INTERNAL: INTERNAL,
++    PEER_DM: INTERNAL,
++    PEER_RUN: INTERNAL,
++    ROOM_DISPATCH: DELEGATED,
++    SUBAGENT: DELEGATED,
++}
++
++# These are current-turn execution surfaces, not durable session ``source``
++# values.  A session title/source never grants provenance to a later row.
++_HUMAN_GATEWAY_PLATFORMS = frozenset(
++    {
++        "bluebubbles",
++        "browser",
++        "dashboard",
++        "desktop",
++        "discord",
++        "dingtalk",
++        "email",
++        "feishu",
++        "hermes_browser",
++        "local",
++        "mattermost",
++        "matrix",
++        "qq",
++        "qqbot",
++        "signal",
++        "slack",
++        "sms",
++        "telegram",
++        "web",
++        "wechat",
++        "wecom",
++        "wecom_callback",
++        "weixin",
++        "whatsapp",
++        "whatsapp_cloud",
++        "yuanbao",
++    }
++)
++
++
++def build_message_origin_proof(writer: str) -> dict[str, str]:
++    """Mint one closed proof for a trusted host writer."""
++    kind = _WRITER_KINDS.get(writer)
++    if kind is None:
++        raise ValueError("unknown message origin writer")
++    return {
++        "schema": MESSAGE_ORIGIN_SCHEMA,
++        "kind": kind,
++        "writer": writer,
++    }
++
++
++def normalize_message_origin_proof(value: Any) -> dict[str, str]:
++    """Validate and copy one exact v1 proof, or raise fail-closed."""
++    if not isinstance(value, Mapping) or set(value) != {
++        "schema",
++        "kind",
++        "writer",
++    }:
++        raise ValueError("message origin proof must use the closed v1 shape")
++    schema = value.get("schema")
++    kind = value.get("kind")
++    writer = value.get("writer")
++    if schema != MESSAGE_ORIGIN_SCHEMA or not isinstance(writer, str):
++        raise ValueError("message origin proof schema or writer is invalid")
++    if _WRITER_KINDS.get(writer) != kind:
++        raise ValueError("message origin proof kind does not match its writer")
++    return {"schema": schema, "kind": kind, "writer": writer}
++
++
++def message_origin_for_platform(platform: Any) -> Optional[dict[str, str]]:
++    """Return the default proof for this live execution surface.
++
++    Unknown/plugin/webhook/relay surfaces remain unclassified until their
++    owning entry point supplies an explicit trusted proof.
++    """
++    value = getattr(platform, "value", platform)
++    token = str(value or "").strip().lower()
++    if token == "cron":
++        return build_message_origin_proof(CRON_AGENT)
++    if token == "subagent":
++        return build_message_origin_proof(SUBAGENT)
++    if token == "api_server":
++        return build_message_origin_proof(API_USER)
++    if token == "cli":
++        return build_message_origin_proof(CLI_USER)
++    if token == "tui":
++        return build_message_origin_proof(TUI_USER)
++    if token == "bot_peer_dm":
++        return build_message_origin_proof(PEER_DM)
++    if token == "bot_room":
++        return build_message_origin_proof(ROOM_DISPATCH)
++    if token in _HUMAN_GATEWAY_PLATFORMS:
++        return build_message_origin_proof(GATEWAY_USER)
++    return None
++
++
++def message_origin_for_gateway_event(event: Any) -> Optional[dict[str, str]]:
++    """Classify one host-normalized gateway event before durable writing."""
++    if getattr(event, "internal", False):
++        metadata = getattr(event, "metadata", None)
++        writer = (
++            GATEWAY_WAKEUP
++            if isinstance(metadata, Mapping)
++            and set(metadata) == {"internal_kind"}
++            and metadata.get("internal_kind") == "wakeup"
++            else GATEWAY_INTERNAL
++        )
++        return build_message_origin_proof(writer)
++    source = getattr(event, "source", None)
++    return message_origin_for_platform(getattr(source, "platform", None))
++
++
++def take_cli_message_origin_proof(
++    environ: Optional[MutableMapping[str, str]] = None,
++) -> Optional[dict[str, str]]:
++    """Consume the one-shot host claim used by cron-to-Bot-Chat delivery."""
++    env = os.environ if environ is None else environ
++    claim = str(env.pop(CLI_ORIGIN_ENV, "") or "").strip()
++    if not claim:
++        return None
++    if claim != CRON_BOT_CHAT_CLAIM:
++        raise ValueError("unsupported internal CLI message origin")
++    return build_message_origin_proof(CRON_BOT_CHAT)
++
++
++def stamp_message_origin(
++    message: MutableMapping[str, Any], proof: Optional[Mapping[str, Any]]
++) -> None:
++    """Attach a validated provider-private proof to one live message."""
++    if proof is None:
++        return
++    normalized = normalize_message_origin_proof(proof)
++    existing = message.get("_origin_proof")
++    if existing is not None:
++        normalize_message_origin_proof(existing)
++        return
++    message["_origin_proof"] = normalized
++
++
++def stamp_turn_message_origins(
++    messages: Sequence[Any],
++    start_index: Any,
++    proof: Optional[Mapping[str, Any]],
++) -> None:
++    """Stamp unstored rows from this turn without minting on summary shells."""
++    if proof is None or not isinstance(start_index, int):
++        return
++    if start_index < 0 or start_index > len(messages):
++        return
++    normalized = normalize_message_origin_proof(proof)
++    for message in messages[start_index:]:
++        if not isinstance(message, MutableMapping):
++            continue
++        if message.get("role") not in {"user", "assistant", "tool"}:
++            continue
++        if message.get("_compressed_summary") and not message.get(
++            "_origin_proof"
++        ):
++            # A composite live-tail carrier already owns the tail's proof.
++            # An unproved summary is synthetic and must remain unproved.
++            continue
++        stamp_message_origin(message, normalized)
++
++
++def classify_message_origin_group(
++    messages: Sequence[Mapping[str, Any]],
++    *,
++    physical_obligations: Sequence[Mapping[str, Any]] = (),
++) -> tuple[Optional[str], str]:
++    """Classify one complete group and any matching physical generations.
++
++    ``physical_obligations`` lets a bounded-history owner include superseded
++    compaction originals that are not canonical material.  They grant no
++    extra authority, but a conflicting proof makes only this group fail
++    closed.
++    """
++    proofs: list[dict[str, str]] = []
++    for message in (*messages, *physical_obligations):
++        raw = message.get("origin_proof", message.get("_origin_proof"))
++        if raw is None:
++            return None, "missing"
++        try:
++            proofs.append(normalize_message_origin_proof(raw))
++        except ValueError:
++            return None, "invalid"
++    if not proofs:
++        return None, "missing"
++    if any(proof != proofs[0] for proof in proofs[1:]):
++        return None, "conflict"
++    return proofs[0]["kind"], "verified"
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index e250b79..789f8b1 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -558,6 +558,7 @@ def build_turn_context(
+     *,
+     persist_user_display_kind: Optional[str] = None,
+     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
++    message_origin_proof: Optional[Dict[str, Any]] = None,
+     restore_or_build_system_prompt,
+     install_safe_stdio,
+     sanitize_surrogates,
+@@ -752,6 +753,26 @@ def build_turn_context(
+     # later, different user input. Voice turns compare against their explicit
+     # clean persistence override rather than the API-only prefixed payload.
+     pending_cli_message = getattr(agent, "_pending_cli_user_message", None)
++    from agent.message_origin import (
++        message_origin_for_platform,
++        normalize_message_origin_proof,
++        stamp_message_origin,
++    )
++
++    if message_origin_proof is not None:
++        turn_origin_proof = normalize_message_origin_proof(message_origin_proof)
++    elif (
++        isinstance(pending_cli_message, dict)
++        and pending_cli_message.get("_origin_proof") is not None
++    ):
++        turn_origin_proof = normalize_message_origin_proof(
++            pending_cli_message["_origin_proof"]
++        )
++    else:
++        turn_origin_proof = message_origin_for_platform(
++            getattr(agent, "platform", None)
++        )
++    agent._current_message_origin_proof = turn_origin_proof
+     expected_persist_content = (
+         persist_user_message if persist_user_message is not None else user_message
+     )
+@@ -774,6 +795,7 @@ def build_turn_context(
+     # CLI input is stamped when staged. Gateway input may carry the platform
+     # event time. Preserve either value and cover any legacy unstamped handoff.
+     stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
++    stamp_message_origin(user_msg, turn_origin_proof)
+ 
+     # Hydrate todo store from conversation history.
+     if conversation_history and not agent._todo_store.has_items():
+diff --git a/cli.py b/cli.py
+index 3e69298..555773e 100644
+--- a/cli.py
++++ b/cli.py
+@@ -16965,10 +16965,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             agent._persist_user_message_override = None
+             agent._persist_user_message_timestamp = None
+             from agent.message_metadata import stamp_message_timestamp
++            from agent.message_origin import (
++                message_origin_for_platform,
++                stamp_message_origin,
++                take_cli_message_origin_proof,
++            )
+ 
+             staged_user_message = stamp_message_timestamp(
+                 {"role": "user", "content": message}
+             )
++            stamp_message_origin(
++                staged_user_message,
++                take_cli_message_origin_proof()
++                or message_origin_for_platform("cli"),
++            )
+             agent._pending_cli_user_message = staged_user_message
+             self.conversation_history.append(staged_user_message)
+ 
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 6580427..c38972f 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2660,6 +2660,9 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
+             return "bot-chat delivery failed: hermes CLI not resolvable"
+ 
+     env = os.environ.copy()
++    from agent.message_origin import CLI_ORIGIN_ENV, CRON_BOT_CHAT_CLAIM
++
++    env[CLI_ORIGIN_ENV] = CRON_BOT_CHAT_CLAIM
+     if profile:
+         argv += ["-p", profile]
+         # -p owns profile resolution in the child; a leftover HERMES_HOME
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 567d5b9..7485f58 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -45,6 +45,7 @@ import concurrent.futures
+ import errno
+ import hashlib
+ import hmac
++import ipaddress
+ import itertools
+ import json
+ from contextlib import contextmanager, nullcontext, suppress
+@@ -53,6 +54,7 @@ from functools import wraps
+ import logging
+ import os
+ import re
++import secrets
+ import sqlite3
+ import sys
+ import threading
+@@ -61,6 +63,8 @@ import uuid
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+ 
++from gateway.wake import INTERNAL_WAKE_HEADER
++
+ # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
+ # names a profile this gateway does not serve (→ 404). Distinct from None
+ # (no prefix / multiplexing off → handle as the default profile).
+@@ -1518,6 +1522,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
+         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
+         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
++        self._internal_wakeup_token: str = secrets.token_urlsafe(32)
+         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
+             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
+         )
+@@ -1968,6 +1973,99 @@ class APIServerAdapter(BasePlatformAdapter):
+             status=401,
+         )
+ 
++    @staticmethod
++    def _request_peer_is_loopback(request: "web.Request") -> bool:
++        """Check the real socket peer, never proxy forwarding headers."""
++        peer_ip = ""
++        try:
++            peer = (
++                request.transport.get_extra_info("peername")
++                if request.transport
++                else None
++            )
++            if isinstance(peer, (tuple, list)) and peer:
++                peer_ip = str(peer[0])
++        except Exception:
++            peer_ip = ""
++        if not peer_ip:
++            peer_ip = str(getattr(request, "remote", "") or "")
++        try:
++            address = ipaddress.ip_address(peer_ip.split("%", 1)[0])
++            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
++                address = address.ipv4_mapped
++            return address.is_loopback
++        except ValueError:
++            return False
++
++    def _verify_internal_wakeup_request(
++        self, request: "web.Request"
++    ) -> tuple[Optional[dict[str, str]], Optional["web.Response"]]:
++        """Authenticate the API server's private loopback wake self-post."""
++        claimed = request.headers.get(INTERNAL_WAKE_HEADER, "")
++        if not claimed:
++            return None, None
++        valid = self._request_peer_is_loopback(request) and hmac.compare_digest(
++            claimed.encode(), self._internal_wakeup_token.encode()
++        )
++        if valid:
++            from agent.message_origin import (
++                GATEWAY_WAKEUP,
++                build_message_origin_proof,
++            )
++
++            return build_message_origin_proof(GATEWAY_WAKEUP), None
++        logger.warning(
++            "API server rejected invalid internal wakeup claim: %s",
++            self._request_audit_log_suffix(request),
++        )
++        return None, web.json_response(
++            _openai_error(
++                "Invalid internal wakeup provenance",
++                err_type="gateway_auth_error",
++                code="invalid_internal_wakeup_provenance",
++            ),
++            status=403,
++        )
++
++    def _verify_peer_origin_request(
++        self, request: "web.Request", *, expected_claim: str
++    ) -> tuple[Optional[dict[str, str]], Optional["web.Response"]]:
++        """Accept a per-request peer claim only with the profile API key."""
++        from agent.message_origin import (
++            INTERNAL_ORIGIN_HEADER,
++            PEER_DM,
++            PEER_DM_CLAIM,
++            PEER_RUN,
++            PEER_RUN_CLAIM,
++            build_message_origin_proof,
++        )
++
++        claim = request.headers.get(INTERNAL_ORIGIN_HEADER, "").strip()
++        if not claim:
++            return None, None
++        writers = {
++            PEER_DM_CLAIM: PEER_DM,
++            PEER_RUN_CLAIM: PEER_RUN,
++        }
++        if (
++            claim != expected_claim
++            or not self._expected_api_key()
++            or self._check_auth(request) is not None
++        ):
++            logger.warning(
++                "API server rejected invalid peer-origin claim: %s",
++                self._request_audit_log_suffix(request),
++            )
++            return None, web.json_response(
++                _openai_error(
++                    "Invalid peer message provenance",
++                    err_type="gateway_auth_error",
++                    code="invalid_peer_message_provenance",
++                ),
++                status=403,
++            )
++        return build_message_origin_proof(writers[claim]), None
++
+     @staticmethod
+     def _normalize_callback_platform(value: str) -> str:
+         normalized = (value or "").strip().lower().replace("-", "_")
+@@ -4604,6 +4702,13 @@ class APIServerAdapter(BasePlatformAdapter):
+     @_admit_api_agent_request
+     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
+         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
++        from agent.message_origin import PEER_DM_CLAIM
++
++        message_origin_proof, origin_error = self._verify_peer_origin_request(
++            request, expected_claim=PEER_DM_CLAIM
++        )
++        if origin_error is not None:
++            return origin_error
+         gateway_session_key, key_err = self._parse_session_key_header(request)
+         if key_err is not None:
+             return key_err
+@@ -4683,6 +4788,11 @@ class APIServerAdapter(BasePlatformAdapter):
+             requested_runtime=runtime_request.get("requested") or {},
+             route_source=runtime_request.get("route_source") or "global",
+             confirmed_runtime_lock=lock_active,
++            **(
++                {"message_origin_proof": message_origin_proof}
++                if message_origin_proof
++                else {}
++            ),
+             **agent_overrides,
+         )
+         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
+@@ -4721,6 +4831,13 @@ class APIServerAdapter(BasePlatformAdapter):
+     @_admit_api_agent_request
+     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
+         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
++        from agent.message_origin import PEER_DM_CLAIM
++
++        message_origin_proof, origin_error = self._verify_peer_origin_request(
++            request, expected_claim=PEER_DM_CLAIM
++        )
++        if origin_error is not None:
++            return origin_error
+         gateway_session_key, key_err = self._parse_session_key_header(request)
+         if key_err is not None:
+             return key_err
+@@ -4856,6 +4973,11 @@ class APIServerAdapter(BasePlatformAdapter):
+                     requested_runtime=runtime_request.get("requested") or {},
+                     route_source=runtime_request.get("route_source") or "global",
+                     confirmed_runtime_lock=lock_active,
++                    **(
++                        {"message_origin_proof": message_origin_proof}
++                        if message_origin_proof
++                        else {}
++                    ),
+                     **agent_overrides,
+                 )
+                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+@@ -5049,6 +5171,10 @@ class APIServerAdapter(BasePlatformAdapter):
+         if limited is not None:
+             return limited
+ 
++        wake_origin, wake_error = self._verify_internal_wakeup_request(request)
++        if wake_error is not None:
++            return wake_error
++
+         # Parse request body
+         try:
+             body = await request.json()
+@@ -5273,6 +5399,17 @@ class APIServerAdapter(BasePlatformAdapter):
+                 tool_complete_callback=_on_tool_complete,
+                 agent_ref=agent_ref,
+                 gateway_session_key=gateway_session_key,
++                **(
++                    {
++                        "persist_user_display_kind": "internal_notification",
++                        "persist_user_display_metadata": {
++                            "internal_kind": "wakeup"
++                        },
++                        "message_origin_proof": wake_origin,
++                    }
++                    if wake_origin
++                    else {}
++                ),
+                 **agent_overrides,
+                 route=route,
+             ))
+@@ -5294,6 +5431,17 @@ class APIServerAdapter(BasePlatformAdapter):
+                 ephemeral_system_prompt=system_prompt,
+                 session_id=session_id,
+                 gateway_session_key=gateway_session_key,
++                **(
++                    {
++                        "persist_user_display_kind": "internal_notification",
++                        "persist_user_display_metadata": {
++                            "internal_kind": "wakeup"
++                        },
++                        "message_origin_proof": wake_origin,
++                    }
++                    if wake_origin
++                    else {}
++                ),
+                 **agent_overrides,
+                 route=route,
+             )
+@@ -7265,6 +7413,9 @@ class APIServerAdapter(BasePlatformAdapter):
+         requested_runtime: Optional[Dict[str, Any]] = None,
+         route_source: str = "global",
+         confirmed_runtime_lock: bool = False,
++        persist_user_display_kind: Optional[str] = None,
++        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
++        message_origin_proof: Optional[Dict[str, Any]] = None,
+     ) -> tuple:
+         """
+         Create an agent and run a conversation in a thread executor.
+@@ -7355,11 +7506,24 @@ class APIServerAdapter(BasePlatformAdapter):
+                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
+                     # is a usable hook for the rest.
+                     self._shutdown_interruptible_agents[id(agent)] = agent
+-                    result = agent.run_conversation(
+-                        user_message=user_message,
+-                        conversation_history=conversation_history,
+-                        task_id=effective_task_id,
+-                    )
++                    conversation_kwargs = {
++                        "user_message": user_message,
++                        "conversation_history": conversation_history,
++                        "task_id": effective_task_id,
++                    }
++                    if persist_user_display_kind is not None:
++                        conversation_kwargs["persist_user_display_kind"] = (
++                            persist_user_display_kind
++                        )
++                    if persist_user_display_metadata is not None:
++                        conversation_kwargs["persist_user_display_metadata"] = (
++                            persist_user_display_metadata
++                        )
++                    if message_origin_proof is not None:
++                        conversation_kwargs["message_origin_proof"] = (
++                            message_origin_proof
++                        )
++                    result = agent.run_conversation(**conversation_kwargs)
+                     usage = {
+                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+diff --git a/gateway/platforms/api_server_runs.py b/gateway/platforms/api_server_runs.py
+index 116d6a7..f687217 100644
+--- a/gateway/platforms/api_server_runs.py
++++ b/gateway/platforms/api_server_runs.py
+@@ -448,6 +448,29 @@ async def _handle_runs(
+         and isinstance(body.get("_room_execution_policy"), dict)
+         else None
+     )
++    from agent.message_origin import (
++        INTERNAL_ORIGIN_HEADER,
++        PEER_RUN_CLAIM,
++        ROOM_DISPATCH,
++        build_message_origin_proof,
++    )
++
++    if room_dispatch is not None:
++        if request.headers.get(INTERNAL_ORIGIN_HEADER, "").strip():
++            return web.json_response(
++                _openai_error(
++                    "Room dispatch cannot carry a peer-origin claim",
++                    code="conflicting_message_provenance",
++                ),
++                status=403,
++            )
++        message_origin_proof = build_message_origin_proof(ROOM_DISPATCH)
++    else:
++        message_origin_proof, origin_error = self._verify_peer_origin_request(
++            request, expected_claim=PEER_RUN_CLAIM
++        )
++        if origin_error is not None:
++            return origin_error
+ 
+     idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+     if idempotency_key and (
+@@ -817,11 +840,16 @@ async def _handle_runs(
+                         # ownership so stop/cancel can reap only the
+                         # background processes this run created (#76115).
+                         _publish_turn_process_ownership(agent, effective_task_id)
+-                        r = agent.run_conversation(
+-                            user_message=user_message,
+-                            conversation_history=conversation_history,
+-                            task_id=effective_task_id,
+-                        )
++                        conversation_kwargs = {
++                            "user_message": user_message,
++                            "conversation_history": conversation_history,
++                            "task_id": effective_task_id,
++                        }
++                        if message_origin_proof is not None:
++                            conversation_kwargs["message_origin_proof"] = (
++                                message_origin_proof
++                            )
++                        r = agent.run_conversation(**conversation_kwargs)
+                     finally:
+                         # Worker finished (interrupted or complete) —
+                         # clear turn ownership immediately so a later
+diff --git a/gateway/run.py b/gateway/run.py
+index 411f557..de36700 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -6995,6 +6995,10 @@ class TurnRunner:
+                 _conversation_kwargs["persist_user_display_kind"] = (
+                     ctx.persist_user_display_kind
+                 )
++            if ctx.message_origin_proof:
++                _conversation_kwargs["message_origin_proof"] = (
++                    ctx.message_origin_proof
++                )
+             if ctx.moa_config is not None:
+                 _conversation_kwargs["moa_config"] = ctx.moa_config
+             if _persist_user_timestamp_override is not None:
+@@ -20655,6 +20659,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_display_kind = (
+             "internal_notification" if getattr(event, "internal", False) else None
+         )
++        from agent.message_origin import message_origin_for_gateway_event
++
++        message_origin_proof = message_origin_for_gateway_event(event)
+         try:
+             _pcfg = _load_gateway_config()
+             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
+@@ -22218,6 +22225,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
+                 persist_user_display_kind=persist_user_display_kind,
++                message_origin_proof=message_origin_proof,
+                 message_type=event.message_type,
+             )
+             _turn_seconds = time.monotonic() - _turn_started_monotonic
+@@ -22659,6 +22667,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 }
+                 if persist_user_display_kind:
+                     _user_entry["display_kind"] = persist_user_display_kind
++                if message_origin_proof:
++                    _user_entry["_origin_proof"] = message_origin_proof
+                 if event.message_id:
+                     _user_entry["message_id"] = str(event.message_id)
+                 # Dedupe: skip if this platform message_id is already in the
+@@ -22703,6 +22713,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     }
+                     if persist_user_display_kind:
+                         _user_entry["display_kind"] = persist_user_display_kind
++                    if message_origin_proof:
++                        _user_entry["_origin_proof"] = message_origin_proof
+                     if event.message_id:
+                         _user_entry["message_id"] = str(event.message_id)
+                     await self.async_session_store.append_to_transcript(
+@@ -22713,7 +22725,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     if response:
+                         await self.async_session_store.append_to_transcript(
+                             session_entry.session_id,
+-                            {"role": "assistant", "content": response, "timestamp": ts},
++                            {
++                                "role": "assistant",
++                                "content": response,
++                                "timestamp": ts,
++                                **(
++                                    {"_origin_proof": message_origin_proof}
++                                    if message_origin_proof
++                                    else {}
++                                ),
++                            },
+                             skip_db=agent_persisted,
+                         )
+                 else:
+@@ -22926,6 +22947,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         }
+                         if 'persist_user_display_kind' in locals() and persist_user_display_kind:
+                             _user_entry["display_kind"] = persist_user_display_kind
++                        if 'message_origin_proof' in locals() and message_origin_proof:
++                            _user_entry["_origin_proof"] = message_origin_proof
+                         if getattr(event, "message_id", None):
+                             _user_entry["message_id"] = str(event.message_id)
+                         await self.async_session_store.append_to_transcript(
+@@ -30210,6 +30233,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_message: Optional[Any] = None,
+         persist_user_timestamp: Optional[float] = None,
+         persist_user_display_kind: Optional[str] = None,
++        message_origin_proof: Optional[Dict[str, Any]] = None,
+         message_type: Optional[str] = None,
+     ) -> Dict[str, Any]:
+         """Profile-scoping wrapper around the agent run.
+@@ -30230,6 +30254,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
+                 persist_user_display_kind=persist_user_display_kind,
++                message_origin_proof=message_origin_proof,
+                 message_type=message_type,
+             )
+ 
+@@ -30243,6 +30268,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
+                 persist_user_display_kind=persist_user_display_kind,
++                message_origin_proof=message_origin_proof,
+                 message_type=message_type,
+             )
+ 
+@@ -30386,6 +30412,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_message: Optional[Any] = None,
+         persist_user_timestamp: Optional[float] = None,
+         persist_user_display_kind: Optional[str] = None,
++        message_origin_proof: Optional[Dict[str, Any]] = None,
+         message_type: Optional[str] = None,
+     ) -> Dict[str, Any]:
+         """
+@@ -30696,6 +30723,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             persist_user_message=persist_user_message,
+             persist_user_timestamp=persist_user_timestamp,
+             persist_user_display_kind=persist_user_display_kind,
++            message_origin_proof=message_origin_proof,
+         )
+         turn_runner = TurnRunner(self, turn_ctx)
+         # Callback invoked by agent on tool lifecycle events — extracted to
+diff --git a/gateway/session.py b/gateway/session.py
+index 32a343c..60a5145 100644
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -3922,6 +3922,7 @@ class SessionStore:
+             # #82888). DB-only; stripped from provider-bound payloads.
+             display_kind=message.get("display_kind"),
+             display_metadata=message.get("display_metadata"),
++            origin_proof=message.get("_origin_proof", message.get("origin_proof")),
+         )
+ 
+     # Maximum in-memory pending messages per session before dropping the
+diff --git a/gateway/shutdown_flush.py b/gateway/shutdown_flush.py
+index a727dd9..57b4192 100644
+--- a/gateway/shutdown_flush.py
++++ b/gateway/shutdown_flush.py
+@@ -259,6 +259,11 @@ def _serialise_value(value: Any) -> Optional[dict]:
+     # MessageEvent objects have a .text attribute and other fields
+     if hasattr(value, "text"):
+         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
++        from agent.message_origin import message_origin_for_gateway_event
++
++        origin_proof = message_origin_for_gateway_event(value)
++        if origin_proof is not None:
++            result["origin_proof"] = origin_proof
+         # Preserve additional fields if present
+         for attr in ("session_id", "platform", "sender_id", "sender_name",
+                       "reply_to", "media", "raw_event"):
+@@ -347,12 +352,18 @@ def recover_pending_to_db(
+                         path,
+                     )
+                     continue
+-                session_db.append_message(
+-                    session_id=spooled_sid,
+-                    role=message.get("role", "unknown"),
+-                    content=message.get("content") or "",
+-                    timestamp=message.get("timestamp") or payload.get("ts"),
++                append_kwargs = {
++                    "session_id": spooled_sid,
++                    "role": message.get("role", "unknown"),
++                    "content": message.get("content") or "",
++                    "timestamp": message.get("timestamp") or payload.get("ts"),
++                }
++                origin_proof = message.get(
++                    "_origin_proof", message.get("origin_proof")
+                 )
++                if origin_proof is not None:
++                    append_kwargs["origin_proof"] = origin_proof
++                session_db.append_message(**append_kwargs)
+                 recovered += 1
+                 path.unlink(missing_ok=True)
+                 continue
+@@ -389,12 +400,15 @@ def recover_pending_to_db(
+                 )
+                 continue
+ 
+-            session_db.append_message(
+-                session_id=session_id,
+-                role="user",
+-                content=text,
+-                timestamp=payload.get("ts", int(time.time())),
+-            )
++            append_kwargs = {
++                "session_id": session_id,
++                "role": "user",
++                "content": text,
++                "timestamp": payload.get("ts", int(time.time())),
++            }
++            if data.get("origin_proof") is not None:
++                append_kwargs["origin_proof"] = data["origin_proof"]
++            session_db.append_message(**append_kwargs)
+             recovered += 1
+             path.unlink(missing_ok=True)
+         except BaseException:
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index 2bf7e55..e69bac2 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -5513,6 +5513,9 @@ class GatewaySlashCommandsMixin:
+                         # replays the parent's exact wire bytes (warm provider
+                         # prompt cache) instead of a full cold prefill.
+                         "api_content": extract_api_content_sidecar(msg),
++                        "origin_proof": msg.get(
++                            "_origin_proof", msg.get("origin_proof")
++                        ),
+                         "timestamp": msg.get("timestamp"),
+                     }
+                     for msg in history
+diff --git a/gateway/turn_context.py b/gateway/turn_context.py
+index b48a24a..9e986ec 100644
+--- a/gateway/turn_context.py
++++ b/gateway/turn_context.py
+@@ -96,6 +96,8 @@ class TurnContext:
+     # "internal_notification" for async-delegation/background notifications
+     # (#82888). DB-only presentation metadata; never sent to the provider.
+     persist_user_display_kind: Optional[str] = None
++    # Closed host authority copied to every durable row in this logical turn.
++    message_origin_proof: Optional[dict] = None
+     user_config: Any = None
+     enabled_toolsets: Any = None
+     disabled_toolsets: Any = None
+diff --git a/gateway/wake.py b/gateway/wake.py
+index cee8d45..4ad1b33 100644
+--- a/gateway/wake.py
++++ b/gateway/wake.py
+@@ -31,6 +31,22 @@ from typing import Any, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
++INTERNAL_WAKE_HEADER = "X-Hermes-Internal-Wakeup"
++INTERNAL_WAKE_KIND = "wakeup"
++
++
++def event_wakeup_origin_proof(event: Any) -> Optional[dict[str, str]]:
++    """Mint scheduled authority only for the host's closed wake event."""
++    from agent.message_origin import (
++        GATEWAY_WAKEUP,
++        message_origin_for_gateway_event,
++    )
++
++    proof = message_origin_for_gateway_event(event)
++    if proof and proof.get("writer") == GATEWAY_WAKEUP:
++        return proof
++    return None
++
+ # A wake self-post runs the entire agent turn synchronously (stream=false);
+ # generous ceiling so long tool-using turns aren't killed mid-flight.
+ WAKE_TURN_TIMEOUT_SECONDS = 600.0
+@@ -82,6 +98,7 @@ async def deliver_wake(
+             message_type=MessageType.TEXT,
+             source=source,
+             internal=True,
++            metadata={"internal_kind": INTERNAL_WAKE_KIND},
+         )
+         await adapter.handle_message(synth_event)
+         return
+@@ -119,6 +136,12 @@ async def _self_post_chat_completion(
+             "X-Hermes-Session-Id is rejected (403) on an unauthenticated API "
+             "server, so the wake cannot reach the target session"
+         )
++    wake_token = str(getattr(adapter, "_internal_wakeup_token", "") or "")
++    if not wake_token:
++        raise RuntimeError(
++            "wake self-post requires the API server's process-local internal "
++            "wakeup credential"
++        )
+ 
+     if ":" in host and not host.startswith("["):
+         host = f"[{host}]"  # bare IPv6 literal
+@@ -126,6 +149,7 @@ async def _self_post_chat_completion(
+     headers = {
+         "Authorization": f"Bearer {api_key}",
+         "X-Hermes-Session-Id": session_id,
++        INTERNAL_WAKE_HEADER: wake_token,
+     }
+     payload = {
+         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
+diff --git a/hermes_cli/subcommands/peer.py b/hermes_cli/subcommands/peer.py
+index 675f2a4..a35f4f7 100644
+--- a/hermes_cli/subcommands/peer.py
++++ b/hermes_cli/subcommands/peer.py
+@@ -41,6 +41,12 @@ import urllib.parse
+ import urllib.request
+ import uuid
+ 
++from agent.message_origin import (
++    INTERNAL_ORIGIN_HEADER,
++    PEER_DM_CLAIM,
++    PEER_RUN_CLAIM,
++)
++
+ BOT_CHAT_TITLE = "Bot Chat"
+ _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+ _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+@@ -373,7 +379,10 @@ def cmd_peer(args) -> int:
+                     key,
+                     method="POST",
+                     body={"input": message, "session_id": session_id},
+-                    headers={"Idempotency-Key": idempotency_key},
++                    headers={
++                        "Idempotency-Key": idempotency_key,
++                        INTERNAL_ORIGIN_HEADER: PEER_RUN_CLAIM,
++                    },
+                 )
+             except urllib.error.HTTPError as exc:
+                 print(
+@@ -415,6 +424,7 @@ def cmd_peer(args) -> int:
+                 method="POST",
+                 body={"message": message},
+                 timeout=DM_TIMEOUT_S,
++                headers={INTERNAL_ORIGIN_HEADER: PEER_DM_CLAIM},
+             )
+         except urllib.error.HTTPError as exc:
+             print(f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {_http_error_detail(exc)}", file=sys.stderr)
+diff --git a/run_agent.py b/run_agent.py
+index 9f145ba..aaa45a4 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -2195,6 +2195,13 @@ class AIAgent:
+         _ov_idx = getattr(self, "_persist_user_message_idx", None)
+         _ov_content = getattr(self, "_persist_user_message_override", None)
+         _ov_timestamp = getattr(self, "_persist_user_message_timestamp", None)
++        from agent.message_origin import stamp_turn_message_origins
++
++        stamp_turn_message_origins(
++            messages,
++            _ov_idx,
++            getattr(self, "_current_message_origin_proof", None),
++        )
+         try:
+             # Retry row creation if the earlier attempt failed transiently.
+             if not self._session_db_created:
+@@ -2419,6 +2426,7 @@ class AIAgent:
+                         else msg.get("display_kind")
+                     ),
+                     "display_metadata": msg.get("display_metadata"),
++                    "origin_proof": msg.get("_origin_proof"),
+                 }
+                 if isinstance(msg.get("_row_id"), int):
+                     _row["_row_id"] = msg["_row_id"]
+@@ -8698,6 +8706,7 @@ class AIAgent:
+         persist_user_timestamp: Optional[float] = None,
+         persist_user_display_kind: Optional[str] = None,
+         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
++        message_origin_proof: Optional[Dict[str, Any]] = None,
+         moa_config: Optional[dict[str, Any]] = None,
+     ) -> Dict[str, Any]:
+         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+@@ -9072,6 +9081,7 @@ class AIAgent:
+                         persist_user_timestamp=persist_user_timestamp,
+                         persist_user_display_kind=persist_user_display_kind,
+                         persist_user_display_metadata=persist_user_display_metadata,
++                        message_origin_proof=message_origin_proof,
+                         moa_config=moa_config,
+                     )
+                 finally:
+diff --git a/tests/agent/test_message_origin.py b/tests/agent/test_message_origin.py
+new file mode 100644
+index 0000000..11f15ac
+--- /dev/null
++++ b/tests/agent/test_message_origin.py
+@@ -0,0 +1,207 @@
++"""Closed H13 message-origin contracts and canonical group behavior."""
++
++from __future__ import annotations
++
++from agent.message_origin import (
++    API_USER,
++    CLI_ORIGIN_ENV,
++    CLI_USER,
++    CRON_AGENT,
++    CRON_BOT_CHAT,
++    CRON_BOT_CHAT_CLAIM,
++    DELEGATED,
++    GATEWAY_USER,
++    HUMAN,
++    INTERNAL,
++    MESSAGE_ORIGIN_SCHEMA,
++    PEER_DM,
++    ROOM_DISPATCH,
++    SCHEDULED,
++    build_message_origin_proof,
++    classify_message_origin_group,
++    message_origin_for_platform,
++    normalize_message_origin_proof,
++    stamp_turn_message_origins,
++    take_cli_message_origin_proof,
++)
++from hermes_state import SessionDB
++
++
++def _row(role: str, proof, content: str = "visible"):
++    return {"role": role, "content": content, "origin_proof": proof}
++
++
++def test_proof_shape_is_closed_and_writer_owns_kind():
++    proof = build_message_origin_proof(CLI_USER)
++    assert proof == {
++        "schema": MESSAGE_ORIGIN_SCHEMA,
++        "kind": HUMAN,
++        "writer": CLI_USER,
++    }
++    assert normalize_message_origin_proof(proof) == proof
++
++    for invalid in (
++        {**proof, "extra": True},
++        {**proof, "kind": SCHEDULED},
++        {**proof, "writer": "plugin.claim"},
++        {"schema": MESSAGE_ORIGIN_SCHEMA},
++    ):
++        try:
++            normalize_message_origin_proof(invalid)
++        except ValueError:
++            pass
++        else:
++            raise AssertionError(f"accepted invalid origin proof: {invalid!r}")
++
++
++def test_execution_surfaces_map_without_using_session_labels():
++    for platform in (
++        "qq",
++        "wechat",
++        "browser",
++        "hermes_browser",
++        "desktop",
++        "dashboard",
++    ):
++        assert message_origin_for_platform(platform) == build_message_origin_proof(
++            GATEWAY_USER
++        )
++    assert message_origin_for_platform("api_server") == build_message_origin_proof(
++        API_USER
++    )
++    assert message_origin_for_platform("cron") == build_message_origin_proof(
++        CRON_AGENT
++    )
++    for unproved in ("webhook", "homeassistant", "relay", "plugin_name", ""):
++        assert message_origin_for_platform(unproved) is None
++
++
++def test_cron_bot_chat_claim_is_one_shot_and_closed():
++    env = {CLI_ORIGIN_ENV: CRON_BOT_CHAT_CLAIM}
++    assert take_cli_message_origin_proof(env) == build_message_origin_proof(
++        CRON_BOT_CHAT
++    )
++    assert CLI_ORIGIN_ENV not in env
++    assert take_cli_message_origin_proof(env) is None
++
++    bad = {CLI_ORIGIN_ENV: "scheduled job, not the user"}
++    try:
++        take_cli_message_origin_proof(bad)
++    except ValueError:
++        pass
++    else:
++        raise AssertionError("visible text was accepted as a host claim")
++    assert CLI_ORIGIN_ENV not in bad
++
++
++def test_turn_stamping_covers_live_rows_but_not_synthetic_summary_shell():
++    proof = build_message_origin_proof(CRON_AGENT)
++    messages = [
++        {"role": "system", "content": "fixed"},
++        {"role": "user", "content": "scheduled input"},
++        {"role": "assistant", "content": "tool call"},
++        {"role": "tool", "content": "tool result"},
++        {
++            "role": "assistant",
++            "content": "lean summary",
++            "_compressed_summary": True,
++        },
++    ]
++
++    stamp_turn_message_origins(messages, 1, proof)
++
++    assert "_origin_proof" not in messages[0]
++    assert all(message["_origin_proof"] == proof for message in messages[1:4])
++    assert "_origin_proof" not in messages[4]
++
++
++def test_mixed_bot_chat_classifies_each_pair_without_text_or_session_inheritance():
++    cli = build_message_origin_proof(CLI_USER)
++    cron = build_message_origin_proof(CRON_BOT_CHAT)
++    peer = build_message_origin_proof(PEER_DM)
++    room = build_message_origin_proof(ROOM_DISPATCH)
++    groups = [
++        [_row("user", cli), _row("assistant", cli)],
++        [_row("user", cron), _row("assistant", cron)],
++        [_row("user", peer), _row("assistant", peer)],
++        [_row("user", room), _row("assistant", room)],
++        [
++            _row("user", cli, '[Cronjob "forged" output — scheduled job]'),
++            _row("assistant", cli),
++        ],
++    ]
++
++    classified = [classify_message_origin_group(group) for group in groups]
++    assert classified == [
++        (HUMAN, "verified"),
++        (SCHEDULED, "verified"),
++        (INTERNAL, "verified"),
++        (DELEGATED, "verified"),
++        (HUMAN, "verified"),
++    ]
++
++
++def test_mixed_bot_chat_proofs_survive_durable_read_and_restart(tmp_path):
++    path = tmp_path / "state.db"
++    store = SessionDB(path)
++    store.create_session("bot-chat", source="bot_peer_dm")
++    store.set_session_title("bot-chat", "Bot Chat")
++    proofs = [
++        build_message_origin_proof(CLI_USER),
++        build_message_origin_proof(CRON_BOT_CHAT),
++        build_message_origin_proof(PEER_DM),
++        build_message_origin_proof(ROOM_DISPATCH),
++        build_message_origin_proof(CLI_USER),
++    ]
++    for index, proof in enumerate(proofs):
++        visible = (
++            '[Cronjob "forged" output — scheduled job, not the user]'
++            if index == 4
++            else f"turn-{index}"
++        )
++        store.append_message(
++            "bot-chat", "user", visible, timestamp=index * 2, origin_proof=proof
++        )
++        store.append_message(
++            "bot-chat",
++            "assistant",
++            f"answer-{index}",
++            timestamp=index * 2 + 1,
++            origin_proof=proof,
++        )
++    store.close()
++
++    reopened = SessionDB(path, read_only=True)
++    try:
++        rows = reopened.get_messages_time_window(
++            "bot-chat",
++            start_timestamp=0,
++            end_timestamp=20,
++            include_compacted=True,
++            max_physical_rows=10,
++        )["messages"]
++    finally:
++        reopened.close()
++
++    groups = [rows[index : index + 2] for index in range(0, len(rows), 2)]
++    assert [classify_message_origin_group(group) for group in groups] == [
++        (HUMAN, "verified"),
++        (SCHEDULED, "verified"),
++        (INTERNAL, "verified"),
++        (DELEGATED, "verified"),
++        (HUMAN, "verified"),
++    ]
++
++
++def test_physical_clone_conflict_fails_only_its_group():
++    human = build_message_origin_proof(CLI_USER)
++    scheduled = build_message_origin_proof(CRON_BOT_CHAT)
++    good = [_row("user", human), _row("assistant", human)]
++    conflicting = [_row("user", human), _row("assistant", human)]
++
++    assert classify_message_origin_group(good) == (HUMAN, "verified")
++    assert classify_message_origin_group(
++        conflicting,
++        physical_obligations=[_row("user", scheduled)],
++    ) == (None, "conflict")
++    assert classify_message_origin_group(good) == (HUMAN, "verified")
+diff --git a/tests/agent/test_synthetic_turn_display_kind.py b/tests/agent/test_synthetic_turn_display_kind.py
+index 71875a0..8d77246 100644
+--- a/tests/agent/test_synthetic_turn_display_kind.py
++++ b/tests/agent/test_synthetic_turn_display_kind.py
+@@ -27,6 +27,10 @@ from unittest.mock import patch
+ import pytest
+ 
+ from agent.turn_context import build_turn_context
++from agent.message_origin import (
++    CRON_AGENT,
++    build_message_origin_proof,
++)
+ from hermes_state import SessionDB
+ from run_agent import AIAgent
+ 
+@@ -104,3 +108,46 @@ def test_a_real_user_turn_stays_untyped(agent_db):
+ 
+     row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
+     assert row.get("display_kind") is None
++
++
++def test_real_turn_persists_one_origin_across_user_assistant_and_tool_rows(agent_db):
++    agent, db, sid = agent_db
++    scheduled = build_message_origin_proof(CRON_AGENT)
++
++    ctx = _build(
++        agent,
++        user_message="scheduled input",
++        message_origin_proof=scheduled,
++    )
++    ctx.messages.extend(
++        [
++            {"role": "assistant", "content": "calling tool"},
++            {
++                "role": "tool",
++                "content": "tool output",
++                "tool_name": "terminal",
++                "tool_call_id": "call-1",
++            },
++            {"role": "assistant", "content": "scheduled answer"},
++        ]
++    )
++    agent._persist_session(ctx.messages)
++
++    rows = db.get_messages(sid)
++    assert [row["role"] for row in rows] == [
++        "user",
++        "assistant",
++        "tool",
++        "assistant",
++    ]
++    assert all(row["origin_proof"] == scheduled for row in rows)
++
++
++def test_direct_cron_platform_mints_scheduled_origin_without_text_hint(agent_db):
++    agent, db, sid = agent_db
++    agent.platform = "cron"
++
++    _build(agent, user_message="plain cron input")
++
++    (row,) = db.get_messages(sid)
++    assert row["origin_proof"] == build_message_origin_proof(CRON_AGENT)
+diff --git a/tests/agent/transports/test_chat_completions.py b/tests/agent/transports/test_chat_completions.py
+index 45c1e6a..2e34faa 100644
+--- a/tests/agent/transports/test_chat_completions.py
++++ b/tests/agent/transports/test_chat_completions.py
+@@ -131,14 +131,25 @@ class TestChatCompletionsBasic:
+         Regression test for #47868.
+         """
+         msgs = [
+-            {"role": "user", "content": "hi", "timestamp": 1781976577.0},
++            {
++                "role": "user",
++                "content": "hi",
++                "timestamp": 1781976577.0,
++                "_origin_proof": {
++                    "schema": "hermes.message_origin.v1",
++                    "kind": "human",
++                    "writer": "cli.user",
++                },
++            },
+         ]
+         result = transport.convert_messages(msgs)
+         assert "timestamp" not in result[0]
++        assert "_origin_proof" not in result[0]
+         assert result[0]["content"] == "hi"
+         assert result[0]["role"] == "user"
+         # Original list untouched (deepcopy-on-demand)
+         assert msgs[0]["timestamp"] == 1781976577.0
++        assert msgs[0]["_origin_proof"]["kind"] == "human"
+ 
+     def test_convert_messages_no_copy_without_timestamp(self, transport):
+         """A timestamp-free message list needs no sanitize pass and is
+diff --git a/tests/cron/test_cron_bot_chat_delivery.py b/tests/cron/test_cron_bot_chat_delivery.py
+index 92ebadd..ea187c8 100644
+--- a/tests/cron/test_cron_bot_chat_delivery.py
++++ b/tests/cron/test_cron_bot_chat_delivery.py
+@@ -11,6 +11,7 @@ from unittest import mock
+ 
+ import pytest
+ 
++from agent.message_origin import CLI_ORIGIN_ENV, CRON_BOT_CHAT_CLAIM
+ from cron import scheduler as sched
+ from cron.scheduler import (
+     BOT_CHAT_PLATFORM,
+@@ -140,6 +141,7 @@ def test_deliver_runs_canonical_bot_chat_lane():
+     assert "--create-if-missing" in argv
+     assert "-Q" in argv
+     assert "--query-file" in argv
++    assert calls["kwargs"]["env"][CLI_ORIGIN_ENV] == CRON_BOT_CHAT_CLAIM
+     # Message rides a temp file, never inline argv (quote/expansion safety).
+     assert not any("the output" in str(a) for a in argv)
+ 
+diff --git a/tests/gateway/test_api_server_runs.py b/tests/gateway/test_api_server_runs.py
+index 0f9f573..2a23e97 100644
+--- a/tests/gateway/test_api_server_runs.py
++++ b/tests/gateway/test_api_server_runs.py
+@@ -19,6 +19,13 @@ import pytest
+ from aiohttp import web
+ from aiohttp.test_utils import TestClient, TestServer
+ 
++from agent.message_origin import (
++    INTERNAL_ORIGIN_HEADER,
++    PEER_RUN,
++    PEER_RUN_CLAIM,
++    ROOM_DISPATCH,
++    build_message_origin_proof,
++)
+ from gateway.config import PlatformConfig
+ from gateway.platforms.api_server import (
+     APIServerAdapter,
+@@ -145,6 +152,43 @@ def auth_adapter():
+ 
+ 
+ class TestStartRun:
++    @pytest.mark.asyncio
++    async def test_authenticated_peer_run_passes_internal_origin_proof(
++        self, auth_adapter
++    ):
++        app = _create_runs_app(auth_adapter)
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(auth_adapter, "_create_agent") as mock_create:
++                agent = MagicMock()
++                agent.run_conversation.return_value = {"final_response": "done"}
++                agent.session_prompt_tokens = 0
++                agent.session_completion_tokens = 0
++                agent.session_total_tokens = 0
++                mock_create.return_value = agent
++                response = await cli.post(
++                    "/v1/runs",
++                    json={"input": "peer work"},
++                    headers={
++                        "Authorization": "Bearer sk-secret",
++                        INTERNAL_ORIGIN_HEADER: PEER_RUN_CLAIM,
++                    },
++                )
++                body = await response.json()
++                for _ in range(40):
++                    status_response = await cli.get(
++                        f"/v1/runs/{body['run_id']}",
++                        headers={"Authorization": "Bearer sk-secret"},
++                    )
++                    status = await status_response.json()
++                    if status.get("status") == "completed":
++                        break
++                    await asyncio.sleep(0.05)
++
++        assert response.status == 202
++        assert agent.run_conversation.call_args.kwargs[
++            "message_origin_proof"
++        ] == build_message_origin_proof(PEER_RUN)
++
+     @pytest.mark.asyncio
+     async def test_room_auth_is_validated_before_body_parse_or_work_reservation(
+         self, auth_adapter
+@@ -2032,6 +2076,9 @@ class TestHostedRoomRuns:
+             row = db.get_session(session_id)
+             assert row["source"] == "bot_room"
+             assert row["title"] == "Group: room-1"
++            assert agent.run_conversation.call_args.kwargs[
++                "message_origin_proof"
++            ] == build_message_origin_proof(ROOM_DISPATCH)
+             assert catalog["installation_id"] == (
+                 hosted_rooms.local_authority_gateway_id()
+             )
+diff --git a/tests/gateway/test_internal_notification_marker_82888.py b/tests/gateway/test_internal_notification_marker_82888.py
+index d3f9301..769c3c8 100644
+--- a/tests/gateway/test_internal_notification_marker_82888.py
++++ b/tests/gateway/test_internal_notification_marker_82888.py
+@@ -25,6 +25,12 @@ from unittest.mock import AsyncMock, MagicMock
+ import pytest
+ 
+ import gateway.run as gateway_run
++from agent.message_origin import (
++    GATEWAY_INTERNAL,
++    GATEWAY_USER,
++    GATEWAY_WAKEUP,
++    build_message_origin_proof,
++)
+ from gateway.config import GatewayConfig, Platform
+ from gateway.platforms.base import MessageEvent
+ from gateway.session import SessionEntry, SessionSource
+@@ -135,6 +141,9 @@ async def test_internal_event_threads_marker_into_agent_run(monkeypatch, tmp_pat
+ 
+     kwargs = runner._run_agent.call_args.kwargs
+     assert kwargs["persist_user_display_kind"] == "internal_notification"
++    assert kwargs["message_origin_proof"] == build_message_origin_proof(
++        GATEWAY_INTERNAL
++    )
+ 
+ 
+ @pytest.mark.asyncio
+@@ -156,6 +165,31 @@ async def test_real_user_event_gets_no_marker(monkeypatch, tmp_path):
+ 
+     kwargs = runner._run_agent.call_args.kwargs
+     assert kwargs["persist_user_display_kind"] is None
++    assert kwargs["message_origin_proof"] == build_message_origin_proof(
++        GATEWAY_USER
++    )
++
++
++@pytest.mark.asyncio
++async def test_exact_host_wakeup_event_gets_scheduled_origin(monkeypatch, tmp_path):
++    runner = _bootstrap(monkeypatch, tmp_path)
++    runner._run_agent = AsyncMock(
++        return_value={
++            "final_response": "ack",
++            "messages": [],
++            "tools": [],
++            "history_offset": 0,
++            "last_prompt_tokens": 0,
++        }
++    )
++    event = _event(internal=True, text="wake")
++    event.metadata = {"internal_kind": "wakeup"}
++
++    await runner._handle_message_with_agent(event, _source(), SESSION_KEY, 1)
++
++    assert runner._run_agent.call_args.kwargs[
++        "message_origin_proof"
++    ] == build_message_origin_proof(GATEWAY_WAKEUP)
+ 
+ 
+ # ── 3: gateway-side fallback rows carry the marker for internal events ─────
+@@ -187,6 +221,9 @@ async def test_failed_early_fallback_row_is_marked_for_internal_event(
+     for entry in entries:
+         assert entry["role"] == "user"  # alternation invariant: role unchanged
+         assert entry["display_kind"] == "internal_notification"
++        assert entry["_origin_proof"] == build_message_origin_proof(
++            GATEWAY_INTERNAL
++        )
+ 
+ 
+ @pytest.mark.asyncio
+@@ -213,6 +250,9 @@ async def test_failed_early_fallback_row_is_unmarked_for_real_user(
+     assert entries
+     for entry in entries:
+         assert "display_kind" not in entry
++        assert entry["_origin_proof"] == build_message_origin_proof(
++            GATEWAY_USER
++        )
+ 
+ 
+ @pytest.mark.asyncio
+@@ -240,6 +280,9 @@ async def test_no_new_messages_fallback_row_is_marked_for_internal_event(
+     for entry in entries:
+         assert entry["role"] == "user"
+         assert entry["display_kind"] == "internal_notification"
++        assert entry["_origin_proof"] == build_message_origin_proof(
++            GATEWAY_INTERNAL
++        )
+ 
+ 
+ # ── 4: DB round-trip replay + provider-payload hygiene ─────────────────────
+@@ -259,6 +302,7 @@ def test_marked_row_replays_cleanly_and_never_reaches_provider(tmp_path):
+             role="user",
+             content="[ASYNC DELEGATION BATCH COMPLETE — 2/2 succeeded]",
+             display_kind="internal_notification",
++            origin_proof=build_message_origin_proof(GATEWAY_INTERNAL),
+         )
+         db.append_message(session_id=sid, role="assistant", content="noted")
+ 
+@@ -266,6 +310,9 @@ def test_marked_row_replays_cleanly_and_never_reaches_provider(tmp_path):
+         replayed = db.get_messages_as_conversation(sid)
+         user_row, = [m for m in replayed if m["role"] == "user"]
+         assert user_row["display_kind"] == "internal_notification"
++        assert user_row["_origin_proof"] == build_message_origin_proof(
++            GATEWAY_INTERNAL
++        )
+         assert user_row["content"].startswith("[ASYNC DELEGATION BATCH COMPLETE")
+ 
+         # Provider hygiene: the per-request copy in conversation_loop pops
+diff --git a/tests/gateway/test_peer_dm_hidden_e2e.py b/tests/gateway/test_peer_dm_hidden_e2e.py
+index 1666976..1667b41 100644
+--- a/tests/gateway/test_peer_dm_hidden_e2e.py
++++ b/tests/gateway/test_peer_dm_hidden_e2e.py
+@@ -20,6 +20,7 @@ from types import SimpleNamespace
+ import pytest
+ from aiohttp import web
+ 
++from agent.message_origin import PEER_DM, build_message_origin_proof
+ from gateway.config import PlatformConfig
+ from gateway.platforms.api_server import APIServerAdapter
+ from hermes_cli.subcommands import peer as peer_cmd
+@@ -53,8 +54,10 @@ def peer_gateway(tmp_path, monkeypatch):
+ 
+     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": API_KEY}))
+     adapter._session_db = db
++    calls = []
+ 
+     async def fake_run_agent(user_message, **kwargs):
++        calls.append({"user_message": user_message, **kwargs})
+         return (
+             {
+                 "final_response": f"e2e reply to: {user_message}",
+@@ -92,6 +95,7 @@ def peer_gateway(tmp_path, monkeypatch):
+             url=f"http://127.0.0.1:{state['port']}",
+             db=db,
+             hidden_id=hidden_id,
++            calls=calls,
+         )
+     finally:
+         async def _stop():
+@@ -119,6 +123,9 @@ def test_peer_dm_reaches_hidden_canonical_bot_chat_e2e(peer_gateway, monkeypatch
+     payload = json.loads(capsys.readouterr().out)
+     assert payload["reply"] == "e2e reply to: disk status?"
+     assert payload["session_id"] == peer_gateway.hidden_id
++    assert peer_gateway.calls[0]["message_origin_proof"] == (
++        build_message_origin_proof(PEER_DM)
++    )
+ 
+     # The real DB still holds exactly ONE Bot Chat row and it is still hidden.
+     rows = peer_gateway.db.list_sessions_rich(limit=200, include_hidden=True)
+diff --git a/tests/gateway/test_shutdown_flush.py b/tests/gateway/test_shutdown_flush.py
+index fe67ab7..0221a78 100644
+--- a/tests/gateway/test_shutdown_flush.py
++++ b/tests/gateway/test_shutdown_flush.py
+@@ -5,11 +5,14 @@ import os
+ import stat
+ import time
+ from pathlib import Path
++from types import SimpleNamespace
+ from unittest.mock import MagicMock
+ 
+ import pytest
+ 
++from agent.message_origin import GATEWAY_USER, build_message_origin_proof
+ from gateway.shutdown_flush import (
++    TRANSCRIPT_CAP_DROP_REASON,
+     _serialise_value,
+     flush_pending_to_file,
+     recover_pending_to_db,
+@@ -55,6 +58,9 @@ def test_flush_writes_message_event_to_file(tmp_path, monkeypatch):
+     event.reply_to = None
+     event.media = None
+     event.raw_event = None
++    event.internal = False
++    event.metadata = None
++    event.source = SimpleNamespace(platform="telegram")
+ 
+     count = flush_pending_to_file({"session_key_1": event}, reason="adapter_shutdown")
+     assert count == 1
+@@ -63,6 +69,9 @@ def test_flush_writes_message_event_to_file(tmp_path, monkeypatch):
+     payload = json.loads(files[0].read_text(encoding="utf-8"))
+     assert payload["data"]["text"] == "user message"
+     assert payload["data"]["session_id"] == "20260728_120000_abc"
++    assert payload["data"]["origin_proof"] == build_message_origin_proof(
++        GATEWAY_USER
++    )
+ 
+ 
+ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypatch):
+@@ -79,6 +88,7 @@ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypat
+         "data": {
+             "text": "lost message",
+             "session_id": "20260728_120000_abc",
++            "origin_proof": build_message_origin_proof(GATEWAY_USER),
+         },
+     }
+     flush_file = flush_dir / "test_session_123.json"
+@@ -93,6 +103,41 @@ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypat
+         role="user",
+         content="lost message",
+         timestamp=ts,
++        origin_proof=build_message_origin_proof(GATEWAY_USER),
++    )
++    assert not flush_file.exists()
++
++
++def test_transcript_cap_recovery_keeps_origin_proof(tmp_path, monkeypatch):
++    flush_dir = _make_flush_dir(tmp_path)
++    monkeypatch.setattr(
++        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
++    )
++    proof = build_message_origin_proof(GATEWAY_USER)
++    payload = {
++        "session_key": "session-1",
++        "reason": TRANSCRIPT_CAP_DROP_REASON,
++        "ts": 12,
++        "data": {
++            "session_id": "session-1",
++            "message": {
++                "role": "user",
++                "content": "spooled",
++                "_origin_proof": proof,
++            },
++        },
++    }
++    flush_file = flush_dir / "cap.json"
++    flush_file.write_text(json.dumps(payload), encoding="utf-8")
++    mock_db = MagicMock()
++
++    assert recover_pending_to_db(mock_db) == 1
++    mock_db.append_message.assert_called_once_with(
++        session_id="session-1",
++        role="user",
++        content="spooled",
++        timestamp=12,
++        origin_proof=proof,
+     )
+     assert not flush_file.exists()
+ 
+@@ -166,5 +211,3 @@ def test_get_flush_dir_uses_get_hermes_home(tmp_path, monkeypatch):
+     result = mod._get_flush_dir()
+     assert captured.get("called") is True
+     assert result == tmp_path / "pending_messages"
+-
+-
+diff --git a/tests/hermes_cli/test_peer_cmd.py b/tests/hermes_cli/test_peer_cmd.py
+index 732aab2..6f4c6b0 100644
+--- a/tests/hermes_cli/test_peer_cmd.py
++++ b/tests/hermes_cli/test_peer_cmd.py
+@@ -7,6 +7,11 @@ from types import SimpleNamespace
+ 
+ import pytest
+ 
++from agent.message_origin import (
++    INTERNAL_ORIGIN_HEADER,
++    PEER_DM_CLAIM,
++    PEER_RUN_CLAIM,
++)
+ from hermes_cli.subcommands import peer as peer_cmd
+ 
+ 
+@@ -133,6 +138,9 @@ class _FakePeer(BaseHTTPRequestHandler):
+ 
+     def do_POST(self):
+         type(self).auth_seen.append(self.headers.get("Authorization", ""))
++        type(self).origin_headers.append(
++            self.headers.get(INTERNAL_ORIGIN_HEADER, "")
++        )
+         length = int(self.headers.get("Content-Length", 0))
+         body = json.loads(self.rfile.read(length) or b"{}")
+ 
+@@ -179,6 +187,7 @@ def fake_peer_server():
+     _FakePeer.runs = []
+     _FakePeer.run_idempotency_keys = []
+     _FakePeer.auth_seen = []
++    _FakePeer.origin_headers = []
+     server = HTTPServer(("127.0.0.1", 0), _FakePeer)
+     thread = threading.Thread(target=server.serve_forever, daemon=True)
+     thread.start()
+@@ -210,6 +219,7 @@ def test_dm_creates_bot_chat_then_chats(monkeypatch, capsys, fake_peer_server):
+     assert _FakePeer.chats == ["Message from 🤖 dixie (@dixie): disk status?"]
+     # Every request carried the peer key.
+     assert all(a == "Bearer secret-key-123456" for a in _FakePeer.auth_seen)
++    assert _FakePeer.origin_headers[-1] == PEER_DM_CLAIM
+ 
+ 
+ def test_dm_reuses_existing_bot_chat(monkeypatch, capsys, fake_peer_server):
+@@ -392,6 +402,7 @@ def test_run_starts_async_turn_with_canonical_session_and_idempotency(
+     }
+     assert _FakePeer.runs == [{"input": "long task", "session_id": "bc_existing"}]
+     assert _FakePeer.run_idempotency_keys == ["ticket-123"]
++    assert _FakePeer.origin_headers[-1] == PEER_RUN_CLAIM
+ 
+ 
+ def test_status_reads_async_run_output(monkeypatch, capsys, fake_peer_server):
+diff --git a/tests/test_gateway_wakeup_origin.py b/tests/test_gateway_wakeup_origin.py
+new file mode 100644
+index 0000000..55eaaa6
+--- /dev/null
++++ b/tests/test_gateway_wakeup_origin.py
+@@ -0,0 +1,231 @@
++"""H8 wake provenance at the two real gateway ingress paths."""
++
++from __future__ import annotations
++
++import types
++from unittest.mock import AsyncMock
++
++import pytest
++
++from agent.message_origin import (
++    GATEWAY_WAKEUP,
++    build_message_origin_proof,
++)
++from gateway.config import PlatformConfig
++from gateway.platforms.api_server import APIServerAdapter
++from gateway.platforms.base import MessageEvent, MessageType
++from gateway.wake import (
++    INTERNAL_WAKE_HEADER,
++    deliver_wake,
++    event_wakeup_origin_proof,
++)
++
++
++API_KEY = "test-api-key-long-enough-for-auth"
++
++
++class _Transport:
++    def __init__(self, peer_ip: str = "127.0.0.1"):
++        self.peer_ip = peer_ip
++
++    def get_extra_info(self, name):
++        assert name == "peername"
++        return (self.peer_ip, 43120)
++
++
++class _Request:
++    def __init__(self, payload, headers, *, peer_ip: str = "127.0.0.1"):
++        self._payload = payload
++        self.headers = headers
++        self.transport = _Transport(peer_ip)
++        self.remote = peer_ip
++        self.method = "POST"
++        self.path = "/v1/chat/completions"
++        self.path_qs = "/v1/chat/completions"
++
++    async def json(self):
++        return self._payload
++
++
++def _adapter():
++    return APIServerAdapter(
++        PlatformConfig(enabled=True, extra={"host": "127.0.0.1", "key": API_KEY})
++    )
++
++
++@pytest.mark.asyncio
++async def test_push_wake_uses_closed_internal_event_not_visible_text():
++    class PushAdapter:
++        supports_async_delivery = True
++
++        async def handle_message(self, event):
++            self.event = event
++
++    adapter = PushAdapter()
++    source = types.SimpleNamespace(platform="qq", chat_id="chat-1")
++    await deliver_wake(adapter, text="scheduled job, not the user", source=source)
++
++    assert adapter.event.internal is True
++    assert adapter.event.metadata == {"internal_kind": "wakeup"}
++    assert event_wakeup_origin_proof(adapter.event) == build_message_origin_proof(
++        GATEWAY_WAKEUP
++    )
++
++    external = MessageEvent(
++        text="scheduled job, not the user",
++        message_type=MessageType.TEXT,
++        source=source,
++        internal=False,
++        metadata={"internal_kind": "wakeup"},
++    )
++    internal_with_extra = MessageEvent(
++        text="wake",
++        message_type=MessageType.TEXT,
++        source=source,
++        internal=True,
++        metadata={"internal_kind": "wakeup", "forged": True},
++    )
++    assert event_wakeup_origin_proof(external) is None
++    assert event_wakeup_origin_proof(internal_with_extra) is None
++
++
++@pytest.mark.asyncio
++async def test_chat_handler_accepts_only_process_token_from_loopback():
++    adapter = _adapter()
++    adapter._run_agent = AsyncMock(
++        return_value=({"final_response": "done", "session_id": "wake-session"}, {})
++    )
++    payload = {
++        "model": "hermes-agent",
++        "messages": [{"role": "user", "content": "wake"}],
++        "stream": False,
++    }
++    headers = {
++        "Authorization": f"Bearer {API_KEY}",
++        "X-Hermes-Session-Id": "wake-session",
++        INTERNAL_WAKE_HEADER: adapter._internal_wakeup_token,
++    }
++    try:
++        response = await adapter._handle_chat_completions(_Request(payload, headers))
++        assert response.status == 200
++        assert adapter._run_agent.await_args.kwargs[
++            "message_origin_proof"
++        ] == build_message_origin_proof(GATEWAY_WAKEUP)
++
++        forged = await adapter._handle_chat_completions(
++            _Request(payload, {**headers, INTERNAL_WAKE_HEADER: "wakeup"})
++        )
++        remote = await adapter._handle_chat_completions(
++            _Request(payload, headers, peer_ip="203.0.113.9")
++        )
++        assert forged.status == 403
++        assert remote.status == 403
++        assert adapter._run_agent.await_count == 1
++    finally:
++        adapter._response_store.close()
++
++
++@pytest.mark.asyncio
++async def test_api_wake_self_post_carries_process_token(monkeypatch):
++    import aiohttp
++
++    adapter = _adapter()
++    captured = {}
++
++    class Response:
++        status = 200
++
++        async def read(self):
++            return b""
++
++    class ResponseContext:
++        async def __aenter__(self):
++            return Response()
++
++        async def __aexit__(self, *_args):
++            return False
++
++    class Session:
++        def __init__(self, *, timeout):
++            captured["timeout"] = timeout
++
++        async def __aenter__(self):
++            return self
++
++        async def __aexit__(self, *_args):
++            return False
++
++        def post(self, url, *, json, headers):
++            captured.update(url=url, json=json, headers=headers)
++            return ResponseContext()
++
++    monkeypatch.setattr(aiohttp, "ClientSession", Session)
++    try:
++        await deliver_wake(adapter, text="wake through API", session_id="wake-1")
++    finally:
++        adapter._response_store.close()
++
++    assert captured["headers"][INTERNAL_WAKE_HEADER] == (
++        adapter._internal_wakeup_token
++    )
++    assert captured["headers"]["X-Hermes-Session-Id"] == "wake-1"
++    assert captured["json"]["messages"] == [
++        {"role": "user", "content": "wake through API"}
++    ]
++
++
++@pytest.mark.asyncio
++async def test_api_wake_crosses_real_loopback_handler_with_scheduled_proof(tmp_path):
++    from aiohttp import web
++    from hermes_state import SessionDB
++
++    adapter = _adapter()
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("wake-real", source="api_server")
++    adapter._session_db = db
++    adapter._run_agent = AsyncMock(
++        return_value=({"final_response": "done", "session_id": "wake-real"}, {})
++    )
++    app = web.Application()
++    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
++    runner = web.AppRunner(app)
++    await runner.setup()
++    site = web.TCPSite(runner, "127.0.0.1", 0)
++    await site.start()
++    adapter._port = site._server.sockets[0].getsockname()[1]
++    try:
++        await deliver_wake(adapter, text="real wake", session_id="wake-real")
++        assert adapter._run_agent.await_args.kwargs[
++            "message_origin_proof"
++        ] == build_message_origin_proof(GATEWAY_WAKEUP)
++    finally:
++        await runner.cleanup()
++        adapter._response_store.close()
++        db.close()
++
++
++@pytest.mark.asyncio
++async def test_ordinary_api_body_cannot_mint_scheduled_origin():
++    adapter = _adapter()
++    adapter._run_agent = AsyncMock(
++        return_value=({"final_response": "done", "session_id": "ordinary"}, {})
++    )
++    payload = {
++        "model": "hermes-agent",
++        "messages": [{"role": "user", "content": "human"}],
++        "stream": False,
++        "display_kind": "internal_notification",
++        "display_metadata": {"internal_kind": "wakeup"},
++        "message_origin_proof": build_message_origin_proof(GATEWAY_WAKEUP),
++    }
++    headers = {
++        "Authorization": f"Bearer {API_KEY}",
++        "X-Hermes-Session-Id": "ordinary",
++    }
++    try:
++        response = await adapter._handle_chat_completions(_Request(payload, headers))
++        assert response.status == 200
++        assert "message_origin_proof" not in adapter._run_agent.await_args.kwargs
++        assert "persist_user_display_kind" not in adapter._run_agent.await_args.kwargs
++    finally:
++        adapter._response_store.close()
+diff --git a/tests/test_hermes_state_time_window.py b/tests/test_hermes_state_time_window.py
+index 0214409..4aea7a9 100644
+--- a/tests/test_hermes_state_time_window.py
++++ b/tests/test_hermes_state_time_window.py
+@@ -17,18 +17,16 @@ from agent.context_compressor import (
+     _MERGED_SUMMARY_DELIMITER,
+     _SUMMARY_END_MARKER,
+ )
++from agent.message_origin import (
++    CLI_USER,
++    CRON_BOT_CHAT,
++    build_message_origin_proof,
++    classify_message_origin_group,
++)
+ 
+ 
+-ORIGIN_A = {
+-    "schema": "hermes.message_origin.v1",
+-    "issuer": "test-writer-a",
+-    "opaque": "proof-a",
+-}
+-ORIGIN_B = {
+-    "schema": "hermes.message_origin.v1",
+-    "issuer": "test-writer-b",
+-    "opaque": "proof-b",
+-}
++ORIGIN_A = build_message_origin_proof(CLI_USER)
++ORIGIN_B = build_message_origin_proof(CRON_BOT_CHAT)
+ 
+ 
+ @pytest.fixture()
+@@ -66,6 +64,7 @@ def _real_compression(messages, *, force_user_leading: bool = False):
+         )
+     response = MagicMock()
+     response.choices[0].message.content = "## Active Task\nsynthetic summary"
++    response.choices[0].finish_reason = "stop"
+     with patch("agent.context_compressor.call_llm", return_value=response):
+         return compressor.compress(messages, current_tokens=100_000, force=True)
+ 
+@@ -294,7 +293,7 @@ def test_real_composite_compaction_projects_only_live_tail_after_restart(
+         )
+ 
+     compressed = _real_compression(
+-        db.get_messages("parent"),
++        db.get_messages_as_conversation("parent"),
+         force_user_leading=force_user_leading,
+     )
+     composite = [
+@@ -315,6 +314,14 @@ def test_real_composite_compaction_projects_only_live_tail_after_restart(
+     carrier = composite[0]
+     live = ContextCompressor._strip_context_summary_handoff_message(carrier)
+     assert live is not None
++    assert carrier.get("_origin_proof") == ORIGIN_A
++    for message in compressed:
++        if (
++            message.get(COMPRESSED_SUMMARY_METADATA_KEY)
++            and ContextCompressor._strip_context_summary_handoff_message(message)
++            is None
++        ):
++            assert message.get("_origin_proof") is None
+     if force_user_leading:
+         assert _SUMMARY_END_MARKER in carrier["content"]
+         assert _MERGED_SUMMARY_DELIMITER not in carrier["content"]
+@@ -451,6 +458,47 @@ def test_raw_window_exposes_origin_collision_while_canonical_uses_live_row(db):
+     ]
+ 
+ 
++def test_superseded_tail_origin_conflict_remains_a_physical_obligation(db):
++    human = build_message_origin_proof(CLI_USER)
++    scheduled = build_message_origin_proof(CRON_BOT_CHAT)
++    db.append_message("window", "user", "tail user", timestamp=54, origin_proof=human)
++    db.append_message(
++        "window", "assistant", "tail answer", timestamp=55, origin_proof=human
++    )
++    db.archive_and_compact("window", db.get_messages("window"), tail_count=2)
++    db._execute_write(
++        lambda conn: conn.execute(
++            "UPDATE messages SET origin_proof = ? "
++            "WHERE session_id = ? AND active = 0 AND compacted = 0",
++            (db._encode_origin_proof(scheduled), "window"),
++        )
++    )
++
++    canonical = _read(
++        db,
++        start_timestamp=54,
++        end_timestamp=55,
++        include_compacted=True,
++        max_physical_rows=2,
++    )["messages"]
++    raw = _read(
++        db,
++        start_timestamp=54,
++        end_timestamp=55,
++        include_inactive=True,
++        max_physical_rows=4,
++    )["messages"]
++
++    superseded = [
++        row for row in raw if not row["active"] and not row["compacted"]
++    ]
++    assert len(canonical) == 2
++    assert len(superseded) == 2
++    assert classify_message_origin_group(
++        canonical, physical_obligations=superseded
++    ) == (None, "conflict")
++
++
+ def test_api_content_is_body_free_but_distinct_in_bounded_views(db):
+     db.append_message(
+         "window",
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 78a3b82..99572b5 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
+ 
+ import pytest
+ 
++from agent.message_origin import CLI_USER, build_message_origin_proof
+ from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+ from hermes_cli.active_sessions import active_session_registry_snapshot
+ from hermes_cli.browser_connect import ChromeDebugLaunch
+@@ -20165,11 +20166,12 @@ BRANCH_CODEX_MESSAGE_ITEMS = [
+         "content": [{"type": "output_text", "text": "done"}],
+     }
+ ]
++BRANCH_ORIGIN = build_message_origin_proof(CLI_USER)
+ 
+ 
+ def _branch_history():
+     return [
+-        {"role": "user", "content": "hello"},
++        {"role": "user", "content": "hello", "_origin_proof": BRANCH_ORIGIN},
+         {
+             "role": "assistant",
+             "content": "done",
+@@ -20178,6 +20180,7 @@ def _branch_history():
+             "reasoning_details": BRANCH_REASONING_DETAILS,
+             "codex_reasoning_items": BRANCH_CODEX_REASONING_ITEMS,
+             "codex_message_items": BRANCH_CODEX_MESSAGE_ITEMS,
++            "_origin_proof": BRANCH_ORIGIN,
+         },
+         # Timeline marker: rides as role=user but must keep its tag through
+         # the branch copy, or it re-enters the truncate ordinal address space
+@@ -20237,6 +20240,7 @@ def test_persist_branch_seed_keeps_reasoning_fields(monkeypatch, tmp_path):
+         assert assistant["reasoning_details"] == BRANCH_REASONING_DETAILS
+         assert assistant["codex_reasoning_items"] == BRANCH_CODEX_REASONING_ITEMS
+         assert assistant["codex_message_items"] == BRANCH_CODEX_MESSAGE_ITEMS
++        assert assistant["_origin_proof"] == BRANCH_ORIGIN
+         marker = _branched_marker(db, "branch-key")
+         assert marker is not None, (
+             "the branch seed dropped display_kind: the marker re-entered the "
+@@ -20284,6 +20288,7 @@ def test_session_branch_keeps_reasoning_fields(monkeypatch, tmp_path):
+         assert assistant["reasoning_details"] == BRANCH_REASONING_DETAILS
+         assert assistant["codex_reasoning_items"] == BRANCH_CODEX_REASONING_ITEMS
+         assert assistant["codex_message_items"] == BRANCH_CODEX_MESSAGE_ITEMS
++        assert assistant["_origin_proof"] == BRANCH_ORIGIN
+         marker = _branched_marker(db, "branch-key")
+         assert marker is not None, (
+             "session.branch dropped display_kind: the marker re-entered the "
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 485456a..8a3d113 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -3256,6 +3256,9 @@ def _(rid, params: dict) -> dict:
+                         # space the same way #82756 did.
+                         "display_kind": msg.get("display_kind"),
+                         "display_metadata": msg.get("display_metadata"),
++                        "origin_proof": msg.get(
++                            "_origin_proof", msg.get("origin_proof")
++                        ),
+                         # Preserve the parent's original message timestamps —
+                         # branch copies are history, not new activity (9d73006ad).
+                         "timestamp": msg.get("timestamp"),
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 4e846e3..10567e0 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -4118,6 +4118,9 @@ def _persist_branch_seed(session: dict) -> None:
+                         # space the same way #82756 did.
+                         "display_kind": msg.get("display_kind"),
+                         "display_metadata": msg.get("display_metadata"),
++                        "origin_proof": msg.get(
++                            "_origin_proof", msg.get("origin_proof")
++                        ),
+                         # Preserve the parent's original message timestamps —
+                         # append_message would otherwise stamp time.time() and the
+                         # branch's copied history would all appear authored "now".
+-- 
+2.50.1 (Apple Git-155)
+

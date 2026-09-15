@@ -1,0 +1,230 @@
+From 1ead5fe47818ca3e538da7dde71fa33ca2820d5d Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 23:13:37 +0800
+Subject: [PATCH] fix(budget): account Anthropic native input schemas
+
+---
+ agent/model_metadata.py            | 72 ++++++++++++++++++++++++++++--
+ tests/agent/test_model_metadata.py | 46 +++++++++++++++++++
+ tests/test_request_overlay.py      | 40 +++++++++++++++++
+ 3 files changed, 155 insertions(+), 3 deletions(-)
+
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 78f547c..2522a7c 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -4218,7 +4218,17 @@ def estimate_provider_body_tokens_rough(body: Any) -> dict[str, Any]:
+             total += estimate_tokens_rough(str(value))
+     tools = body.get("tools")
+     if isinstance(tools, list):
+-        total += _estimate_tools_tokens_rough(tools)
++        tool_tokens = _provider_tools_tokens_rough(tools)
++        if tool_tokens is None:
++            return {
++                "estimated_tokens": None,
++                "estimate_source": "unknown",
++                "estimate_confidence": "unknown",
++                "output_reserve_tokens": output_reserve_tokens,
++                "output_reserve_source": output_reserve_source,
++                "output_reserve_confidence": output_reserve_confidence,
++            }
++        total += tool_tokens
+     elif tools:
+         total += estimate_tokens_rough(str(tools))
+     if bedrock_native:
+@@ -4237,7 +4247,17 @@ def estimate_provider_body_tokens_rough(body: Any) -> dict[str, Any]:
+                     "output_reserve_source": output_reserve_source,
+                     "output_reserve_confidence": output_reserve_confidence,
+                 }
+-            total += _estimate_tools_tokens_rough(tool_config["tools"])
++            tool_tokens = _provider_tools_tokens_rough(tool_config["tools"])
++            if tool_tokens is None:
++                return {
++                    "estimated_tokens": None,
++                    "estimate_source": "unknown",
++                    "estimate_confidence": "unknown",
++                    "output_reserve_tokens": output_reserve_tokens,
++                    "output_reserve_source": output_reserve_source,
++                    "output_reserve_confidence": output_reserve_confidence,
++                }
++            total += tool_tokens
+         stop_sequences = (body.get("inferenceConfig") or {}).get("stopSequences")
+         if stop_sequences:
+             total += estimate_tokens_rough(str(stop_sequences))
+@@ -4278,6 +4298,37 @@ def _tool_name_for_cache(tool: Any) -> str:
+     return name if isinstance(name, str) else ""
+ 
+ 
++def _provider_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int | None:
++    """Estimate known provider tool shapes or reject unknown schema buckets."""
++
++    for tool in tools:
++        if not isinstance(tool, dict):
++            return None
++        fn = tool.get("function")
++        if not isinstance(fn, dict):
++            fn = tool.get("toolSpec")
++        if isinstance(fn, dict):
++            allowed_schema_keys = {"parameters", "inputSchema"}
++            schema_keys = {
++                key for key in fn if "schema" in str(key).lower()
++            }
++        else:
++            allowed_schema_keys = {"parameters", "input_schema"}
++            schema_keys = {
++                key for key in tool if "schema" in str(key).lower()
++            }
++            if "input_schema" in tool and not isinstance(
++                tool.get("input_schema"), dict
++            ):
++                return None
++            cache_control = tool.get("cache_control")
++            if cache_control is not None and not isinstance(cache_control, dict):
++                return None
++        if schema_keys - allowed_schema_keys:
++            return None
++    return _estimate_tools_tokens_rough(tools)
++
++
+ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
+     if not tools:
+         return 0
+@@ -4319,7 +4370,10 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
+         else:
+             name = tool.get("name") or ""
+             desc = tool.get("description") or ""
+-            params = tool.get("parameters") or {}
++            params = tool.get("parameters")
++            if params is None:
++                params = tool.get("input_schema")
++            params = params or {}
+ 
+         if isinstance(name, str):
+             total_chars += len(name)
+@@ -4330,6 +4384,18 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
+             total_chars += len(json.dumps(params, ensure_ascii=False, separators=(",", ":")))
+         except Exception:
+             total_chars += len(str(params))
++        cache_control = tool.get("cache_control")
++        if cache_control is not None:
++            try:
++                total_chars += len(
++                    json.dumps(
++                        cache_control,
++                        ensure_ascii=False,
++                        separators=(",", ":"),
++                    )
++                )
++            except Exception:
++                total_chars += len(str(cache_control))
+ 
+     tokens = (total_chars + 3) // 4
+     # Bound the cache: drop the oldest entry when the cap is exceeded so a
+diff --git a/tests/agent/test_model_metadata.py b/tests/agent/test_model_metadata.py
+index 7fd93fd..4e17f6d 100644
+--- a/tests/agent/test_model_metadata.py
++++ b/tests/agent/test_model_metadata.py
+@@ -117,6 +117,52 @@ class TestEstimateTokensRough:
+         assert estimate["estimate_source"] == "unknown"
+         assert estimate["estimate_confidence"] == "unknown"
+ 
++    def test_provider_body_estimator_covers_anthropic_input_schema(self):
++        estimate = estimate_provider_body_tokens_rough(
++            {
++                "model": "claude-test",
++                "messages": [{"role": "user", "content": "hello"}],
++                "tools": [
++                    {
++                        "name": "large_tool",
++                        "description": "large native schema",
++                        "input_schema": {
++                            "type": "object",
++                            "properties": {
++                                "payload": {
++                                    "type": "string",
++                                    "description": "x" * 50_000,
++                                }
++                            },
++                        },
++                        "cache_control": {"type": "ephemeral"},
++                    }
++                ],
++            }
++        )
++
++        assert estimate["estimated_tokens"] > 10_000
++        assert estimate["estimate_source"] == "hermes.provider_body.rough.v1"
++        assert estimate["estimate_confidence"] == "heuristic_with_margin"
++
++    def test_provider_body_estimator_rejects_unknown_native_schema_shape(self):
++        estimate = estimate_provider_body_tokens_rough(
++            {
++                "model": "native-test",
++                "messages": [{"role": "user", "content": "hello"}],
++                "tools": [
++                    {
++                        "name": "unknown_tool",
++                        "argument_schema": {"type": "object"},
++                    }
++                ],
++            }
++        )
++
++        assert estimate["estimated_tokens"] is None
++        assert estimate["estimate_source"] == "unknown"
++        assert estimate["estimate_confidence"] == "unknown"
++
+ 
+     def test_known_length(self):
+         assert estimate_tokens_rough("a" * 400) == 100
+diff --git a/tests/test_request_overlay.py b/tests/test_request_overlay.py
+index c677d6e..6b98c8c 100644
+--- a/tests/test_request_overlay.py
++++ b/tests/test_request_overlay.py
+@@ -406,6 +406,46 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+                     "hermes.provider_body.rough.v1",
+                 )
+ 
++    def test_anthropic_large_input_schema_removes_overlay_at_final_budget(self) -> None:
++        from agent import relay_llm
++
++        record = middleware.TransportRecord()
++        self.assertTrue(self.register_with_host_record(record, window=2_000))
++        provider_body = {
++            **self.overlay.request,
++            "model": "claude-test",
++            "tools": [
++                {
++                    "name": "large_tool",
++                    "description": "large native schema",
++                    "input_schema": {
++                        "type": "object",
++                        "properties": {
++                            "payload": {
++                                "type": "string",
++                                "description": "x" * 50_000,
++                            }
++                        },
++                    },
++                    "cache_control": {"type": "ephemeral"},
++                }
++            ],
++        }
++        record.mark_middleware_verified(provider_body)
++
++        with middleware.transport_record_scope(record):
++            with relay_llm.provider_body_scope(provider_body) as filtered:
++                pass
++        record.settle()
++
++        self.assertEqual(filtered["messages"][0]["content"], "current")
++        self.assertGreater(record.provider_body_estimated_tokens or 0, 10_000)
++        self.assertEqual(
++            self.overlay.disposition,
++            OVERLAY_REMOVED_FINAL_BUDGET,
++        )
++        self.assertTrue(record.settled)
++
+     def test_real_transport_preserves_late_transform_in_both_registration_orders(self) -> None:
+         from agent import relay_llm
+ 

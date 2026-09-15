@@ -1,0 +1,274 @@
+From a983219186ed1ee40847166f8571b847eaeddb4b Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Wed, 2 Sep 2026 09:26:59 +0800
+Subject: [PATCH 7/8] fix(transport): fail closed for native Gemini bodies
+
+---
+ agent/conversation_loop.py                |  16 +++-
+ agent/gemini_native_adapter.py            |   4 +
+ agent/relay_llm.py                        |  12 +++
+ hermes_cli/middleware.py                  |  15 ++-
+ tests/agent/test_gemini_native_adapter.py | 111 ++++++++++++++++++++++
+ tests/test_request_overlay.py             |   7 ++
+ 6 files changed, 163 insertions(+), 2 deletions(-)
+
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 37d4c47..69b2aea 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -3330,7 +3330,21 @@ def run_conversation(
+                     transport_record_scope,
+                 )
+ 
+-                _transport_record = TransportRecord()
++                _client_completions = getattr(
++                    getattr(getattr(agent, "client", None), "chat", None),
++                    "completions",
++                    None,
++                )
++                _transport_record = TransportRecord(
++                    provider_body_supported=(
++                        getattr(
++                            _client_completions,
++                            "_hermes_provider_body_truth_supported",
++                            True,
++                        )
++                        is not False
++                    )
++                )
+ 
+                 def _perform_api_call(next_api_kwargs):
+                     _transport_record.mark_middleware_verified(next_api_kwargs)
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index ffbc2d5..242a8d3 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -1074,6 +1074,8 @@ def gemini_http_error(
+ 
+ 
+ class _GeminiChatCompletions:
++    _hermes_provider_body_truth_supported = False
++
+     def __init__(self, client: "GeminiNativeClient"):
+         self._client = client
+ 
+@@ -1082,6 +1084,8 @@ class _GeminiChatCompletions:
+ 
+ 
+ class _AsyncGeminiChatCompletions:
++    _hermes_provider_body_truth_supported = False
++
+     def __init__(self, client: "AsyncGeminiNativeClient"):
+         self._client = client
+ 
+diff --git a/agent/relay_llm.py b/agent/relay_llm.py
+index 8ba8f59..e9c80fe 100644
+--- a/agent/relay_llm.py
++++ b/agent/relay_llm.py
+@@ -71,6 +71,18 @@ def call_provider_body(
+ ) -> Any:
+     """Invoke an SDK surface while recording only its JSON request body."""
+ 
++    callback_owner = getattr(callback, "__self__", None)
++    if getattr(callback_owner, "_hermes_provider_body_truth_supported", True) is False:
++        from hermes_cli.middleware import (
++            current_transport_record,
++            transport_record_scope,
++        )
++
++        record = current_transport_record()
++        if record is not None:
++            record.mark_provider_body_unsupported()
++        with transport_record_scope(None):
++            return callback(**body)
+     with provider_body_scope(body) as final_body:
+         return callback(**final_body)
+ 
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index 8f022aa..dfa5fdf 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -142,8 +142,9 @@ class TransportRecord:
+ 
+     schema_version = TRANSPORT_SCHEMA_VERSION
+ 
+-    def __init__(self) -> None:
++    def __init__(self, *, provider_body_supported: bool = True) -> None:
+         self._lock = Lock()
++        self._provider_body_supported = bool(provider_body_supported)
+         self._middleware_verified_request: Dict[str, Any] | None = None
+         self._provider_body: Dict[str, Any] | None = None
+         self._capture_count = 0
+@@ -169,6 +170,10 @@ class TransportRecord:
+         with self._lock:
+             return _safe_copy(self._provider_body)
+ 
++    @property
++    def provider_body_supported(self) -> bool:
++        return self._provider_body_supported
++
+     @property
+     def capture_count(self) -> int:
+         with self._lock:
+@@ -246,6 +251,8 @@ class TransportRecord:
+                 "provider-body filter phase must be 'transform' or 'final_guard'"
+             )
+         with self._lock:
++            if not self._provider_body_supported:
++                raise RuntimeError("provider route has no final-body truth seam")
+             if self._capture_count or self._provider_attempt_count:
+                 raise RuntimeError("provider-body filter registration is closed")
+             if any(
+@@ -411,6 +418,12 @@ class TransportRecord:
+                 raise RuntimeError("no rejected provider attempt awaits a successor")
+             self._failed_provider_attempt_pending_retry = False
+ 
++    def mark_provider_body_unsupported(self) -> None:
++        with self._lock:
++            self._provider_attempt_count += 1
++            self._ambiguous = True
++            self._settled = False
++
+     def _store_active_provider_attempt(
+         self,
+         body: Dict[str, Any],
+diff --git a/tests/agent/test_gemini_native_adapter.py b/tests/agent/test_gemini_native_adapter.py
+index 8164522..98c147c 100644
+--- a/tests/agent/test_gemini_native_adapter.py
++++ b/tests/agent/test_gemini_native_adapter.py
+@@ -349,6 +349,117 @@ def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatc
+     assert response.choices[0].message.content == "hello"
+ 
+ 
++def test_native_gemini_nonstream_is_explicitly_unsupported_transport_truth():
++    from agent import relay_llm
++    from agent.gemini_native_adapter import GeminiNativeClient
++    from hermes_cli.middleware import TransportRecord, transport_record_scope
++
++    recorded = {}
++
++    class DummyHTTP:
++        def post(self, url, json=None, headers=None, timeout=None):
++            recorded.update(url=url, json=json, headers=headers, timeout=timeout)
++            return DummyResponse(
++                payload={
++                    "candidates": [
++                        {
++                            "content": {"parts": [{"text": "hello"}]},
++                            "finishReason": "STOP",
++                        }
++                    ]
++                }
++            )
++
++        def close(self):
++            return None
++
++    client = GeminiNativeClient(api_key="AIza-test", http_client=DummyHTTP())
++    facade = {
++        "model": "gemini-2.5-flash",
++        "messages": [{"role": "user", "content": "Hello"}],
++        "unknown_facade_field": "must-not-be-receipted",
++    }
++    record = TransportRecord()
++    record.mark_middleware_verified(facade)
++
++    with transport_record_scope(record):
++        result = relay_llm.call_provider_body(
++            client.chat.completions.create,
++            facade,
++        )
++    record.settle()
++
++    assert result.choices[0].message.content == "hello"
++    assert recorded["json"]["contents"][0]["parts"] == [{"text": "Hello"}]
++    assert "unknown_facade_field" not in recorded["json"]
++    assert record.provider_attempt_count == 1
++    assert record.capture_count == 0
++    assert record.provider_body is None
++    assert record.ambiguous is True
++    assert record.settled is False
++
++
++def test_native_gemini_stream_is_explicitly_unsupported_transport_truth():
++    from agent import relay_llm
++    from agent.gemini_native_adapter import GeminiNativeClient
++    from hermes_cli.middleware import TransportRecord, transport_record_scope
++
++    recorded = {}
++
++    class StreamResponse(DummyResponse):
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *_args):
++            return False
++
++        def iter_text(self):
++            yield (
++                'data: {"candidates":[{"content":{"parts":[{"text":"hi"}]},'
++                '"finishReason":"STOP"}]}\n'
++            )
++
++    class DummyHTTP:
++        def stream(self, method, url, json=None, headers=None, timeout=None):
++            recorded.update(
++                method=method,
++                url=url,
++                json=json,
++                headers=headers,
++                timeout=timeout,
++            )
++            return StreamResponse()
++
++        def close(self):
++            return None
++
++    client = GeminiNativeClient(api_key="AIza-test", http_client=DummyHTTP())
++    facade = {
++        "model": "gemini-2.5-flash",
++        "messages": [{"role": "user", "content": "Hello"}],
++        "stream": True,
++    }
++    record = TransportRecord()
++    record.mark_middleware_verified(facade)
++
++    with transport_record_scope(record):
++        stream = relay_llm.call_provider_body(
++            client.chat.completions.create,
++            facade,
++        )
++        chunks = list(stream)
++    record.settle()
++
++    assert recorded["method"] == "POST"
++    assert recorded["json"]["contents"][0]["parts"] == [{"text": "Hello"}]
++    assert chunks[-1].choices[0].finish_reason == "stop"
++    assert record.provider_attempt_count == 1
++    assert record.capture_count == 0
++    assert record.provider_body is None
++    assert record.ambiguous is True
++    assert record.settled is False
++
++
+ 
+ 
+ 
+diff --git a/tests/test_request_overlay.py b/tests/test_request_overlay.py
+index 4a33ca7..2c7f1c1 100644
+--- a/tests/test_request_overlay.py
++++ b/tests/test_request_overlay.py
+@@ -356,6 +356,13 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+         self.assertEqual(record.callbacks, [])
+         self.assertEqual(self.overlay.disposition, OVERLAY_PENDING)
+ 
++    def test_unsupported_provider_route_rejects_guard_registration(self) -> None:
++        record = middleware.TransportRecord(provider_body_supported=False)
++
++        self.assertFalse(self.register_with_host_record(record, window=100_000))
++        self.assertEqual(record.provider_body_filter_owners, ())
++        self.assertEqual(self.overlay.disposition, OVERLAY_PENDING)
++
+     def test_final_budget_guard_keeps_fitting_overlay(self) -> None:
+         record = _FilterRecord()
+         self.assertTrue(self.register(record, window=100_000))

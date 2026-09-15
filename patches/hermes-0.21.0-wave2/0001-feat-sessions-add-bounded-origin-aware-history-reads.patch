@@ -1,0 +1,1253 @@
+From ea71085f7c1cfe07b836491c62d14309be94f405 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 18:28:09 +0800
+Subject: [PATCH 1/2] feat(sessions): add bounded origin-aware history reads
+
+---
+ hermes_state.py                        | 433 +++++++++++++---
+ hermes_state_common.py                 |   3 +-
+ tests/test_hermes_state_time_window.py | 681 +++++++++++++++++++++++++
+ 3 files changed, 1058 insertions(+), 59 deletions(-)
+ create mode 100644 tests/test_hermes_state_time_window.py
+
+diff --git a/hermes_state.py b/hermes_state.py
+index 8040c0f..a15b878 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -21,6 +21,7 @@ import errno
+ import hashlib
+ import json
+ import logging
++import math
+ import os
+ import queue
+ import random
+@@ -7592,9 +7593,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     time.time(),
+                 ),
+             )
++            published_messages: List[Dict[str, Any]] = []
++            from agent.context_compressor import (
++                ContextCompressor,
++                is_compaction_summary_message,
++            )
++
++            for message in messages:
++                published = message.copy()
++                if (
++                    published.get("role") == "assistant"
++                    and is_compaction_summary_message(published)
++                    and ContextCompressor._strip_context_summary_handoff_message(
++                        published
++                    )
++                    is not None
++                ):
++                    # The closed parent remains the canonical owner of this
++                    # assistant turn.  Keep the child carrier synthetic for
++                    # bounded lineage readers; otherwise its live view can be
++                    # paired with an unrelated protected-head user message.
++                    metadata = published.get("display_metadata")
++                    metadata = metadata.copy() if isinstance(metadata, dict) else {}
++                    metadata["_continuity_rotation_shadow"] = True
++                    published["display_metadata"] = metadata
++                published_messages.append(published)
++
+             total_messages, total_tool_calls = self._insert_message_rows(
+-                conn, child_session_id, messages
++                conn, child_session_id, published_messages
+             )
++            for original, published in zip(messages, published_messages):
++                if isinstance(original, dict) and published.get("_row_id") is not None:
++                    original["_row_id"] = published["_row_id"]
+             if watermark is not None:
+                 # Clone the parent's concurrent tail (rows landed after the
+                 # watermark, at or below the ceiling — see docstring) into the
+@@ -11367,6 +11397,64 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         )
+         return None
+ 
++    @staticmethod
++    def _encode_origin_proof(origin_proof: Any) -> Optional[str]:
++        """Serialize one host-owned per-message origin proof.
++
++        Wave 2 only owns the durable storage substrate.  Writer-specific
++        classification (human, scheduled, internal, delegated) lands later,
++        so the store deliberately treats the proof as an opaque JSON object.
++        Strings are accepted only for lossless store/read/store round trips
++        and must themselves decode to an object.
++        """
++        if origin_proof is None:
++            return None
++        parsed = origin_proof
++        if isinstance(origin_proof, str):
++            try:
++                parsed = json.loads(origin_proof)
++            except (json.JSONDecodeError, TypeError) as exc:
++                raise ValueError("origin_proof must be a JSON object") from exc
++        if not isinstance(parsed, dict):
++            raise ValueError("origin_proof must be a JSON object")
++        try:
++            return json.dumps(
++                parsed,
++                ensure_ascii=True,
++                allow_nan=False,
++                sort_keys=True,
++                separators=(",", ":"),
++            )
++        except (TypeError, ValueError) as exc:
++            raise ValueError("origin_proof must be JSON serializable") from exc
++
++    @staticmethod
++    def _decode_origin_proof(origin_proof: Any) -> Any:
++        """Decode a stored origin proof without hiding corrupt storage.
++
++        Invalid TEXT remains visible as TEXT.  A future classifier can then
++        fail closed for that message/group instead of mistaking corruption for
++        an absent proof.
++        """
++        if not isinstance(origin_proof, str):
++            return origin_proof
++
++        def reject_nonfinite(value: str) -> None:
++            raise ValueError(f"invalid JSON constant: {value}")
++
++        try:
++            parsed = json.loads(
++                origin_proof,
++                parse_constant=reject_nonfinite,
++            )
++        except (json.JSONDecodeError, TypeError, ValueError):
++            logger.warning("Invalid origin_proof JSON on message row")
++            return origin_proof
++        if not isinstance(parsed, dict):
++            logger.warning("Non-object origin_proof JSON on message row")
++            return origin_proof
++        return parsed
++
+     def _check_transcript_write_guards(
+         self,
+         conn,
+@@ -11549,6 +11637,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         compression_lock_holder: Optional[str] = None,
+         turn_lease_holder: Optional[str] = None,
+         turn_lease_ttl_seconds: float = 300.0,
++        origin_proof: Optional[Dict[str, Any]] = None,
+     ) -> int:
+         """
+         Append a message to a session. Returns the message row ID.
+@@ -11569,6 +11658,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         (which sqlite3 cannot bind and which the conversation loop scrubs
+         from every outgoing payload anyway, so the scrubbed form IS the
+         wire bytes).
++
++        ``origin_proof`` is an opaque host-owned JSON object attached to this
++        durable message. SessionDB preserves it through transcript rewrites
++        and compaction clones but does not classify or mint it.
+         """
+         # Display metadata is presentation-only and never changes the model
+         # context role/content replayed to providers.
+@@ -11617,8 +11710,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 """INSERT INTO messages (session_id, role, content, tool_call_id,
+                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
+-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
+-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata, origin_proof)
++                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 (
+                     session_id,
+                     role,
+@@ -11642,6 +11735,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
+                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
+                     display_metadata_json,
++                    self._encode_origin_proof(origin_proof),
+                 ),
+             )
+             msg_id = cursor.lastrowid
+@@ -12062,8 +12156,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 """INSERT INTO messages (session_id, role, content, tool_call_id,
+                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
+-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
+-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata, origin_proof)
++                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 (
+                     session_id,
+                     role,
+@@ -12087,6 +12181,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
+                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
+                     self._encode_display_metadata(msg.get("display_metadata")),
++                    self._encode_origin_proof(
++                        msg.get("_origin_proof", msg.get("origin_proof"))
++                    ),
+                 ),
+             )
+             if isinstance(msg, dict) and cur.lastrowid is not None:
+@@ -12485,6 +12582,163 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+ 
+         return self._execute_write(_do)
+ 
++    def _message_dedupe_key(self, row: Any) -> Tuple[Any, ...]:
++        """Canonical identity used by every compacted display read."""
++        dedupe_content = row["content"]
++        if row["role"] == "user":
++            from agent.context_compressor import split_user_originated_turn
++
++            candidate = {
++                "role": "user",
++                "content": self._decode_content(row["content"]),
++                "display_kind": row["display_kind"],
++                "display_metadata": self._decode_display_metadata(
++                    row["display_metadata"]
++                ),
++            }
++            handoff, live_view = split_user_originated_turn(candidate)
++            if handoff is not None and live_view is not None:
++                dedupe_content = self._encode_content(live_view.get("content"))
++        # Sidecars, including origin_proof, deliberately do not enter this key.
++        # A clone with conflicting sidecars is one logical identity whose raw
++        # generations must be audited, not two independently trusted messages.
++        return (
++            row["role"],
++            dedupe_content,
++            row["timestamp"],
++            row["tool_call_id"],
++            row["tool_calls"],
++            row["tool_name"],
++        )
++
++    def _dedupe_compacted_message_rows(self, rows: List[Any]) -> List[Any]:
++        """Collapse physical compaction generations to canonical messages."""
++        seen: Dict[Tuple[Any, ...], Any] = {}
++        for row in rows:
++            key = self._message_dedupe_key(row)
++            current = seen.get(key)
++            if current is None or (row["active"], row["id"]) > (
++                current["active"],
++                current["id"],
++            ):
++                seen[key] = row
++        return sorted(seen.values(), key=lambda row: row["id"])
++
++    def _decode_message_rows(self, rows: List[Any]) -> List[Dict[str, Any]]:
++        """Decode stored message rows using the public read representation."""
++        result: List[Dict[str, Any]] = []
++        for row in rows:
++            msg = dict(row)
++            if msg.pop("_compressed_summary", 0):
++                msg["_compressed_summary"] = True
++            if "content" in msg:
++                msg["content"] = self._decode_content(msg["content"])
++            if msg.get("tool_calls"):
++                try:
++                    msg["tool_calls"] = json.loads(msg["tool_calls"])
++                except (json.JSONDecodeError, TypeError):
++                    logger.warning(
++                        "Failed to deserialize tool_calls in get_messages, "
++                        "falling back to []"
++                    )
++                    msg["tool_calls"] = []
++            if msg.get("display_metadata") is not None:
++                msg["display_metadata"] = self._decode_display_metadata(
++                    msg["display_metadata"]
++                )
++            origin_proof = msg.pop("origin_proof", None)
++            if origin_proof is not None:
++                msg["origin_proof"] = self._decode_origin_proof(origin_proof)
++            result.append(msg)
++        return result
++
++    @staticmethod
++    def _project_compaction_live_views(
++        messages: List[Dict[str, Any]],
++    ) -> List[Dict[str, Any]]:
++        """Expose real content embedded in synthetic compaction carriers.
++
++        Lean compaction can persist one physical row containing both a model-
++        only handoff and a carried-forward live message.  Bounded history
++        consumers need the logical live message, while collision auditors
++        still need to distinguish physical carriers whose hidden handoffs
++        differ.  Reuse the compressor's grammar owner, and retain only a
++        body-free digest of the physical wrapper in Continuity's projection
++        namespace.  An assistant carrier published into a rotation child
++        remains synthetic because the closed parent still owns that turn;
++        user-leading carriers remain live so the child can receive its answer.
++
++        Pure handoffs and malformed/unhashable carriers remain unchanged so
++        downstream consumers continue to identify or reject them fail closed.
++        """
++        from agent.context_compressor import (
++            COMPRESSED_SUMMARY_METADATA_KEY,
++            ContextCompressor,
++            is_compaction_summary_message,
++        )
++
++        projected_messages: List[Dict[str, Any]] = []
++        for message in messages:
++            if not is_compaction_summary_message(message):
++                projected_messages.append(message)
++                continue
++            metadata = message.get("display_metadata")
++            if (
++                message.get("role") == "assistant"
++                and isinstance(metadata, dict)
++                and metadata.get("_continuity_rotation_shadow") is True
++            ):
++                projected_messages.append(message)
++                continue
++            live_view = ContextCompressor._strip_context_summary_handoff_message(
++                message
++            )
++            if live_view is None:
++                projected_messages.append(message)
++                continue
++            carrier = {
++                "content": message.get("content"),
++                "compressed_summary": bool(
++                    message.get(COMPRESSED_SUMMARY_METADATA_KEY)
++                ),
++                "display_kind": message.get("display_kind"),
++                "display_metadata": message.get("display_metadata"),
++            }
++            try:
++                encoded = json.dumps(
++                    carrier,
++                    allow_nan=False,
++                    ensure_ascii=True,
++                    sort_keys=True,
++                    separators=(",", ":"),
++                ).encode("utf-8")
++            except (TypeError, ValueError):
++                projected_messages.append(message)
++                continue
++
++            live_view = live_view.copy()
++            if live_view.get("display_kind") in {
++                "compaction_summary",
++                "context_compaction_summary",
++            }:
++                live_view.pop("display_kind", None)
++            metadata = live_view.get("display_metadata")
++            if isinstance(metadata, dict) and metadata.get(
++                COMPRESSED_SUMMARY_METADATA_KEY
++            ):
++                metadata = metadata.copy()
++                metadata.pop(COMPRESSED_SUMMARY_METADATA_KEY, None)
++                if metadata:
++                    live_view["display_metadata"] = metadata
++                else:
++                    live_view.pop("display_metadata", None)
++            live_view["_continuity_compaction_live_view"] = {
++                "schema": "hermes.compaction_live_view.v1",
++                "carrier_sha256": hashlib.sha256(encoded).hexdigest(),
++            }
++            projected_messages.append(live_view)
++        return projected_messages
++
+     def get_messages(
+         self,
+         session_id: str,
+@@ -12564,41 +12818,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     [session_id],
+                 )
+                 all_rows = cursor.fetchall()
+-            seen: dict = {}
+-            for row in all_rows:
+-                dedupe_content = row["content"]
+-                if row["role"] == "user":
+-                    from agent.context_compressor import split_user_originated_turn
+-
+-                    candidate = {
+-                        "role": "user",
+-                        "content": self._decode_content(row["content"]),
+-                        "display_kind": row["display_kind"],
+-                        "display_metadata": self._decode_display_metadata(
+-                            row["display_metadata"]
+-                        ),
+-                    }
+-                    handoff, live_view = split_user_originated_turn(candidate)
+-                    if handoff is not None and live_view is not None:
+-                        dedupe_content = self._encode_content(
+-                            live_view.get("content")
+-                        )
+-                # Tool fields participate in the dedupe key: compaction copies
+-                # them verbatim, so identical tool messages across generations
+-                # still collapse, while distinct tool calls that happen to
+-                # share role/content/timestamp are never merged.
+-                key = (
+-                    row["role"],
+-                    dedupe_content,
+-                    row["timestamp"],
+-                    row["tool_call_id"],
+-                    row["tool_calls"],
+-                    row["tool_name"],
+-                )
+-                cur = seen.get(key)
+-                if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
+-                    seen[key] = row
+-            rows = sorted(seen.values(), key=lambda r: r["id"])
++            rows = self._dedupe_compacted_message_rows(all_rows)
+             if latest:
+                 rows = rows[::-1]
+             rows = rows[offset:]
+@@ -12616,23 +12836,112 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 rows = cursor.fetchall()
+             if latest:
+                 rows.reverse()
+-        result = []
+-        for row in rows:
+-            msg = dict(row)
+-            if msg.pop("_compressed_summary", 0):
+-                msg["_compressed_summary"] = True
+-            if "content" in msg:
+-                msg["content"] = self._decode_content(msg["content"])
+-            if msg.get("tool_calls"):
+-                try:
+-                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+-                except (json.JSONDecodeError, TypeError):
+-                    logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
+-                    msg["tool_calls"] = []
+-            if msg.get("display_metadata") is not None:
+-                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+-            result.append(msg)
+-        return result
++        return self._decode_message_rows(rows)
++
++    def get_messages_time_window(
++        self,
++        session_id: str,
++        *,
++        start_timestamp: float,
++        end_timestamp: float,
++        include_inactive: bool = False,
++        include_compacted: bool = False,
++        max_physical_rows: int,
++    ) -> Dict[str, Any]:
++        """Read one bounded inclusive message timestamp window.
++
++        SQLite applies the lifecycle and time predicates before the physical
++        row cap. The extra row is only an overflow sentinel; overflow returns
++        no message bodies because a later row could be the canonical winner
++        for an earlier compaction generation.
++
++        Complete canonical reads reuse :meth:`get_messages` generation
++        collapse and decoding. ``include_inactive`` takes precedence and
++        exposes every physical row for collision/lifecycle audit. Eligible
++        composite compaction carriers expose their logical live content in
++        both views, plus a private body-free digest of the physical wrapper;
++        pure handoffs and rotation-child assistant shadows remain identifiable
++        as synthetic. Persisted ``api_content`` is exposed as a private
++        body-free digest so same-session physical generations remain
++        auditable without making provider-side context part of cross-lineage
++        logical identity. Exact empty provider scaffolds also retain one fixed
++        body-free presence sentinel so downstream readers can exclude them.
++        Rows remain in AUTOINCREMENT order,
++        so a regressing wall clock affects membership in the requested window
++        but never reorders matching rows.
++        """
++        try:
++            start = float(start_timestamp)
++            end = float(end_timestamp)
++        except (TypeError, ValueError) as exc:
++            raise ValueError("timestamps must be finite numbers") from exc
++        if not math.isfinite(start) or not math.isfinite(end):
++            raise ValueError("timestamps must be finite numbers")
++        if start > end:
++            raise ValueError("start_timestamp must be <= end_timestamp")
++        if (
++            isinstance(max_physical_rows, bool)
++            or not isinstance(max_physical_rows, int)
++            or max_physical_rows <= 0
++        ):
++            raise ValueError("max_physical_rows must be a positive integer")
++
++        if include_inactive:
++            lifecycle_clause = ""
++        elif include_compacted:
++            lifecycle_clause = " AND (active = 1 OR compacted = 1)"
++        else:
++            lifecycle_clause = " AND active = 1"
++        with self._read_ctx() as conn:
++            rows = conn.execute(
++                "SELECT * FROM messages WHERE session_id = ? "
++                "AND timestamp >= ? AND timestamp <= ?"
++                f"{lifecycle_clause} ORDER BY id ASC LIMIT ?",
++                (session_id, start, end, max_physical_rows + 1),
++            ).fetchall()
++
++        physical_row_count = len(rows)
++        if physical_row_count > max_physical_rows:
++            return {
++                "messages": [],
++                "scan_complete": False,
++                "overflow": True,
++                "physical_row_count": physical_row_count,
++                "max_physical_rows": max_physical_rows,
++            }
++        if include_compacted and not include_inactive:
++            rows = self._dedupe_compacted_message_rows(rows)
++        decoded = self._decode_message_rows(rows)
++        projected = self._project_compaction_live_views(decoded)
++        for message in projected:
++            if "api_content" not in message:
++                continue
++            api_content = message.pop("api_content")
++            if api_content is None:
++                continue
++            if not isinstance(api_content, str):
++                raise ValueError("persisted api_content must be text or null")
++            message["_continuity_api_content_sha256"] = hashlib.sha256(
++                api_content.encode("utf-8")
++            ).hexdigest()
++            if (
++                api_content.strip()
++                and not message.get("content")
++                and not message.get("platform_message_id")
++                and (
++                    str(message.get("role") or "").strip().lower() == "user"
++                    or str(message.get("display_kind") or "").strip().lower()
++                    == "hidden"
++                )
++            ):
++                message["api_content"] = "[continuity provider scaffold]"
++        return {
++            "messages": projected,
++            "scan_complete": True,
++            "overflow": False,
++            "physical_row_count": physical_row_count,
++            "max_physical_rows": max_physical_rows,
++        }
+ 
+     def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
+         """Tool results in these sessions that mention a GitHub PR url.
+@@ -12897,7 +13206,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         "finish_reason, reasoning, reasoning_content, reasoning_details, "
+         "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
+         "_compressed_summary, timestamp, "
+-        "api_content, display_kind, display_metadata"
++        "api_content, display_kind, display_metadata, origin_proof"
+     )
+ 
+     def _rows_to_conversation(
+@@ -12962,6 +13271,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 decoded = self._decode_display_metadata(row["display_metadata"])
+                 if decoded is not None:
+                     msg["display_metadata"] = decoded
++            if row["origin_proof"] is not None:
++                # Provider-facing conversation dicts keep host metadata under
++                # an underscore-prefixed carrier so transport sanitizers strip
++                # it. Compaction assembly preserves that carrier and the store
++                # accepts it on reinsert, keeping the proof across rotation.
++                msg["_origin_proof"] = self._decode_origin_proof(
++                    row["origin_proof"]
++                )
+             if include_summary_markers and row["_compressed_summary"]:
+                 msg["_compressed_summary"] = True
+             if row["timestamp"]:
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index d7f70bc..855edcd 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -477,7 +477,8 @@ CREATE TABLE IF NOT EXISTS messages (
+     compacted INTEGER NOT NULL DEFAULT 0,
+     api_content TEXT,
+     display_kind TEXT,
+-    display_metadata TEXT
++    display_metadata TEXT,
++    origin_proof TEXT
+ );
+ 
+ CREATE TABLE IF NOT EXISTS session_model_usage (
+diff --git a/tests/test_hermes_state_time_window.py b/tests/test_hermes_state_time_window.py
+new file mode 100644
+index 0000000..0214409
+--- /dev/null
++++ b/tests/test_hermes_state_time_window.py
+@@ -0,0 +1,681 @@
++"""Bounded 0.21 SessionDB reads and durable origin-proof lifecycle."""
++
++from __future__ import annotations
++
++import hashlib
++import sqlite3
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from hermes_state import SessionDB
++
++from agent.context_compressor import (
++    COMPRESSED_SUMMARY_METADATA_KEY,
++    ContextCompressor,
++    _MERGED_SUMMARY_DELIMITER,
++    _SUMMARY_END_MARKER,
++)
++
++
++ORIGIN_A = {
++    "schema": "hermes.message_origin.v1",
++    "issuer": "test-writer-a",
++    "opaque": "proof-a",
++}
++ORIGIN_B = {
++    "schema": "hermes.message_origin.v1",
++    "issuer": "test-writer-b",
++    "opaque": "proof-b",
++}
++
++
++@pytest.fixture()
++def db(tmp_path: Path):
++    store = SessionDB(tmp_path / "state.db")
++    store.create_session("window", source="test")
++    try:
++        yield store
++    finally:
++        store.close()
++
++
++def _read(db: SessionDB, session_id: str = "window", **overrides):
++    options = {
++        "start_timestamp": 0.0,
++        "end_timestamp": 1_000.0,
++        "max_physical_rows": 100,
++    }
++    options.update(overrides)
++    return db.get_messages_time_window(session_id, **options)
++
++
++def _real_compression(messages, *, force_user_leading: bool = False):
++    with patch(
++        "agent.context_compressor.get_model_context_length",
++        return_value=100_000,
++    ):
++        compressor = ContextCompressor(
++            model="test-model",
++            threshold_percent=0.85,
++            protect_first_n=0 if force_user_leading else 1,
++            protect_last_n=1,
++            quiet_mode=True,
++            config_context_length=100_000,
++        )
++    response = MagicMock()
++    response.choices[0].message.content = "## Active Task\nsynthetic summary"
++    with patch("agent.context_compressor.call_llm", return_value=response):
++        return compressor.compress(messages, current_tokens=100_000, force=True)
++
++
++def test_filters_before_cap_and_preserves_id_order_when_clock_regresses(db):
++    for index in range(40):
++        db.append_message("window", "user", f"old-{index}", timestamp=index)
++
++    db.append_message("window", "user", "lower-bound", timestamp=100)
++    db.append_message("window", "assistant", "outside-middle", timestamp=300)
++    db.append_message("window", "assistant", "regressed-clock", timestamp=150)
++    db.append_message("window", "user", "upper-bound", timestamp=200)
++
++    for index in range(40):
++        db.append_message(
++            "window", "assistant", f"future-{index}", timestamp=400 + index
++        )
++
++    materialized_rows = []
++
++    def count_rows(cursor, row):
++        materialized_rows.append(row)
++        return sqlite3.Row(cursor, row)
++
++    wal_active = db._wal_active
++    db._wal_active = False
++    db._conn.row_factory = count_rows
++    try:
++        result = _read(
++            db,
++            start_timestamp=100,
++            end_timestamp=200,
++            max_physical_rows=3,
++        )
++    finally:
++        db._conn.row_factory = sqlite3.Row
++        db._wal_active = wal_active
++
++    assert result["physical_row_count"] == 3
++    assert len(materialized_rows) == 3
++    assert [message["content"] for message in result["messages"]] == [
++        "lower-bound",
++        "regressed-clock",
++        "upper-bound",
++    ]
++
++
++def test_inclusive_bounds_and_overflow_never_return_partial_body(db):
++    db.append_message("window", "user", "start", timestamp=10)
++    db.append_message("window", "assistant", "middle", timestamp=11)
++    db.append_message("window", "user", "end", timestamp=12)
++
++    complete = _read(db, start_timestamp=10, end_timestamp=12, max_physical_rows=3)
++    assert [message["content"] for message in complete["messages"]] == [
++        "start",
++        "middle",
++        "end",
++    ]
++
++    overflow = _read(db, start_timestamp=10, end_timestamp=12, max_physical_rows=2)
++    assert overflow == {
++        "messages": [],
++        "scan_complete": False,
++        "overflow": True,
++        "physical_row_count": 3,
++        "max_physical_rows": 2,
++    }
++
++
++def test_tail_generations_keep_one_live_authority_and_origin_proof(db):
++    db.append_message(
++        "window", "user", "old user", timestamp=100, origin_proof=ORIGIN_A
++    )
++    db.append_message(
++        "window", "assistant", "old answer", timestamp=101, origin_proof=ORIGIN_A
++    )
++    db.append_message(
++        "window", "user", "carried user", timestamp=102, origin_proof=ORIGIN_A
++    )
++    db.append_message(
++        "window", "assistant", "carried answer", timestamp=103, origin_proof=ORIGIN_A
++    )
++
++    summary = {
++        "role": "assistant",
++        "content": "lean summary with anchor index and recovery footer",
++        "timestamp": 99,
++        "_compressed_summary": True,
++    }
++    for _ in range(2):
++        active = db.get_messages("window")
++        tail = [message for message in active if message["content"].startswith("carried")]
++        db.archive_and_compact(
++            "window",
++            [summary.copy(), *tail],
++            tail_count=len(tail),
++        )
++
++    canonical = _read(
++        db,
++        start_timestamp=0,
++        end_timestamp=200,
++        include_compacted=True,
++        max_physical_rows=8,
++    )
++    assert canonical["scan_complete"] is True
++    carried = [
++        message
++        for message in canonical["messages"]
++        if message["content"].startswith("carried")
++    ]
++    assert [message["content"] for message in carried] == [
++        "carried user",
++        "carried answer",
++    ]
++    assert all(message["active"] == 1 for message in carried)
++    assert all(message["origin_proof"] == ORIGIN_A for message in carried)
++
++    raw = _read(
++        db,
++        start_timestamp=102,
++        end_timestamp=103,
++        include_inactive=True,
++        max_physical_rows=6,
++    )
++    assert raw["physical_row_count"] == 6
++    assert all(message["origin_proof"] == ORIGIN_A for message in raw["messages"])
++    for content in ("carried user", "carried answer"):
++        copies = [message for message in raw["messages"] if message["content"] == content]
++        assert [(message["active"], message["compacted"]) for message in copies] == [
++            (0, 0),
++            (0, 0),
++            (1, 0),
++        ]
++
++
++def test_lean_synthetic_material_stays_identifiable_in_bounded_read(db):
++    db.append_message(
++        "window", "user", "real question", timestamp=10, origin_proof=ORIGIN_A
++    )
++    db.append_message(
++        "window", "assistant", "real answer", timestamp=11, origin_proof=ORIGIN_A
++    )
++    compacted = [
++        {
++            "role": "assistant",
++            "content": (
++                "lean narrative\n## Anchor Index\nsha\n"
++                "## Context Recovery\nsession_search(...)"
++            ),
++            "timestamp": 12,
++            "_compressed_summary": True,
++        },
++        {
++            "role": "tool",
++            "tool_name": "terminal",
++            "content": "[terminal output demoted at compaction]",
++            "timestamp": 13,
++        },
++        {
++            "role": "user",
++            "content": "live carried question",
++            "timestamp": 14,
++            "origin_proof": ORIGIN_A,
++        },
++        {
++            "role": "assistant",
++            "content": "live carried answer",
++            "timestamp": 15,
++            "origin_proof": ORIGIN_A,
++        },
++    ]
++    db.archive_and_compact("window", compacted, tail_count=3)
++
++    messages = _read(db, start_timestamp=0, end_timestamp=20)["messages"]
++    summary = next(message for message in messages if "lean narrative" in message["content"])
++    stub = next(message for message in messages if message["role"] == "tool")
++    eligible = [
++        message
++        for message in messages
++        if message["role"] in {"user", "assistant"}
++        and not message.get("_compressed_summary")
++    ]
++
++    assert summary["_compressed_summary"] is True
++    assert stub["role"] == "tool"
++    assert [message["content"] for message in eligible] == [
++        "live carried question",
++        "live carried answer",
++    ]
++
++
++@pytest.mark.parametrize("force_user_leading", [False, True])
++@pytest.mark.parametrize("rotate", [False, True])
++def test_real_composite_compaction_projects_only_live_tail_after_restart(
++    tmp_path: Path,
++    force_user_leading: bool,
++    rotate: bool,
++):
++    path = tmp_path / "composite.db"
++    db = SessionDB(path)
++    db.create_session("parent", source="qq")
++    transcript = [{"role": "system", "content": "system"}]
++    for index in range(30):
++        transcript.extend(
++            [
++                {
++                    "role": "user",
++                    "content": f"question {index} " + "x" * 400,
++                },
++                {
++                    "role": "assistant",
++                    "content": f"answer {index} " + "y" * 400,
++                },
++            ]
++        )
++    if force_user_leading:
++        transcript.append({"role": "user", "content": "live final request"})
++    for index, message in enumerate(transcript):
++        db.append_message(
++            "parent",
++            message["role"],
++            message["content"],
++            timestamp=100 + index,
++            origin_proof=ORIGIN_A,
++        )
++
++    compressed = _real_compression(
++        db.get_messages("parent"),
++        force_user_leading=force_user_leading,
++    )
++    composite = [
++        message
++        for message in compressed
++        if message.get(COMPRESSED_SUMMARY_METADATA_KEY)
++        and ContextCompressor._strip_context_summary_handoff_message(message)
++        is not None
++    ]
++    assert len(composite) == 1, [
++        (
++            message.get("role"),
++            bool(message.get(COMPRESSED_SUMMARY_METADATA_KEY)),
++            str(message.get("content"))[:120],
++        )
++        for message in compressed
++    ]
++    carrier = composite[0]
++    live = ContextCompressor._strip_context_summary_handoff_message(carrier)
++    assert live is not None
++    if force_user_leading:
++        assert _SUMMARY_END_MARKER in carrier["content"]
++        assert _MERGED_SUMMARY_DELIMITER not in carrier["content"]
++    else:
++        assert _MERGED_SUMMARY_DELIMITER in carrier["content"]
++
++    tail_count = sum(
++        1
++        for message in compressed
++        if isinstance(message, dict) and message.pop("_compaction_tail", None)
++    )
++    if rotate:
++        db.publish_compression_child(
++            parent_session_id="parent",
++            child_session_id="child",
++            source="qq",
++            messages=compressed,
++            require_compression_lease=False,
++        )
++        assert all(message.get("_row_id") for message in compressed)
++        read_session_id = "child"
++    else:
++        db.archive_and_compact("parent", compressed, tail_count=tail_count)
++        read_session_id = "parent"
++    if force_user_leading:
++        db.append_message(
++            read_session_id,
++            "assistant",
++            "live final answer",
++            timestamp=999,
++            origin_proof=ORIGIN_A,
++        )
++    db.close()
++
++    reopened = SessionDB(path, read_only=True)
++    try:
++        canonical = _read(
++            reopened,
++            read_session_id,
++            start_timestamp=0,
++            end_timestamp=1_000,
++            include_compacted=True,
++            max_physical_rows=200,
++        )
++        raw = _read(
++            reopened,
++            read_session_id,
++            start_timestamp=0,
++            end_timestamp=1_000,
++            include_inactive=True,
++            max_physical_rows=200,
++        )
++    finally:
++        reopened.close()
++
++    expected_content = live["content"]
++    projected = [
++        message
++        for message in canonical["messages"]
++        if message.get("content") == expected_content
++        and message.get("active") in {1, True}
++    ]
++    if rotate and not force_user_leading:
++        assert projected == []
++        shadows = [
++            message
++            for message in canonical["messages"]
++            if isinstance(message.get("display_metadata"), dict)
++            and message["display_metadata"].get("_continuity_rotation_shadow")
++            is True
++        ]
++        assert len(shadows) == 1
++        assert shadows[0]["origin_proof"] == ORIGIN_A
++    else:
++        assert len(projected) == 1
++        assert projected[0]["origin_proof"] == ORIGIN_A
++        assert not projected[0].get(COMPRESSED_SUMMARY_METADATA_KEY)
++        assert projected[0]["_continuity_compaction_live_view"]["schema"] == (
++            "hermes.compaction_live_view.v1"
++        )
++    assert all(
++        _MERGED_SUMMARY_DELIMITER not in str(message.get("content"))
++        and "synthetic summary" not in str(message.get("content"))
++        for message in canonical["messages"]
++        if message.get("_continuity_compaction_live_view")
++    )
++    if rotate and not force_user_leading:
++        assert not any(
++            message.get("content") == expected_content
++            for message in raw["messages"]
++        )
++    else:
++        assert any(
++            message.get("content") == expected_content
++            and message.get("_continuity_compaction_live_view")
++            for message in raw["messages"]
++        )
++
++
++def test_raw_window_exposes_origin_collision_while_canonical_uses_live_row(db):
++    db.append_message(
++        "window", "user", "same", timestamp=50, origin_proof=ORIGIN_A
++    )
++    original = db.get_messages("window")
++    db.archive_and_compact("window", original)
++    db._execute_write(
++        lambda conn: conn.execute(
++            "UPDATE messages SET origin_proof = ? "
++            "WHERE session_id = ? AND active = 1",
++            (db._encode_origin_proof(ORIGIN_B), "window"),
++        )
++    )
++
++    canonical = _read(
++        db,
++        start_timestamp=50,
++        end_timestamp=50,
++        include_compacted=True,
++        max_physical_rows=2,
++    )
++    raw = _read(
++        db,
++        start_timestamp=50,
++        end_timestamp=50,
++        include_inactive=True,
++        max_physical_rows=2,
++    )
++
++    assert len(canonical["messages"]) == 1
++    assert canonical["messages"][0]["origin_proof"] == ORIGIN_B
++    assert [message["origin_proof"] for message in raw["messages"]] == [
++        ORIGIN_A,
++        ORIGIN_B,
++    ]
++
++
++def test_api_content_is_body_free_but_distinct_in_bounded_views(db):
++    db.append_message(
++        "window",
++        "user",
++        "same visible request",
++        timestamp=52,
++        api_content="same visible request\n\n[memory a]",
++    )
++    replacement = db.get_messages("window")[0]
++    replacement["api_content"] = "same visible request\n\n[memory b]"
++    db.archive_and_compact("window", [replacement], tail_count=0)
++
++    canonical = _read(
++        db,
++        start_timestamp=52,
++        end_timestamp=52,
++        include_compacted=True,
++        max_physical_rows=2,
++    )
++    raw = _read(
++        db,
++        start_timestamp=52,
++        end_timestamp=52,
++        include_inactive=True,
++        max_physical_rows=2,
++    )
++
++    assert all("api_content" not in message for message in raw["messages"])
++    assert {
++        message["_continuity_api_content_sha256"] for message in raw["messages"]
++    } == {
++        hashlib.sha256(
++            "same visible request\n\n[memory a]".encode()
++        ).hexdigest(),
++        hashlib.sha256(
++            "same visible request\n\n[memory b]".encode()
++        ).hexdigest(),
++    }
++    assert canonical["messages"][0]["_continuity_api_content_sha256"] in {
++        message["_continuity_api_content_sha256"] for message in raw["messages"]
++    }
++
++
++@pytest.mark.parametrize(
++    ("role", "display_kind"),
++    [("user", None), ("assistant", "hidden")],
++)
++def test_api_only_scaffolds_keep_body_free_presence(
++    db, role: str, display_kind: str | None
++):
++    body = "PRIVATE PROVIDER REPLAY BODY"
++    db.append_message(
++        "window",
++        role,
++        "",
++        timestamp=53,
++        api_content=body,
++        display_kind=display_kind,
++    )
++
++    (message,) = _read(
++        db,
++        start_timestamp=53,
++        end_timestamp=53,
++        include_inactive=True,
++        max_physical_rows=1,
++    )["messages"]
++
++    assert message["api_content"] == "[continuity provider scaffold]"
++    assert message["_continuity_api_content_sha256"] == hashlib.sha256(
++        body.encode()
++    ).hexdigest()
++    assert body not in repr(message)
++
++
++def test_origin_proof_survives_rotation_lineage_concurrent_clone_and_restart(
++    tmp_path: Path,
++):
++    path = tmp_path / "lineage.db"
++    db = SessionDB(path)
++    db.create_session("parent", source="cli")
++    db.append_message(
++        "parent", "user", "handoff", timestamp=70, origin_proof=ORIGIN_A
++    )
++    watermark = db.get_active_message_watermark("parent")
++    db.append_message(
++        "parent", "assistant", "concurrent", timestamp=71, origin_proof=ORIGIN_B
++    )
++    handoff = [db.get_messages("parent")[0]]
++    db.publish_compression_child(
++        parent_session_id="parent",
++        child_session_id="child",
++        source="cli",
++        messages=handoff,
++        watermark=watermark,
++        require_compression_lease=False,
++    )
++    db.close()
++
++    reopened = SessionDB(path)
++    try:
++        assert reopened.get_compression_lineage("child") == ["parent", "child"]
++        child = _read(
++            reopened,
++            "child",
++            start_timestamp=70,
++            end_timestamp=71,
++            max_physical_rows=2,
++        )["messages"]
++    finally:
++        reopened.close()
++
++    assert [(message["content"], message["origin_proof"]) for message in child] == [
++        ("handoff", ORIGIN_A),
++        ("concurrent", ORIGIN_B),
++    ]
++
++
++def test_invalid_origin_proof_rolls_back_compaction(db):
++    db.append_message(
++        "window", "user", "still active", timestamp=30, origin_proof=ORIGIN_A
++    )
++
++    with pytest.raises(ValueError, match="origin_proof"):
++        db.archive_and_compact(
++            "window",
++            [{"role": "assistant", "content": "bad", "origin_proof": []}],
++        )
++
++    active = db.get_messages("window")
++    assert [(message["content"], message["origin_proof"]) for message in active] == [
++        ("still active", ORIGIN_A)
++    ]
++
++    with pytest.raises(ValueError, match="JSON serializable"):
++        db.append_message(
++            "window",
++            "assistant",
++            "non-finite proof",
++            origin_proof={"score": float("nan")},
++        )
++
++
++def test_model_conversation_uses_transport_private_origin_carrier(db):
++    db.append_message(
++        "window", "user", "private carrier", timestamp=40, origin_proof=ORIGIN_A
++    )
++
++    (message,) = db.get_messages_as_conversation("window")
++
++    assert message["_origin_proof"] == ORIGIN_A
++    assert "origin_proof" not in message
++
++
++def test_existing_database_reconciles_origin_proof_column(tmp_path: Path):
++    path = tmp_path / "pre-origin.db"
++    before = SessionDB(path)
++    before.create_session("window", source="test")
++    before.close()
++
++    legacy = sqlite3.connect(path)
++    legacy.execute("ALTER TABLE messages DROP COLUMN origin_proof")
++    legacy.commit()
++    legacy.close()
++
++    upgraded = SessionDB(path)
++    try:
++        columns = {
++            row[1]
++            for row in upgraded._conn.execute("PRAGMA table_info(messages)")
++        }
++        assert "origin_proof" in columns
++        upgraded.append_message(
++            "window",
++            "user",
++            "after upgrade",
++            timestamp=20,
++            origin_proof=ORIGIN_A,
++        )
++        assert upgraded.get_messages("window")[0]["origin_proof"] == ORIGIN_A
++    finally:
++        upgraded.close()
++
++
++def test_decoding_matches_get_messages_and_read_only_store(tmp_path: Path):
++    path = tmp_path / "read-only.db"
++    writable = SessionDB(path)
++    writable.create_session("window", source="test")
++    writable.append_message(
++        "window",
++        "user",
++        [{"type": "text", "text": "multimodal"}],
++        timestamp=25,
++        display_metadata={"nested": {"value": 1}},
++        origin_proof=ORIGIN_A,
++    )
++    expected = writable.get_messages("window")
++    for message in expected:
++        message.pop("api_content", None)
++    writable.close()
++
++    read_only = SessionDB(path, read_only=True)
++    try:
++        result = _read(
++            read_only,
++            start_timestamp=25,
++            end_timestamp=25,
++            include_inactive=True,
++            max_physical_rows=1,
++        )
++    finally:
++        read_only.close()
++
++    assert result["messages"] == expected
++
++
++@pytest.mark.parametrize(
++    ("overrides", "message"),
++    [
++        ({"start_timestamp": 2, "end_timestamp": 1}, "start_timestamp"),
++        ({"start_timestamp": float("nan")}, "finite"),
++        ({"max_physical_rows": 0}, "positive integer"),
++        ({"max_physical_rows": True}, "positive integer"),
++    ],
++)
++def test_invalid_window_or_capacity_is_rejected(db, overrides, message):
++    with pytest.raises(ValueError, match=message):
++        _read(db, **overrides)
+-- 
+2.50.1 (Apple Git-155)
+

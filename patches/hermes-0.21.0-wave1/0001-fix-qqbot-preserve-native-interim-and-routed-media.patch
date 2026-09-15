@@ -1,0 +1,392 @@
+From 58df98394544189a075e10ed2011461c4bc378c3 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 12:47:43 +0800
+Subject: [PATCH 1/6] fix(qqbot): preserve native interim and routed media
+
+---
+ gateway/run.py                                |  67 +++++++++
+ .../test_qqbot_interim_media_delivery.py      | 124 ++++++++++++++++
+ tests/tools/test_send_message_qqbot_media.py  | 136 ++++++++++++++++++
+ tools/send_message_tool.py                    |   4 +-
+ 4 files changed, 329 insertions(+), 2 deletions(-)
+ create mode 100644 tests/gateway/test_qqbot_interim_media_delivery.py
+ create mode 100644 tests/tools/test_send_message_qqbot_media.py
+
+diff --git a/gateway/run.py b/gateway/run.py
+index 8264eed..d8e1c0f 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5935,9 +5935,40 @@ class TurnRunner:
+                     _stream_consumer.on_segment_break()
+                 else:
+                     _stream_consumer.on_commentary(display_text)
++                    if ctx.source.platform == Platform.QQBOT:
++                        media_adapter = self._runner._adapter_for_source(ctx.source)
++                        if media_adapter is not None:
++                            safe_schedule_threadsafe(
++                                self._runner._deliver_interim_assistant_response(
++                                    display_text,
++                                    ctx.source,
++                                    media_adapter,
++                                    metadata=ctx._status_thread_metadata,
++                                    event_message_id=ctx.event_message_id,
++                                    send_text=False,
++                                ),
++                                ctx._loop_for_step,
++                                logger=logger,
++                                log_message="interim media callback scheduling error",
++                            )
+                 return
+             if already_streamed or not ctx._status_adapter or not str(display_text or "").strip():
+                 return
++            if ctx.source.platform == Platform.QQBOT:
++                safe_schedule_threadsafe(
++                    self._runner._deliver_interim_assistant_response(
++                        display_text,
++                        ctx.source,
++                        ctx._status_adapter,
++                        chat_id=ctx._status_chat_id,
++                        metadata=ctx._status_thread_metadata,
++                        event_message_id=ctx.event_message_id,
++                    ),
++                    ctx._loop_for_step,
++                    logger=logger,
++                    log_message="interim_assistant_callback scheduling error",
++                )
++                return
+             safe_schedule_threadsafe(
+                 ctx._status_adapter.send(
+                     ctx._status_chat_id,
+@@ -24182,6 +24213,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 except OSError:
+                     pass
+ 
++    async def _deliver_interim_assistant_response(
++        self,
++        response: str,
++        source: SessionSource,
++        adapter,
++        chat_id: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++        event_message_id: Optional[str] = None,
++        send_text: bool = True,
++    ) -> None:
++        """Deliver interim QQ text and explicit attachments without path leaks."""
++        media_files, cleaned = adapter.extract_media(response)
++
++        if send_text and str(cleaned or "").strip():
++            interim_metadata = dict(metadata or {})
++            interim_metadata["_interim_send"] = True
++            await adapter.send(
++                chat_id or source.chat_id,
++                cleaned,
++                metadata=interim_metadata,
++            )
++
++        if media_files:
++            event = MessageEvent(
++                text=response,
++                message_type=MessageType.TEXT,
++                source=source,
++                message_id=event_message_id,
++            )
++            await self._deliver_media_from_response(
++                response,
++                event,
++                adapter,
++                thread_metadata=metadata,
++            )
++
+     async def _deliver_media_from_response(
+         self,
+         response: str,
+diff --git a/tests/gateway/test_qqbot_interim_media_delivery.py b/tests/gateway/test_qqbot_interim_media_delivery.py
+new file mode 100644
+index 0000000..ffc453f
+--- /dev/null
++++ b/tests/gateway/test_qqbot_interim_media_delivery.py
+@@ -0,0 +1,124 @@
++"""QQ interim responses keep text clean and deliver explicit media natively."""
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from gateway.config import Platform
++from gateway.platforms.base import BasePlatformAdapter, SendResult
++from gateway.run import GatewayRunner
++from gateway.session import SessionSource
++
++
++def _source():
++    return SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="qq-chat",
++        chat_type="private",
++        thread_id=None,
++    )
++
++
++def _runner():
++    runner = object.__new__(GatewayRunner)
++    runner._thread_metadata_for_source = lambda source, anchor=None: {}
++    runner._reply_anchor_for_event = lambda event: None
++    return runner
++
++
++def _adapter():
++    return SimpleNamespace(
++        name="qqbot",
++        extract_media=BasePlatformAdapter.extract_media,
++        extract_images=BasePlatformAdapter.extract_images,
++        send=AsyncMock(return_value=SendResult(success=True, message_id="text")),
++        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
++        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
++        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
++        send_multiple_images=AsyncMock(return_value=SendResult(success=True, message_id="image")),
++    )
++
++
++def _allowed_media_path(tmp_path, monkeypatch, name):
++    root = tmp_path / "media-cache"
++    media_file = root / name
++    media_file.parent.mkdir(parents=True, exist_ok=True)
++    media_file.write_bytes(b"media")
++    monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (root,))
++    return media_file.resolve()
++
++
++@pytest.mark.asyncio
++async def test_interim_image_hides_path_and_preserves_interim_metadata(tmp_path, monkeypatch):
++    media_file = _allowed_media_path(tmp_path, monkeypatch, "chart.png")
++    adapter = _adapter()
++
++    await GatewayRunner._deliver_interim_assistant_response(
++        _runner(),
++        f"Here is the chart.\nMEDIA:{media_file}",
++        _source(),
++        adapter,
++        metadata={"thread_id": "thread-1"},
++        event_message_id="message-1",
++    )
++
++    adapter.send.assert_awaited_once()
++    sent_text = adapter.send.await_args.args[1]
++    sent_metadata = adapter.send.await_args.kwargs["metadata"]
++    assert "Here is the chart." in sent_text
++    assert str(media_file) not in sent_text
++    assert sent_metadata == {"thread_id": "thread-1", "_interim_send": True}
++    adapter.send_multiple_images.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_stream_consumer_lane_delivers_media_without_duplicate_text(tmp_path, monkeypatch):
++    media_file = _allowed_media_path(tmp_path, monkeypatch, "chart.png")
++    adapter = _adapter()
++
++    await GatewayRunner._deliver_interim_assistant_response(
++        _runner(),
++        f"Here is the chart.\nMEDIA:{media_file}",
++        _source(),
++        adapter,
++        send_text=False,
++    )
++
++    adapter.send.assert_not_awaited()
++    adapter.send_multiple_images.assert_awaited_once()
++
++
++@pytest.mark.parametrize("name", ["notes.txt", "paper.pdf"])
++@pytest.mark.asyncio
++async def test_interim_files_use_document_delivery(tmp_path, monkeypatch, name):
++    media_file = _allowed_media_path(tmp_path, monkeypatch, name)
++    adapter = _adapter()
++
++    await GatewayRunner._deliver_interim_assistant_response(
++        _runner(),
++        f"Requested file.\nMEDIA:{media_file}",
++        _source(),
++        adapter,
++    )
++
++    adapter.send_multiple_images.assert_not_awaited()
++    adapter.send_document.assert_awaited_once()
++    assert adapter.send_document.await_args.kwargs["file_path"] == str(media_file)
++
++
++@pytest.mark.asyncio
++async def test_as_document_preserves_image_bytes_as_file(tmp_path, monkeypatch):
++    media_file = _allowed_media_path(tmp_path, monkeypatch, "original.png")
++    adapter = _adapter()
++
++    await GatewayRunner._deliver_interim_assistant_response(
++        _runner(),
++        f"Original file.\n[[as_document]]\nMEDIA:{media_file}",
++        _source(),
++        adapter,
++    )
++
++    adapter.send_multiple_images.assert_not_awaited()
++    adapter.send_document.assert_awaited_once()
++    assert adapter.send_document.await_args.kwargs["file_path"] == str(media_file)
+diff --git a/tests/tools/test_send_message_qqbot_media.py b/tests/tools/test_send_message_qqbot_media.py
+new file mode 100644
+index 0000000..c930948
+--- /dev/null
++++ b/tests/tools/test_send_message_qqbot_media.py
+@@ -0,0 +1,136 @@
++"""QQ send_message delivery uses the connected native adapter for media."""
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch
++
++import pytest
++
++from gateway.config import Platform
++from gateway.platforms.base import SendResult
++from tools.send_message_tool import _send_to_platform, _send_via_adapter
++
++
++class _Adapter:
++    def __init__(self):
++        self.send_mock = AsyncMock(return_value=SendResult(success=True, message_id="text"))
++        self.send_image_file_mock = AsyncMock(
++            return_value=SendResult(success=True, message_id="image")
++        )
++        self.send_voice_mock = AsyncMock(
++            return_value=SendResult(success=True, message_id="voice")
++        )
++        self.send_video_mock = AsyncMock(
++            return_value=SendResult(success=True, message_id="video")
++        )
++        self.send_document_mock = AsyncMock(
++            return_value=SendResult(success=True, message_id="document")
++        )
++
++    async def send(self, *args, **kwargs):
++        return await self.send_mock(*args, **kwargs)
++
++    async def send_image_file(self, *args, **kwargs):
++        return await self.send_image_file_mock(*args, **kwargs)
++
++    async def send_voice(self, *args, **kwargs):
++        return await self.send_voice_mock(*args, **kwargs)
++
++    async def send_video(self, *args, **kwargs):
++        return await self.send_video_mock(*args, **kwargs)
++
++    async def send_document(self, *args, **kwargs):
++        return await self.send_document_mock(*args, **kwargs)
++
++
++@pytest.mark.asyncio
++async def test_qqbot_text_and_image_use_live_native_adapter(tmp_path):
++    image = tmp_path / "chart.png"
++    image.write_bytes(b"image")
++    adapter = _Adapter()
++    runner = SimpleNamespace(adapters={Platform.QQBOT: adapter}, _gateway_loop=None)
++
++    with patch("gateway.run._gateway_runner_ref", return_value=runner):
++        result = await _send_via_adapter(
++            Platform.QQBOT,
++            SimpleNamespace(),
++            "qq-chat",
++            "Here is the image.",
++            media_files=[(str(image), False)],
++        )
++
++    assert result["success"] is True
++    adapter.send_mock.assert_not_awaited()
++    adapter.send_image_file_mock.assert_awaited_once_with(
++        "qq-chat",
++        str(image),
++        caption="Here is the image.",
++        reply_to=None,
++        metadata=None,
++    )
++
++
++@pytest.mark.asyncio
++async def test_qqbot_as_document_preserves_image_bytes(tmp_path):
++    image = tmp_path / "original.png"
++    image.write_bytes(b"image")
++    adapter = _Adapter()
++    runner = SimpleNamespace(adapters={Platform.QQBOT: adapter}, _gateway_loop=None)
++
++    with patch("gateway.run._gateway_runner_ref", return_value=runner):
++        result = await _send_via_adapter(
++            Platform.QQBOT,
++            SimpleNamespace(),
++            "qq-chat",
++            "Original file.",
++            media_files=[(str(image), False)],
++            force_document=True,
++        )
++
++    assert result["success"] is True
++    adapter.send_image_file_mock.assert_not_awaited()
++    adapter.send_document_mock.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_qqbot_media_fails_explicitly_without_live_adapter(tmp_path):
++    image = tmp_path / "chart.png"
++    image.write_bytes(b"image")
++
++    with patch("gateway.run._gateway_runner_ref", return_value=None):
++        result = await _send_via_adapter(
++            Platform.QQBOT,
++            SimpleNamespace(),
++            "qq-chat",
++            "Attachment follows.",
++            media_files=[(str(image), False)],
++        )
++
++    assert "error" in result
++    assert "live adapter" in result["error"].lower()
++
++
++@pytest.mark.asyncio
++async def test_send_to_platform_routes_qq_media_to_generic_native_helper():
++    media_files = [("/tmp/chart.png", False)]
++    native_send = AsyncMock(return_value={"success": True, "message_id": "image"})
++
++    with patch("tools.send_message_tool._send_via_adapter", native_send):
++        result = await _send_to_platform(
++            Platform.QQBOT,
++            SimpleNamespace(token="unused", extra={}),
++            "qq-chat",
++            "Here is the image.",
++            media_files=media_files,
++            force_document=True,
++        )
++
++    assert result["success"] is True
++    native_send.assert_awaited_once_with(
++        Platform.QQBOT,
++        SimpleNamespace(token="unused", extra={}),
++        "qq-chat",
++        "Here is the image.",
++        thread_id=None,
++        media_files=media_files,
++        force_document=True,
++    )
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index 11a7bf4..36dec93 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -1446,8 +1446,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
+             last_result = result
+         return last_result
+ 
+-    # --- WeCom: native media attachment support via live gateway adapter ---
+-    if platform == Platform.WECOM and media_files:
++    # --- WeCom / QQBot: native media via the connected gateway adapter ---
++    if platform in (Platform.WECOM, Platform.QQBOT) and media_files:
+         last_result = None
+         for i, chunk in enumerate(chunks):
+             is_last = (i == len(chunks) - 1)
+-- 
+2.50.1 (Apple Git-155)
+

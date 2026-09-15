@@ -6,13 +6,29 @@ AsherieSystem revision
 tested Thread Continuity algorithms while replacing Asherie-specific storage,
 surface routing, and service wiring with narrow Hermes host seams.
 
-The current Wave 5 host identity is Hermes Agent 0.21.0 commit
+The accepted Wave 5 host identity is Hermes Agent 0.21.0 commit
 `13900108780ae712059075200b243aa049c634cf`, tree
 `5e82789d9984f8c338c09bdd0ebb31794af1f0dc`. Continuity consumes the
 host-owned `hermes.message_origin.v1` group classifier introduced by the H13
 storage/writer seam. It does not reproduce that classifier or mint origin
 proofs in production; `tests/host_contract/message_origin.py` is a deliberately
 small host-independent unit fixture, not a runtime fallback.
+
+The public 0.21 host replay starts from pure upstream
+`29112bef099274229cadff79cdff7bf7b99c4b77` and applies, in order:
+
+- ten Wave 1 QQ/foundation patches;
+- two Wave 2 canonical-history/lifecycle patches;
+- seventeen Wave 3 provider-boundary patches; and
+- six Wave 4 H8/H13 provenance patches.
+
+All 35 files are byte-identical to their reviewed PrivateAssembly artifacts.
+`patches/hermes-0.21.0-series.sha256` records each digest, while
+`scripts/materialize_hermes_021.py` refuses a missing or changed patch and
+requires the reconstructed Git tree to equal
+`5e82789d9984f8c338c09bdd0ebb31794af1f0dc`. Global Hot reuses this same public
+authority through the exact Continuity checkout; it does not publish a second
+copy of the host series.
 
 The retained 0.20.5 predecessor compatibility lineage is:
 
@@ -43,7 +59,7 @@ The retained 0.20.5 predecessor compatibility lineage is:
 - shared request overlay ownership and proof:
   `5a680e5e38625fb3275b4bf6973a40d089ec11a7`.
 
-The exported patch SHA-256 values, in application order, are:
+The predecessor 0.20.5 patch SHA-256 values, in application order, are:
 
 1. `7e46190001282848025f65cf7916c3bc9c00dba998755cc465d57303c61a7eee`
 2. `c23622949a7db978ff55ac1b72c02825dbcbe9829ea5aec1e672a5d1e8077ab9`

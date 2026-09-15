@@ -1,0 +1,867 @@
+From bfd311f992f5a3a1d3af32a095469e35576c2c3a Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 23:09:19 +0800
+Subject: [PATCH] fix(transport): reconcile streaming retries with attempt
+ truth
+
+---
+ agent/chat_completion_helpers.py              |  56 ++-
+ agent/codex_runtime.py                        |  39 +-
+ agent/relay_llm.py                            | 132 +++++++
+ hermes_cli/middleware.py                      |  18 +-
+ .../test_transport_successor_attempts.py      | 357 ++++++++++++++++++
+ tests/agent/test_transport_truth.py           |  12 +-
+ 6 files changed, 587 insertions(+), 27 deletions(-)
+
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 6d25b14..eb80e41 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -3954,6 +3954,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+         "discarded_bytes": 0,
+     }
+     managed_stream_holder = {"stream": None}
++    provider_body_stream_attempt = {"value": None}
+ 
+     def _set_managed_stream(stream: Any) -> Any:
+         managed_stream_holder["stream"] = stream
+@@ -4128,10 +4129,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+             attempt_request_client["value"] = request_client
+             last_chunk_time["t"] = time.time()
+             agent._touch_activity("waiting for provider response (streaming)")
+-            return relay_llm.call_provider_body(
++            attempt = relay_llm.ProviderBodyStreamAttempt(
+                 request_client.chat.completions.create,
+                 stream_kwargs,
+             )
++            provider_body_stream_attempt["value"] = attempt
++            return attempt.open()
+ 
+         def _stream_created(raw_stream: Any) -> None:
+             response = getattr(raw_stream, "response", None)
+@@ -4513,6 +4516,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                 if isinstance(content, str) and content:
+                     _fire_first_delta()
+                     agent._fire_stream_delta(content)
++            attempt = provider_body_stream_attempt.get("value")
++            if attempt is not None:
++                attempt.accept()
+             return final_response
+ 
+         # Build mock response matching non-streaming shape
+@@ -4665,12 +4671,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+             message=mock_message,
+             finish_reason=effective_finish_reason,
+         )
+-        return SimpleNamespace(
++        response = SimpleNamespace(
+             id="stream-" + str(uuid.uuid4()),
+             model=model_name,
+             choices=[mock_choice],
+             usage=usage_obj,
+         )
++        attempt = provider_body_stream_attempt.get("value")
++        if attempt is not None:
++            attempt.accept()
++        return response
+ 
+     def _call_anthropic(request_client):
+         """Stream an Anthropic Messages API response.
+@@ -4702,7 +4712,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+         _diag = agent._stream_diag_init()
+         request_client_holder["diag"] = _diag
+         _writer_token = {"value": None}
+-        _stream_context = {"manager": None, "stream": None}
++        _stream_context = {"stream": None}
+         base_final_message = None
+ 
+         from agent import relay_llm
+@@ -4716,12 +4726,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                 final_kwargs,
+                 log_prefix=getattr(agent, "log_prefix", ""),
+             )
+-            manager = relay_llm.provider_body_context(
++            attempt = relay_llm.ProviderBodyStreamAttempt(
+                 request_client.messages.stream,
+                 final_kwargs,
++                enter_context=True,
+             )
+-            _stream_context["manager"] = manager
+-            return manager.__enter__()
++            provider_body_stream_attempt["value"] = attempt
++            return attempt.open()
+ 
+         def _anthropic_stream_created(raw_stream: Any) -> None:
+             _stream_context["stream"] = raw_stream
+@@ -4826,12 +4837,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                             ) from None
+                         raise
+         finally:
+-            try:
+-                _close_managed_stream()
+-            finally:
+-                manager = _stream_context["manager"]
+-                if manager is not None:
+-                    manager.__exit__(None, None, None)
++            _close_managed_stream()
+ 
+         if agent._interrupt_requested:
+             return None
+@@ -4879,6 +4885,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                     "block was still incomplete; treating as a "
+                     "mid-tool-call stream drop (#80498)."
+                 )
++            attempt = provider_body_stream_attempt.get("value")
++            if attempt is not None:
++                attempt.accept()
+             return base_final_message
+         final_message = accumulator.response(base_final_message)
+         if (
+@@ -4895,6 +4904,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                 "block was still incomplete; treating as a "
+                 "mid-tool-call stream drop (#80498)."
+             )
++        attempt = provider_body_stream_attempt.get("value")
++        if attempt is not None:
++            attempt.accept()
+         return final_message
+ 
+     def _call():
+@@ -4905,6 +4917,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+         try:
+             for _stream_attempt in range(_max_stream_retries + 1):
+                 stream_attempt_id = _start_stream_attempt()
++                provider_body_stream_attempt["value"] = None
+                 # Check for interrupt before each retry attempt.  Without
+                 # this, /stop closes the HTTP connection (outer poll loop),
+                 # but the retry loop opens a FRESH connection — negating the
+@@ -4929,6 +4942,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                         result["response"] = _call_anthropic(request_client)
+                     else:
+                         result["response"] = _call_chat_completions(stream_attempt_id)
++                    attempt = provider_body_stream_attempt.get("value")
++                    if attempt is not None and not attempt.finalized:
++                        attempt.abandon()
+                     _emit_stream_end(
+                         final_text=_stream_final_text(result["response"]),
+                         finished=True,
+@@ -4936,6 +4952,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                     )
+                     return  # success
+                 except Exception as e:
++                    attempt = provider_body_stream_attempt.get("value")
++                    transport_retry_safe = bool(
++                        attempt is None or attempt.finish_failure(e)
++                    )
+                     _emit_stream_end(final_text="", finished=False, error=str(e))
+                     _close_managed_stream()
+                     # If the main poll loop force-closed this request because
+@@ -5009,6 +5029,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                             _partial_tool_in_flight
+                             and _is_transient
+                             and _stream_attempt < _max_stream_retries
++                            and transport_retry_safe
+                         )
+                         if not _can_silent_retry:
+                             # Either no tool call was in-flight (so the
+@@ -5105,6 +5126,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                         or _is_stream_parse_err
+                         or _is_empty_stream
+                     ):
++                        if (
++                            _stream_attempt < _max_stream_retries
++                            and not transport_retry_safe
++                        ):
++                            logger.warning(
++                                "Streaming failed after the provider stream opened; "
++                                "deferring retry to a new transport record: %s",
++                                e,
++                            )
++                            result["error"] = e
++                            return
+                         # Transient network / timeout error. Retry the
+                         # streaming request with a fresh connection first.
+                         if _stream_attempt < _max_stream_retries:
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index 4e835f4..3b922b7 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -1627,6 +1627,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+ 
+         intercepted_events = []
+         writer_token = {"value": None}
++        provider_body_attempt = {"value": None}
+ 
+         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+             stream_kwargs = _sanitize_consumer_codex_request(
+@@ -1635,10 +1636,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+             )
+             stream_kwargs["stream"] = True
+             stream_kwargs = _bypass_sdk_request_transform(stream_kwargs)
+-            return relay_llm.call_provider_body(
++            body_attempt = relay_llm.ProviderBodyStreamAttempt(
+                 active_client.responses.create,
+                 stream_kwargs,
+             )
++            provider_body_attempt["value"] = body_attempt
++            return body_attempt.open()
+ 
+         def _codex_stream_created(_raw_stream: Any) -> None:
+             # Claim the delta sink for THIS physical attempt. A newer attempt
+@@ -1698,7 +1701,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+             _httpx.ConnectError,
+             ConnectionError,
+         ) as exc:
+-            if attempt < max_stream_retries:
++            body_attempt = provider_body_attempt.get("value")
++            retry_safe = bool(
++                body_attempt is None or body_attempt.finish_failure(exc)
++            )
++            if attempt < max_stream_retries and retry_safe:
+                 logger.debug(
+                     "Codex Responses stream connect failed (attempt %s/%s); "
+                     "retrying. %s error=%s",
+@@ -1715,12 +1722,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+             )
+             raise
+         except _APIConnectionError as exc:
++            body_attempt = provider_body_attempt.get("value")
++            if body_attempt is not None:
++                body_attempt.finish_failure(exc)
+             _log_codex_request_failure(
+                 agent,
+                 exc,
+                 stream_opened=writer_token["value"] is not None,
+             )
+             raise
++        except BaseException as exc:
++            body_attempt = provider_body_attempt.get("value")
++            if body_attempt is not None:
++                body_attempt.finish_failure(exc)
++            raise
+ 
+         def _interrupt_or_superseded() -> bool:
+             return bool(agent._interrupt_requested)
+@@ -1745,7 +1760,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+                     interrupt_check=_interrupt_or_superseded,
+                 )
+             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+-                if attempt < max_stream_retries:
++                body_attempt = provider_body_attempt.get("value")
++                retry_safe = bool(
++                    body_attempt is None or body_attempt.finish_failure(exc)
++                )
++                if attempt < max_stream_retries and retry_safe:
+                     logger.debug(
+                         "Codex Responses stream transport failed mid-iteration "
+                         "(attempt %s/%s); retrying. %s error=%s",
+@@ -1759,11 +1778,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+                     stream_opened=writer_token["value"] is not None,
+                 )
+                 raise
+-            except RuntimeError:
++            except RuntimeError as exc:
+                 if event_stream.final_response is not None:
++                    body_attempt = provider_body_attempt.get("value")
++                    if body_attempt is not None:
++                        body_attempt.accept()
+                     return event_stream.final_response
++                body_attempt = provider_body_attempt.get("value")
++                if body_attempt is not None:
++                    body_attempt.finish_failure(exc)
+                 raise
+             except _APIConnectionError as exc:
++                body_attempt = provider_body_attempt.get("value")
++                if body_attempt is not None:
++                    body_attempt.finish_failure(exc)
+                 _log_codex_request_failure(
+                     agent,
+                     exc,
+@@ -1817,6 +1845,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+                     agent._client_log_context(),
+                 )
+ 
++            body_attempt = provider_body_attempt.get("value")
++            if body_attempt is not None:
++                body_attempt.accept()
+             return final
+         finally:
+             close_fn = getattr(event_stream, "close", None)
+diff --git a/agent/relay_llm.py b/agent/relay_llm.py
+index e9c80fe..ab4b418 100644
+--- a/agent/relay_llm.py
++++ b/agent/relay_llm.py
+@@ -109,6 +109,138 @@ def allow_provider_successor() -> None:
+         record.allow_provider_successor()
+ 
+ 
++class ProviderBodyStreamAttempt:
++    """Keep one filtered provider body pending through stream consumption."""
++
++    def __init__(
++        self,
++        callback: Callable[..., Any],
++        body: dict[str, Any],
++        *,
++        enter_context: bool = False,
++    ) -> None:
++        from hermes_cli.middleware import current_transport_record
++
++        self._callback = callback
++        self._body = dict(body)
++        self._enter_context = enter_context
++        self._record = current_transport_record()
++        self._provider_body: dict[str, Any] | None = None
++        self._manager: Any = None
++        self._state = "new"
++
++    @property
++    def finalized(self) -> bool:
++        return self._state in {"accepted", "failed", "retry_ready"}
++
++    def open(self) -> Any:
++        """Open the SDK stream without accepting its body as terminal truth."""
++
++        from hermes_cli.middleware import transport_record_scope
++
++        client_timeout = self._body.get("timeout")
++        has_client_timeout = "timeout" in self._body
++        provider_body = {
++            key: value for key, value in self._body.items() if key != "timeout"
++        }
++        record = self._record
++        if record is not None and not record.provider_body_supported:
++            record.mark_provider_body_unsupported()
++            self._record = None
++            record = None
++        if record is not None:
++            filtered = record.begin_provider_body_attempt(provider_body)
++            if filtered is not None:
++                provider_body = filtered
++        self._provider_body = dict(provider_body)
++        final_body = dict(provider_body)
++        if has_client_timeout:
++            final_body["timeout"] = client_timeout
++        try:
++            with transport_record_scope(None):
++                resource = self._callback(**final_body)
++                if self._enter_context:
++                    self._manager = resource
++                    resource = resource.__enter__()
++        except BaseException:
++            if record is not None:
++                record.reject_provider_body_attempt(successor_allowed=True)
++            self._state = "preopen_failed"
++            raise
++        self._state = "opened"
++        return resource
++
++    def accept(self) -> None:
++        """Accept only after the consumer observed terminal stream truth."""
++
++        if self._state != "opened":
++            return
++        try:
++            self._exit_manager(None)
++        except BaseException:
++            if self._record is not None:
++                self._record.reject_provider_body_attempt(successor_allowed=False)
++            self._state = "failed"
++            raise
++        if self._record is not None:
++            self._record.accept_provider_body_attempt(self._provider_body)
++        self._state = "accepted"
++
++    def finish_failure(self, exc: BaseException) -> bool:
++        """Close a failed stream and report whether an inner retry is safe."""
++
++        if self._state == "preopen_failed":
++            if self._record is not None:
++                self._record.allow_provider_successor()
++            self._state = "retry_ready"
++            return True
++        if self._state == "opened":
++            try:
++                self._exit_manager(exc)
++            except Exception:
++                logger.debug(
++                    "Provider stream context cleanup failed",
++                    exc_info=True,
++                )
++            if self._record is not None:
++                self._record.reject_provider_body_attempt(successor_allowed=False)
++                retry_safe = False
++            else:
++                retry_safe = True
++            self._state = "failed"
++            return retry_safe
++        return self._record is None
++
++    def abandon(self) -> None:
++        """Reject a non-terminal stream result without authorizing a successor."""
++
++        if self._state != "opened":
++            return
++        try:
++            self._exit_manager(None)
++        except Exception:
++            logger.debug(
++                "Provider stream context cleanup failed",
++                exc_info=True,
++            )
++        if self._record is not None:
++            self._record.reject_provider_body_attempt(successor_allowed=False)
++        self._state = "failed"
++
++    def _exit_manager(self, exc: BaseException | None) -> None:
++        manager = self._manager
++        self._manager = None
++        if manager is None:
++            return
++        from hermes_cli.middleware import transport_record_scope
++
++        with transport_record_scope(None):
++            if exc is None:
++                manager.__exit__(None, None, None)
++            else:
++                manager.__exit__(type(exc), exc, exc.__traceback__)
++
++
+ def _without_transport_record(callback: Callable[..., Any], *args: Any) -> Any:
+     from hermes_cli.middleware import transport_record_scope
+ 
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index 720ead4..e53070f 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -410,8 +410,18 @@ class TransportRecord:
+             except Exception:
+                 self._mark_ambiguous()
+ 
+-    def reject_provider_body_attempt(self) -> None:
+-        """Discard a failed SDK candidate and require proof before fallback."""
++    def reject_provider_body_attempt(
++        self,
++        *,
++        successor_allowed: bool = True,
++    ) -> None:
++        """Discard a failed SDK candidate.
++
++        A successor is allowed only when the caller can prove that the SDK
++        stream never opened.  Once a stream resource exists, delivery is
++        uncertain and the logical execution must leave retry to a new
++        transport record.
++        """
+ 
+         with self._lock:
+             if self._active_provider_attempt is None:
+@@ -419,7 +429,9 @@ class TransportRecord:
+                 self._settled = False
+                 return
+             self._active_provider_attempt = None
+-            self._failed_provider_attempt_pending_retry = True
++            self._failed_provider_attempt_pending_retry = bool(successor_allowed)
++            if not successor_allowed:
++                self._ambiguous = True
+             self._settled = False
+ 
+     def allow_provider_successor(self) -> None:
+diff --git a/tests/agent/test_transport_successor_attempts.py b/tests/agent/test_transport_successor_attempts.py
+index d0808b6..b4ec71c 100644
+--- a/tests/agent/test_transport_successor_attempts.py
++++ b/tests/agent/test_transport_successor_attempts.py
+@@ -2,6 +2,8 @@ from __future__ import annotations
+ 
+ from copy import deepcopy
+ from types import SimpleNamespace
++import httpx
++import pytest
+ 
+ from agent import chat_completion_helpers as cch
+ from hermes_cli.middleware import (
+@@ -232,3 +234,358 @@ def test_anthropic_stream_to_create_fallback_reapplies_guard():
+ 
+     assert result == "ok"
+     _assert_selected_successor(overlay, record, provider_bodies)
++
++
++def _stream_overlay_record():
++    request = {
++        "model": "test/model",
++        "messages": [{"role": "user", "content": "current"}],
++    }
++    overlay = project_request_overlay(
++        request,
++        marker_namespace=NAMESPACE,
++        end_boundary=END,
++        marker=MARKER,
++        body=BODY,
++    )
++    record = TransportRecord()
++    filter_runs = []
++    owner = _CURRENT_MIDDLEWARE_OWNER.set("stream-count")
++    try:
++        record.register_provider_body_filter(
++            lambda body: filter_runs.append(deepcopy(body)) or body
++        )
++    finally:
++        _CURRENT_MIDDLEWARE_OWNER.reset(owner)
++    owner = _CURRENT_MIDDLEWARE_OWNER.set("stream-overlay")
++    try:
++        assert overlay.register_final_budget_guard(
++            record,
++            context_window_tokens=100_000,
++            reserve_tokens=lambda _body, _window: 0,
++            validator=lambda _body, native: (
++                native["messages"][-1]["content"] == "current"
++            ),
++        )
++    finally:
++        _CURRENT_MIDDLEWARE_OWNER.reset(owner)
++    record.mark_middleware_verified(overlay.request)
++    return overlay, record, filter_runs
++
++
++def _streaming_agent():
++    from run_agent import AIAgent
++
++    agent = AIAgent(
++        api_key="test-key",
++        base_url="https://example.invalid/v1",
++        model="test/model",
++        quiet_mode=True,
++        skip_context_files=True,
++        skip_memory=True,
++    )
++    agent.api_mode = "chat_completions"
++    agent._interrupt_requested = False
++    return agent
++
++
++def _chat_chunks():
++    return [
++        SimpleNamespace(
++            choices=[
++                SimpleNamespace(
++                    delta=SimpleNamespace(
++                        content="ok",
++                        tool_calls=None,
++                        reasoning_content=None,
++                        reasoning=None,
++                    ),
++                    finish_reason=None,
++                )
++            ],
++            model="test/model",
++            usage=None,
++        ),
++        SimpleNamespace(
++            choices=[
++                SimpleNamespace(
++                    delta=SimpleNamespace(
++                        content=None,
++                        tool_calls=None,
++                        reasoning_content=None,
++                        reasoning=None,
++                    ),
++                    finish_reason="stop",
++                )
++            ],
++            model="test/model",
++            usage=None,
++        ),
++    ]
++
++
++def test_openai_preopen_connect_retry_reapplies_overlay_guard(monkeypatch):
++    overlay, record, filter_runs = _stream_overlay_record()
++    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
++    provider_bodies = []
++
++    def create(**body):
++        provider_bodies.append(deepcopy(body))
++        if len(provider_bodies) == 1:
++            raise httpx.ConnectError("pre-open failure")
++        class Stream:
++            response = SimpleNamespace(headers={})
++
++            def __iter__(self):
++                return iter(_chat_chunks())
++
++        return Stream()
++
++    client = SimpleNamespace(
++        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
++    )
++    agent = _streaming_agent()
++    agent._create_request_openai_client = lambda **_kwargs: client
++    agent._close_request_openai_client = lambda *_args, **_kwargs: None
++
++    with transport_record_scope(record):
++        response = agent._interruptible_streaming_api_call(
++            deepcopy(overlay.request)
++        )
++    record.settle()
++
++    assert response.choices[0].finish_reason == "stop"
++    assert len(provider_bodies) == 2
++    assert len(filter_runs) == 2
++    assert record.provider_attempt_count == 2
++    assert record.capture_count == 1
++    assert record.settled is True
++    assert overlay.disposition != OVERLAY_PENDING
++
++
++def test_openai_opened_empty_stream_does_not_retry_same_record(monkeypatch):
++    overlay, record, filter_runs = _stream_overlay_record()
++    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
++    provider_bodies = []
++
++    def create(**body):
++        provider_bodies.append(deepcopy(body))
++        class Stream:
++            response = SimpleNamespace(headers={})
++
++            def __iter__(self):
++                return iter(())
++
++        return Stream()
++
++    client = SimpleNamespace(
++        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
++    )
++    agent = _streaming_agent()
++    agent._create_request_openai_client = lambda **_kwargs: client
++    agent._close_request_openai_client = lambda *_args, **_kwargs: None
++
++    with transport_record_scope(record):
++        with pytest.raises(cch.EmptyStreamError):
++            agent._interruptible_streaming_api_call(deepcopy(overlay.request))
++    record.settle()
++
++    assert len(provider_bodies) == 1
++    assert len(filter_runs) == 1
++    assert record.provider_attempt_count == 1
++    assert record.capture_count == 0
++    assert record.ambiguous is True
++    assert record.settled is False
++    assert overlay.disposition == OVERLAY_PENDING
++
++
++def test_anthropic_eventless_stream_does_not_retry_same_record(monkeypatch):
++    overlay, record, filter_runs = _stream_overlay_record()
++    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
++    provider_bodies = []
++
++    class RawStream:
++        response = SimpleNamespace(headers={})
++
++        def __iter__(self):
++            return iter(())
++
++        def get_final_message(self):
++            raise AssertionError("no message_start")
++
++    class StreamManager:
++        def __enter__(self):
++            return RawStream()
++
++        def __exit__(self, *_args):
++            return False
++
++    class Messages:
++        def stream(self, **body):
++            provider_bodies.append(deepcopy(body))
++            return StreamManager()
++
++    client = SimpleNamespace(messages=Messages())
++    agent = _streaming_agent()
++    agent.api_mode = "anthropic_messages"
++    agent._create_request_anthropic_client = lambda **_kwargs: client
++    agent._close_request_anthropic_client = lambda *_args, **_kwargs: None
++
++    with transport_record_scope(record):
++        with pytest.raises(cch.EmptyStreamError):
++            agent._interruptible_streaming_api_call(deepcopy(overlay.request))
++    record.settle()
++
++    assert len(provider_bodies) == 1
++    assert len(filter_runs) == 1
++    assert record.provider_attempt_count == 1
++    assert record.capture_count == 0
++    assert record.ambiguous is True
++    assert record.settled is False
++    assert overlay.disposition == OVERLAY_PENDING
++
++
++def _codex_overlay_record():
++    request = {
++        "model": "gpt-test",
++        "input": [
++            {
++                "role": "user",
++                "content": [{"type": "input_text", "text": "current"}],
++            }
++        ],
++    }
++    overlay = project_request_overlay(
++        request,
++        marker_namespace=NAMESPACE,
++        end_boundary=END,
++        marker=MARKER,
++        body=BODY,
++    )
++    record = TransportRecord()
++    filter_runs = []
++    owner = _CURRENT_MIDDLEWARE_OWNER.set("codex-stream-count")
++    try:
++        record.register_provider_body_filter(
++            lambda body: filter_runs.append(deepcopy(body)) or body
++        )
++    finally:
++        _CURRENT_MIDDLEWARE_OWNER.reset(owner)
++    owner = _CURRENT_MIDDLEWARE_OWNER.set("codex-stream-overlay")
++    try:
++        assert overlay.register_final_budget_guard(
++            record,
++            context_window_tokens=100_000,
++            reserve_tokens=lambda _body, _window: 0,
++            validator=lambda _body, native: (
++                native["input"][-1]["content"][-1]["text"] == "current"
++            ),
++        )
++    finally:
++        _CURRENT_MIDDLEWARE_OWNER.reset(owner)
++    record.mark_middleware_verified(overlay.request)
++    return overlay, record, filter_runs
++
++
++def _codex_agent():
++    return SimpleNamespace(
++        _abort_request_openai_client=lambda *_args, **_kwargs: None,
++        _client_log_context=lambda: "test",
++        _fallback_index=0,
++        _fire_reasoning_delta=lambda _text: None,
++        _fire_stream_delta=lambda _text: None,
++        _fire_streamed_codex_commentary=lambda _text: None,
++        _interrupt_requested=False,
++        _is_codex_backend=lambda: False,
++        _touch_activity=lambda _text: None,
++        _current_api_request_id="request-id",
++        interim_assistant_callback=None,
++        is_subagent=False,
++        model="gpt-test",
++        provider="openai-codex",
++        session_id="codex-stream-session",
++        show_commentary=True,
++    )
++
++
++def _codex_terminal_events():
++    return [
++        SimpleNamespace(
++            type="response.completed",
++            response=SimpleNamespace(
++                status="completed",
++                output=[],
++                usage=None,
++                id="response-1",
++                model="gpt-test",
++                incomplete_details=None,
++                error=None,
++            ),
++        )
++    ]
++
++
++def test_codex_preopen_connect_retry_reapplies_overlay_guard(monkeypatch):
++    from agent.codex_runtime import run_codex_stream
++
++    overlay, record, filter_runs = _codex_overlay_record()
++    monkeypatch.setenv("HERMES_CODEX_SDK_TRANSFORM", "1")
++    provider_bodies = []
++
++    def create(**body):
++        provider_bodies.append(deepcopy(body))
++        if len(provider_bodies) == 1:
++            raise httpx.ConnectError("pre-open failure")
++        return iter(_codex_terminal_events())
++
++    client = SimpleNamespace(responses=SimpleNamespace(create=create))
++    with transport_record_scope(record):
++        response = run_codex_stream(
++            _codex_agent(),
++            deepcopy(overlay.request),
++            client=client,
++        )
++    record.settle()
++
++    assert response.status == "completed"
++    assert len(provider_bodies) == 2
++    assert len(filter_runs) == 2
++    assert record.provider_attempt_count == 2
++    assert record.capture_count == 1
++    assert record.settled is True
++    assert overlay.disposition != OVERLAY_PENDING
++
++
++def test_codex_mid_iteration_failure_does_not_retry_same_record(monkeypatch):
++    from agent.codex_runtime import run_codex_stream
++
++    overlay, record, filter_runs = _codex_overlay_record()
++    monkeypatch.setenv("HERMES_CODEX_SDK_TRANSFORM", "1")
++    provider_bodies = []
++
++    class BrokenStream:
++        def __iter__(self):
++            yield SimpleNamespace(type="response.output_text.delta", delta="partial")
++            raise httpx.ReadTimeout("mid-stream failure")
++
++    def create(**body):
++        provider_bodies.append(deepcopy(body))
++        return BrokenStream()
++
++    client = SimpleNamespace(responses=SimpleNamespace(create=create))
++    with transport_record_scope(record):
++        with pytest.raises(httpx.ReadTimeout):
++            run_codex_stream(
++                _codex_agent(),
++                deepcopy(overlay.request),
++                client=client,
++            )
++    record.settle()
++
++    assert len(provider_bodies) == 1
++    assert len(filter_runs) == 1
++    assert record.provider_attempt_count == 1
++    assert record.capture_count == 0
++    assert record.ambiguous is True
++    assert record.settled is False
++    assert overlay.disposition == OVERLAY_PENDING
+diff --git a/tests/agent/test_transport_truth.py b/tests/agent/test_transport_truth.py
+index 707a0fc..b987a1f 100644
+--- a/tests/agent/test_transport_truth.py
++++ b/tests/agent/test_transport_truth.py
+@@ -900,7 +900,7 @@ def test_anthropic_stream_records_final_sanitized_sdk_kwargs(monkeypatch):
+     assert record.settled is True
+ 
+ 
+-def test_codex_stream_records_final_sanitized_responses_kwargs(monkeypatch):
++def test_codex_stream_does_not_accept_body_before_terminal_truth(monkeypatch):
+     class TransportError(Exception):
+         pass
+ 
+@@ -969,10 +969,6 @@ def test_codex_stream_records_final_sanitized_responses_kwargs(monkeypatch):
+             "temperature": 0.25,
+         }
+     ]
+-    assert record.provider_body == {
+-        "model": "gpt-5.6-sol",
+-        "input": "hello",
+-        "stream": True,
+-        "temperature": 0.25,
+-    }
+-    assert record.capture_count == 1
++    assert record.provider_body is None
++    assert record.capture_count == 0
++    assert record.ambiguous is True
