@@ -56,11 +56,14 @@ provider, or a replacement compressor.
 
 Checkpoint v2 still reads and proves the complete canonical prefix and stores
 full-prefix identity/fingerprint arrays. Work, memory, and checkpoint bytes
-therefore grow with total history. A formal long-lived-profile release
-requires a Hermes-owned stable logical anchor/prefix digest seam and a compact
-checkpoint v3 that proves bounded suffix growth and detects prefix rewrite.
-The existing bounded time-window API is sufficient for the cross-mouth window
-service, but cannot honestly replace this full-prefix contract.
+therefore grow with total history while the physical row count remains within
+the configured full-prefix budget. Larger sessions leave the request on the
+native Hermes path before the complete compacted view is decoded. Providing
+Continuity bridges for those sessions still requires a Hermes-owned stable
+logical anchor/prefix digest seam and a compact checkpoint v3 that proves
+bounded suffix growth and detects prefix rewrite. The existing bounded
+time-window API is sufficient for the cross-mouth window service, but cannot
+honestly replace this full-prefix contract.
 
 ## Release gates
 

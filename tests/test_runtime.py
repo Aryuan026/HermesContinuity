@@ -436,6 +436,39 @@ def post(
 
 
 class ContinuityRuntimeTests(unittest.TestCase):
+    def test_full_prefix_overflow_leaves_native_request_unchanged_and_visible(
+        self,
+    ) -> None:
+        value = bundle()
+        value["source"] = {
+            "status": "overflow",
+            "groups": [],
+            "source_prefix_ids": [],
+            "source_snapshot": "",
+            "scan_complete": False,
+            "error": "source_physical_row_limit_exceeded",
+            "stats": {
+                "full_prefix": False,
+                "returned_groups": 0,
+                "compacted_prefix_group_ids": [],
+                "physical_row_count_at_least": 2_049,
+                "max_physical_rows": 2_048,
+            },
+        }
+        adapter = FakeAdapter(value)
+        compiler = FakeCompiler(checkpoint("unused"))
+        runtime = make_runtime(adapter, compiler)
+        original = request()
+
+        self.assertIsNone(project(runtime, original))
+        self.assertEqual(original, request())
+        self.assertEqual(compiler.calls, [])
+        status = json.loads(runtime.status_command())
+        self.assertEqual(
+            status["reason_counts"],
+            {"source_physical_row_limit_exceeded": 1},
+        )
+
     def test_real_extracted_compiler_reaches_projection_and_settlement(self) -> None:
         value = bundle()
         groups = [exact_group(1), exact_group(2)]

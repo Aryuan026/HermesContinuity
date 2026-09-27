@@ -91,7 +91,13 @@ def register(ctx: Any) -> None:
     except Exception:
         session_db.close()
         raise
-    adapter = HermesSessionAdapter(session_db, metadata_store)
+    adapter = HermesSessionAdapter(
+        session_db,
+        metadata_store,
+        max_full_prefix_physical_rows=ctx.get_config(
+            "max_full_prefix_physical_rows", default=2_048
+        ),
+    )
     canonical_source_service = ContinuityCanonicalSourceService(
         adapter,
         additional_human_sources=additional_human_sources,

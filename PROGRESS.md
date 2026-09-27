@@ -1,7 +1,7 @@
 # Progress
 
 - Lifecycle: active, local implementation.
-- Manifest version: 0.4.0.
+- Manifest version: 0.4.1.
 - Source extraction: completed from owner-authorized AsherieSystem revision
   `ddfb1e9aeb7c6f7797912e959a0970c621875c83`.
 - Hermes adapter: implemented against canonical `SessionDB` reads with raw-row
@@ -79,9 +79,13 @@
 - External review: the first public candidate was judged suitable only for a
   disposable canary. Its source-policy findings are incorporated in this
   replacement root; repeat exact-revision review remains the current gate.
-- Long-history boundary: checkpoint v2 and the main continuity source read are
-  still O(total session history). A stable Hermes prefix-proof seam and compact
-  checkpoint v3 remain required before formal long-lived-profile use.
+- Long-history guard: the request path first reads at most 2,049 physical rows.
+  Sessions above the default 2,048-row budget now leave the native Hermes
+  request unchanged before any complete compacted-history decode or Continuity
+  compiler call. The reason is visible as
+  `source_physical_row_limit_exceeded`; 211 compatible-host tests pass with one
+  existing conditional proof skipped. Checkpoint v3 is still required before
+  Continuity itself can serve arbitrarily long sessions.
 - Runtime installation and target canary truth are intentionally owned by the
   exact external assembly receipt rather than inferred from this source tree.
 

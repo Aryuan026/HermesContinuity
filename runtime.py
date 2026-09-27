@@ -659,6 +659,14 @@ class ContinuityRuntime:
             source = bundle.get("source") if isinstance(bundle, Mapping) else None
             if not isinstance(source, Mapping):
                 raise ValueError("source_unavailable")
+            if (
+                source.get("status") != "ready"
+                or source.get("scan_complete") is not True
+            ):
+                return _TurnPlan(
+                    current_sha,
+                    reason=str(source.get("error") or "source_unavailable"),
+                )
             compacted_ids = list(
                 dict(source.get("stats") or {}).get(
                     "compacted_prefix_group_ids"
