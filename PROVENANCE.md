@@ -49,11 +49,21 @@ The exported patch SHA-256 values, in application order, are:
 10. `99b4847dc3af412f6a0696735021d8ee0a33f6364bab93c426c12f36332e2cfb`
 11. `f3e70e70b0811beb390ef034d1c080497724f3061d93c83ae0329bdd7547f2c6`
 12. `ee52adf371717dc4529ddc6d9b678db92214afb3146393c695cdf45b617addd3`
+13. `1791c7a384b96d7b4e299334bd5b36c9ca20065e3e262e16aae0309ae9e5cfeb`
+
+Patch 13 (`hermes-0.20.5-incremental-history.patch`) is the additive Block 3
+canonical journal/index seam. It is exported from compatibility-host commit
+`60a36dda4387db20ce5777ead59e7a308672b061`, tree
+`f800b2dd1698f93138404535a350c8f08a873646`, whose parent materializes the
+unchanged first twelve patches. Those original artifacts are not rewritten.
+This is an implementation candidate on the named 0.20.5 lane, not a port to
+0.21.3 or a selected deployment artifact.
 
 ## Extraction matrix
 
 | Decision | AsherieSystem donor | Hermes Continuity target | Treatment |
 | --- | --- | --- | --- |
+| Adapt | Retained recent-bridge selection, chunk planning/acceptance and checkpoint policy; current donor inspected at `ddfb1e9aeb7c6f7797912e959a0970c621875c83` | `checkpoint_v3.py`, explicit v3 paths in `context_compactor.py` / `thread_continuity_runtime.py`, `history_index.py` | Block 3 replaces full-history identity arrays with host-proven compact prefix descriptors and a bounded complete-group window. Selection, summary/chunk acceptance, current/raw non-retirement and budget helpers are reused; checkpoint v2 remains available on the original twelve-patch host. This is a representation/storage adaptation, not a new memory or search algorithm. |
 | Retain | `services/home/app/context_compactor.py`: `_ThreadContinuityPhysicalOwnerSidecar`, `_content_to_text`, `_normalize` | `context_compactor.py` | Retained the physical-input authority used by compilation and checkpoint-candidate validation. The prompt-plan/fixed-selection capabilities were initially retained for donor parity, then excluded because the Hermes product has no finalizer registration or consumer. |
 | Adapt | `services/home/app/context_compactor.py`: the continuity compactor section through `accept_summary_chunk_attempt` | `context_compactor.py` | Retained checkpoint v2, its nested retirement/recent-bridge v1 schemas, fold planning, physical-owner proof, summary/chunk planning, acceptance receipts, and bounded validation. Removed the top-level `thread_continuity_checkpoint.v1` builder, normalizer, legacy bridge projection, and physical-owner relation only after the body-free owner-store census found zero v1 rows and zero malformed rows across the known local and Tencent estate. Unexpected top-level v1 now fails closed and is never projected or migrated. |
 | Retain | `services/home/app/thread_continuity_runtime.py`: live compilation, summary/chunk acceptance, and physical-input validation path | `thread_continuity_runtime.py` | Retained the compiler used by `ContinuityRuntime`. The fixed-prompt finalizer and token-watermark context-epoch planner were initially retained for donor parity, then excluded because Hermes registered no policy, configuration, caller, or result consumer for them. |

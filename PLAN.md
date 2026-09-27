@@ -62,10 +62,12 @@ It does not prove continuity for sessions exceeding 2,048 physical rows.
 
 Block 2 must freeze the writer census, host pagination/source-validity protocol,
 publication guarantee and checkpoint-v3 format before Block 3 implements them.
-The docs-only candidate is [LONG_HISTORY_PROTOCOL.md](LONG_HISTORY_PROTOCOL.md):
+The accepted specification is [LONG_HISTORY_PROTOCOL.md](LONG_HISTORY_PROTOCOL.md):
 host-owned change capture and bounded indexes, conditional checkpoint storage
-with validation on every use. It awaits protocol review; no v3 runtime or host
-patch has been implemented by that document.
+with validation on every use. The owner accepted Block 2 at `e54472f2` and
+authorized Block 3 implementation. Current work adds a thirteenth host patch,
+compact v3 storage/compiler input and bounded preparation; implementation
+review and deployment remain distinct. See LONG_HISTORY_IMPLEMENTATION.md.
 Index progress, provider delivery and checkpoint publication remain separate
 facts. Index completion must not trigger whole-history model summarization.
 Block 3 must positively prove a >2,048-row bridge, actual settlement and next-turn
