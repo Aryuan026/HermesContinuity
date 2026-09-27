@@ -51,6 +51,7 @@ jobs:
           python -B -m pytest -q tests/test_request_overlay.py tests/test_middleware.py
       - run: python -B -m unittest discover -s tests -v
       - name: Disposable full-chain resource benchmark
+        shell: bash
         run: python -B tests/benchmark_resource_guard.py | tee "$RUNNER_TEMP/resource-guard.jsonl"
       - uses: actions/upload-artifact@v4
         with:
