@@ -55,6 +55,15 @@ class FakeSessionDB:
     def close(self):
         self.closed = True
 
+    def _read_ctx(self):
+        raise NotImplementedError
+
+    def _decode_message_rows(self, rows):
+        return rows
+
+    def _dedupe_compacted_message_rows(self, rows):
+        return rows
+
     def get_messages_time_window(self, session_id, **kwargs):
         return {
             "messages": [],
@@ -136,6 +145,8 @@ class PluginRegistrationTests(unittest.TestCase):
     def test_registers_only_request_execution_and_settlement_boundaries(self):
         self.ctx.config["additional_human_sources"] = ["custom_frontend"]
         self.ctx.config["max_full_prefix_physical_rows"] = 321
+        self.ctx.config["max_full_prefix_bytes"] = 123456
+        self.ctx.config["max_checkpoint_bytes"] = 12345
         with patch.dict(sys.modules, self._modules(CompatibleResult)):
             plugin.register(self.ctx)
 
@@ -166,6 +177,8 @@ class PluginRegistrationTests(unittest.TestCase):
             self.ctx.services[0][1].adapter.max_full_prefix_physical_rows,
             321,
         )
+        self.assertEqual(self.ctx.services[0][1].adapter.max_full_prefix_bytes, 123456)
+        self.assertEqual(self.ctx.services[0][1].adapter.metadata_store.max_checkpoint_bytes, 12345)
         self.assertEqual(len(FakeSessionDB.instances), 1)
         self.assertTrue(FakeSessionDB.instances[0].read_only)
         self.assertEqual(

@@ -56,6 +56,17 @@ physical rows is left on Hermes's native request path before Continuity asks
 memory guard, not a replacement for the compact prefix-proof design required
 to provide Continuity bridges for arbitrarily long sessions.
 
+The full-prefix reader additionally caps encoded message-column bytes at
+`max_full_prefix_bytes` (default 4 MiB), before transferring rows or calling
+the host decoder. The row probe, byte probe and fetch share one short host
+read snapshot. API content, tool calls, reasoning and display metadata count
+toward this budget, including compacted clones. An unavailable source never
+loads its checkpoint. Stored checkpoint plus prefix-ID JSON is limited by
+`max_checkpoint_bytes` (default 1 MiB), on both read and publication; an
+oversized existing checkpoint is left intact. These are serialized-payload
+budgets, not absolute Python RSS ceilings. See `RESOURCE_GUARD.md` for the
+full-chain benchmark and the remaining long-history work.
+
 The metadata file is claimed by one plugin owner before any Continuity table is
 created. Registration/store initialization rejects Hermes canonical tables,
 foreign owners, and unclaimed nonempty SQLite schema rather than mixing stores.
@@ -85,7 +96,10 @@ confidence class, checkpoint publication outcomes, and unsupported host paths.
 The host estimate covers messages/input, system/instructions, tools and image
 allowances with a 15% + 64-token margin, but it remains a heuristic rather than
 an exact tokenizer upper bound. The status output contains no bridge or
-transcript body.
+transcript body. Session status reads checkpoint metadata only, never its
+JSON: `stored_unvalidated` means present, not proven reusable;
+`byte_limit_exceeded` means it cannot be loaded within the configured budget.
+Source/checkpoint validation remains on the request path.
 
 `api_mode=codex_app_server` is unsupported in v1 and is left unmodified. MoA
 prepared requests are currently transport-ambiguous and therefore never

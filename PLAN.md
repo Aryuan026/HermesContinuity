@@ -54,6 +54,25 @@ provider, or a replacement compressor.
 
 ## Long-history gate
 
+Block 1 is **complete-entry transitional protection and resource baseline**:
+guard full-prefix messages and checkpoint loading before payload transfer,
+preserve small-session compile/settlement, and measure the full plugin chain in
+disposable processes. Source overflow may still leave native Hermes unchanged.
+It does not prove continuity for sessions exceeding 2,048 physical rows.
+
+Block 2 must freeze the writer census, host pagination/source-validity protocol,
+publication guarantee and checkpoint-v3 format before Block 3 implements them.
+Index progress, provider delivery and checkpoint publication remain separate
+facts. Index completion must not trigger whole-history model summarization.
+Block 3 must positively prove a >2,048-row bridge, actual settlement and next-turn
+reuse. The accepted Block 1 exact SHA becomes the preferred v3 rollback target;
+`34780f0` / 0.4.1 remains a historical recovery point, not an equivalent guard.
+Retained v3 data alone cannot prove writes performed by an older host.
+
+This block changes neither the accepted 0.21.3 migration lane nor Global Hot's
+product algorithm. Its byte guard applies to the full-prefix Continuity entry;
+the separate canonical time-window service retains its existing row budget.
+
 Checkpoint v2 still reads and proves the complete canonical prefix and stores
 full-prefix identity/fingerprint arrays. Work, memory, and checkpoint bytes
 therefore grow with total history while the physical row count remains within

@@ -1,5 +1,5 @@
 name: hermes-continuity
-version: 0.4.1
+version: 0.4.2
 manifest_version: 2
 api_version: 1
 description: Exact-source rolling continuity bridges for Hermes without owning its transcript or memory backend
@@ -27,6 +27,14 @@ config_schema:
     type: int
     default: 24000
     description: Exact canonical source budget for one bridge build
+  max_full_prefix_bytes:
+    type: int
+    default: 4194304
+    description: Maximum encoded bytes across all physical message columns before source decoding
+  max_checkpoint_bytes:
+    type: int
+    default: 1048576
+    description: Maximum stored checkpoint and prefix JSON bytes before loading or decoding
   output_token_limit:
     type: int
     default: 2048
