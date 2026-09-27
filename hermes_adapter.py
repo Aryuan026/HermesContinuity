@@ -8,6 +8,7 @@ import json
 import re
 import sqlite3
 from collections import defaultdict
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Sequence
@@ -59,6 +60,8 @@ _CANONICAL_WINDOW_FUTURE_TOLERANCE_SECONDS = 300
 _CANONICAL_WINDOW_MAX_PHYSICAL_ROWS = 2_048
 _CANONICAL_WINDOW_MAX_LINEAGE_SESSIONS = 64
 _FULL_PREFIX_MAX_PHYSICAL_ROWS = 2_048
+_FULL_PREFIX_MAX_BYTES = 4 * 1024 * 1024
+_CHECKPOINT_MAX_BYTES = 1024 * 1024
 _HUMAN_SESSION_SOURCES = frozenset(
     {
         "api_server",
@@ -636,6 +639,7 @@ class HermesSessionAdapter:
         metadata_store: "ContinuityMetadataStore | None" = None,
         *,
         max_full_prefix_physical_rows: int = _FULL_PREFIX_MAX_PHYSICAL_ROWS,
+        max_full_prefix_bytes: int = _FULL_PREFIX_MAX_BYTES,
     ) -> None:
         if (
             type(max_full_prefix_physical_rows) is not int
@@ -645,36 +649,72 @@ class HermesSessionAdapter:
         self.session_db = session_db
         self.metadata_store = metadata_store
         self.max_full_prefix_physical_rows = max_full_prefix_physical_rows
+        if type(max_full_prefix_bytes) is not int or not 1 <= max_full_prefix_bytes <= 2**31 - 1:
+            raise ValueError("max_full_prefix_bytes_invalid")
+        self.max_full_prefix_bytes = max_full_prefix_bytes
+
+    def _read_full_source_rows(self, session_id: str) -> tuple[list, list]:
+        """Probe before payload transfer, using one short host-owned snapshot.
+
+        Reuse the exact 0.20.5 host decoder and compaction winner selection.
+        No additional connection, writer, transcript store, or generation API.
+        """
+        db = self.session_db
+        with db._read_ctx() as connection:
+            old_limit = connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, min(2**31 - 1, self.max_full_prefix_bytes + 4096))
+            try:
+                connection.execute("SAVEPOINT continuity_source_budget")
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM (SELECT id FROM messages "
+                    "WHERE session_id = ? LIMIT ?)",
+                    (session_id, self.max_full_prefix_physical_rows + 1),
+                ).fetchone()[0]
+                if count > self.max_full_prefix_physical_rows:
+                    raise OverflowError("source_physical_row_limit_exceeded")
+                # All stored columns count, including API/tool/reasoning sidecars.
+                # SQL returns only sizes; no message payload crosses into Python.
+                columns = [row[1] for row in connection.execute("PRAGMA table_info(messages)")]
+                sizes = " + ".join(
+                    'coalesce(length(CAST("' + name.replace('"', '""')
+                    + '" AS BLOB)), 0)' for name in columns
+                )
+                size = connection.execute(
+                    f"SELECT coalesce(SUM({sizes}), 0) FROM messages WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()[0]
+                if size > self.max_full_prefix_bytes:
+                    raise OverflowError("source_byte_limit_exceeded")
+                rows = connection.execute(
+                    "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            except sqlite3.DataError as exc:
+                raise OverflowError("source_byte_limit_exceeded") from exc
+            finally:
+                try:
+                    connection.execute("RELEASE continuity_source_budget")
+                finally:
+                    connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, old_limit)
+        visible = [row for row in rows if row["active"] or row["compacted"]]
+        canonical = db._dedupe_compacted_message_rows(visible)
+        return db._decode_message_rows(rows), db._decode_message_rows(canonical)
 
     def read_source(self, session_id: str) -> Dict[str, Any]:
         session_id = str(session_id or "").strip()
         if not session_id:
             return _failed_source("unavailable", "session_id_invalid")
         try:
-            raw_rows = self.session_db.get_messages(
-                session_id,
-                include_inactive=True,
-                limit=self.max_full_prefix_physical_rows + 1,
-            )
-            if not isinstance(raw_rows, list):
-                raise _ProjectionError("source_view_invalid")
-            if len(raw_rows) > self.max_full_prefix_physical_rows:
-                source = _failed_source(
-                    "overflow", "source_physical_row_limit_exceeded"
-                )
-                source["stats"].update(
-                    {
-                        "physical_row_count_at_least": len(raw_rows),
-                        "max_physical_rows": self.max_full_prefix_physical_rows,
-                    }
-                )
-                return source
-            canonical_rows = self.session_db.get_messages(
-                session_id, include_compacted=True
-            )
+            raw_rows, canonical_rows = self._read_full_source_rows(session_id)
             if not isinstance(canonical_rows, list):
                 raise _ProjectionError("source_view_invalid")
             canonical = _audit_canonical_view(session_id, canonical_rows, raw_rows)
+        except OverflowError as exc:
+            source = _failed_source("overflow", str(exc))
+            source["stats"].update(
+                max_physical_rows=self.max_full_prefix_physical_rows,
+                max_source_bytes=self.max_full_prefix_bytes,
+            )
+            return source
         except _ProjectionError as exc:
             return _failed_source("ambiguous", str(exc))
         except Exception:
@@ -1643,10 +1683,13 @@ class ContinuityMetadataStore:
         }
     )
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, max_checkpoint_bytes: int = _CHECKPOINT_MAX_BYTES) -> None:
+        if type(max_checkpoint_bytes) is not int or not 1 <= max_checkpoint_bytes <= 2**31 - 1:
+            raise ValueError("max_checkpoint_bytes_invalid")
+        self.max_checkpoint_bytes = max_checkpoint_bytes
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             schema_objects = {
                 str(row[0]): str(row[1])
@@ -1754,18 +1797,17 @@ class ContinuityMetadataStore:
     def read_continuity(
         self, session_id: str, source: Mapping[str, Any]
     ) -> Dict[str, Any]:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM continuity_checkpoints WHERE session_id = ?",
-                (str(session_id),),
-            ).fetchone()
+        if source.get("status") != "ready" or source.get("scan_complete") is not True:
+            return {"status": "unavailable", "state": {}, "error": "source_unavailable"}
+        with closing(self._connect()) as connection:
+            row = self._bounded_checkpoint_row(connection, str(session_id))
         if row is None:
             return {"status": "absent", "state": {}, "error": ""}
+        if row["checkpoint_json"] is None:
+            return {"status": "unavailable", "state": {}, "error": "checkpoint_byte_limit_exceeded"}
         state = self._decode_checkpoint(row)
         if state.get("error"):
             return {"status": "unavailable", "state": {}, "error": state["error"]}
-        if source.get("status") != "ready" or source.get("scan_complete") is not True:
-            return {"status": "unavailable", "state": {}, "error": "source_unavailable"}
         groups = list(source.get("groups") or [])
         current_ids = [str(group.get("source_prefix_id") or "") for group in groups]
         stored_ids = list(state["source_prefix_ids"])
@@ -1804,6 +1846,42 @@ class ContinuityMetadataStore:
             "error": "",
         }
 
+    def _bounded_checkpoint_row(self, connection: sqlite3.Connection, session_id: str):
+        # One statement: a concurrent replacement cannot pass a stale size check.
+        size = "length(CAST(checkpoint_json AS BLOB)) + length(CAST(source_prefix_ids_json AS BLOB))"
+        # SQLite also applies this limit to an encoded row, including headers
+        # and fixed metadata. The SQL CASE remains the exact payload budget.
+        old_limit = connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, min(2**31 - 1, self.max_checkpoint_bytes + 4096))
+        try:
+            return connection.execute(
+                f"SELECT revision, source_snapshot, checkpoint_sha256, updated_at, "
+                f"CASE WHEN {size} <= :budget THEN checkpoint_json END AS checkpoint_json, "
+                f"CASE WHEN {size} <= :budget THEN source_prefix_ids_json END AS source_prefix_ids_json "
+                "FROM continuity_checkpoints WHERE session_id = :session",
+                {"budget": self.max_checkpoint_bytes, "session": session_id},
+            ).fetchone()
+        except sqlite3.DataError:
+            return {"checkpoint_json": None}
+        finally:
+            connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, old_limit)
+
+    def _checkpoint_metadata(self, connection: sqlite3.Connection, session_id: str):
+        old_limit = connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, min(2**31 - 1, self.max_checkpoint_bytes + 4096))
+        try:
+            row = connection.execute(
+                "SELECT revision, length(CAST(checkpoint_json AS BLOB)) + "
+                "length(CAST(source_prefix_ids_json AS BLOB)) AS stored_bytes "
+                "FROM continuity_checkpoints WHERE session_id = ?", (session_id,),
+            ).fetchone()
+        except sqlite3.DataError:
+            row = connection.execute(
+                "SELECT revision, NULL AS stored_bytes FROM continuity_checkpoints WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        finally:
+            connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, old_limit)
+        return dict(row) if row else {}
+
     def _checkpoint_outcome(
         self,
         connection: sqlite3.Connection,
@@ -1813,10 +1891,9 @@ class ContinuityMetadataStore:
         candidate: Mapping[str, Any],
         source: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        row = connection.execute(
-            "SELECT * FROM continuity_checkpoints WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
+        row = self._bounded_checkpoint_row(connection, session_id)
+        if row is not None and row["checkpoint_json"] is None:
+            return {"status": "failed", "error": "checkpoint_byte_limit_exceeded"}
         state = self._decode_checkpoint(row)
         if state.get("error"):
             return {"status": "failed", "error": state["error"]}
@@ -1868,6 +1945,8 @@ class ContinuityMetadataStore:
                 "status": "failed",
                 "error": "thread_continuity_checkpoint_invalid",
             }
+        if sum(len(_json_text(value).encode("utf-8")) for value in (checkpoint, candidate_ids)) > self.max_checkpoint_bytes:
+            return {"status": "failed", "error": "checkpoint_byte_limit_exceeded"}
         return {
             "status": "applied",
             "error": "",
@@ -2207,7 +2286,7 @@ class ContinuityMetadataStore:
             counts=counts,
             recorded_at=recorded_at,
         )
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             self._insert_receipt(connection, row)
         return row
 
@@ -2215,7 +2294,7 @@ class ContinuityMetadataStore:
         """Return restart-safe checkpoint/receipt health without any body."""
 
         session_id = str(session_id or "").strip()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             checkpoint_count = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM continuity_checkpoints"
@@ -2230,25 +2309,28 @@ class ContinuityMetadataStore:
             receipt_row = None
             if session_id:
                 session_id = self._code(session_id, "session_id")
-                checkpoint_row = connection.execute(
-                    "SELECT * FROM continuity_checkpoints WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
+                checkpoint_row = self._checkpoint_metadata(connection, session_id)
                 receipt_row = connection.execute(
                     """
-                    SELECT * FROM continuity_receipts
+                    SELECT status, recorded_at,
+                        CASE WHEN length(CAST(hashes_json AS BLOB)) <= 8192
+                             THEN hashes_json ELSE '{}' END AS hashes_json,
+                        CASE WHEN length(CAST(counts_json AS BLOB)) <= 8192
+                             THEN counts_json ELSE '{}' END AS counts_json
+                    FROM continuity_receipts
                     WHERE session_id = ?
                     ORDER BY recorded_at DESC, receipt_id DESC LIMIT 1
                     """,
                     (session_id,),
                 ).fetchone()
-        checkpoint = self._decode_checkpoint(checkpoint_row)
-        recent_bridge = (
-            checkpoint.get("checkpoint", {}).get("recent_bridge", {})
-            if isinstance(checkpoint.get("checkpoint"), Mapping)
-            else {}
-        )
-        receipt = self._decode_receipt(receipt_row) if receipt_row is not None else None
+        checkpoint = dict(checkpoint_row) if checkpoint_row is not None else {}
+        receipt = dict(receipt_row) if receipt_row is not None else None
+        if receipt is not None:
+            try:
+                receipt["hashes"] = json.loads(receipt.pop("hashes_json"))
+                receipt["counts"] = json.loads(receipt.pop("counts_json"))
+            except (ValueError, TypeError):
+                receipt = None
         return {
             "schema": "hermes_continuity_durable_status.v1",
             "session_filter": session_id,
@@ -2256,22 +2338,17 @@ class ContinuityMetadataStore:
             "receipt_count": receipt_count,
             "checkpoint": {
                 "status": (
-                    "ready"
-                    if checkpoint and not checkpoint.get("error")
-                    else "corrupt"
-                    if checkpoint.get("error")
+                    "byte_limit_exceeded"
+                    if checkpoint and (checkpoint["stored_bytes"] is None
+                                       or checkpoint["stored_bytes"] > self.max_checkpoint_bytes)
+                    else "stored_unvalidated"
+                    if checkpoint
                     else "absent"
                 ),
                 "revision": int(checkpoint.get("revision") or 0),
-                "source_snapshot": str(checkpoint.get("source_snapshot") or ""),
-                "source_prefix_count": len(checkpoint.get("source_prefix_ids") or []),
-                "recent_bridge_status": str(recent_bridge.get("status") or ""),
-                "recent_bridge_body_sha256": str(
-                    recent_bridge.get("body_sha256") or ""
-                ),
-                "represented_source_group_count": len(
-                    recent_bridge.get("source_group_ids") or []
-                ),
+                "stored_bytes": checkpoint.get("stored_bytes", 0),
+                "max_checkpoint_bytes": self.max_checkpoint_bytes,
+                "validation": "not_performed_by_status",
             },
             "last_delivery": (
                 {

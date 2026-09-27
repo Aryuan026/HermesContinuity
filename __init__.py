@@ -79,15 +79,21 @@ def register(ctx: Any) -> None:
     # ownership ledger in reverse order, so the service registered last below
     # becomes unreachable before runtime cleanup and SessionDB.close().
     ctx.on_unload(session_db.close)
-    if not callable(getattr(session_db, "get_messages_time_window", None)):
+    if any(not callable(getattr(session_db, name, None)) for name in (
+        "get_messages_time_window", "_read_ctx", "_decode_message_rows",
+        "_dedupe_compacted_message_rows",
+    )):
         session_db.close()
         raise RuntimeError(
             "Hermes Continuity requires "
-            "SessionDB.get_messages_time_window()"
+            "SessionDB.get_messages_time_window() and the compatible 0.20.5 reader/decoder seams"
         )
     metadata_path = plugin_data_dir / "continuity.sqlite3"
     try:
-        metadata_store = ContinuityMetadataStore(metadata_path)
+        metadata_store = ContinuityMetadataStore(
+            metadata_path,
+            max_checkpoint_bytes=ctx.get_config("max_checkpoint_bytes", default=1_048_576),
+        )
     except Exception:
         session_db.close()
         raise
@@ -97,6 +103,7 @@ def register(ctx: Any) -> None:
         max_full_prefix_physical_rows=ctx.get_config(
             "max_full_prefix_physical_rows", default=2_048
         ),
+        max_full_prefix_bytes=ctx.get_config("max_full_prefix_bytes", default=4_194_304),
     )
     canonical_source_service = ContinuityCanonicalSourceService(
         adapter,

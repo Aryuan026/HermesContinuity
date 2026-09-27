@@ -89,6 +89,31 @@
 - Runtime installation and target canary truth are intentionally owned by the
   exact external assembly receipt rather than inferred from this source tree.
 
-The current review gate is H11's ownership-acceptance correction and public
-real-host patch replay. Target installation, canary authorization, and runtime
-evidence are recorded by the external assembly rather than this source tree.
+## Block 1 complete-entry resource guard (0.4.2 source candidate)
+
+- Builds on merged 34780f0 / 0.4.1. Same-snapshot SQL row/byte probes now precede
+  full-prefix payload fetch and the existing host decoder. Source-unavailable
+  read_bundle does not open the checkpoint store.
+- Old checkpoints are byte-gated before transfer/decoding. New checkpoints use
+  the same write budget; physical delivery and publication failure remain
+  distinct. Session status reads metadata only, never checkpoint JSON.
+- Local Python 3.12 compatible-host run: 220 unittest cases, 219 passed and one
+  existing paired-host conditional skip; host overlay/middleware 42 passed plus
+  15 subtests. Eight entry-resource regressions and UTF-8 write/read boundaries
+  pass. Independent read-only diff review is complete after the write-budget
+  correction.
+- The disposable benchmark exercises actual source read, audit, compiler,
+  request/execution/post, SQLite settlement and status with synthetic transport.
+  Small history and 2,000 clones retain two-round projection/receipt readback;
+  oversized cases leave the native request unchanged. See RESOURCE_GUARD.md for
+  exact baseline, per-phase figures and evidence limits.
+- No compiler/checkpoint-v2 schema change, host patch modification, Global Hot
+  product change, deployment or observation. This is transitional protection,
+  not restoration of >2,048-row Continuity. Blocks 2/3 remain separate.
+- After external acceptance, this block's exact SHA becomes the preferred v3
+  rollback baseline; 34780f0 is retained as historical recovery only.
+
+The current review gate is Block 1 complete-entry protection and resource
+baseline. Accepted 0.21.3 work is preserved. Target installation, authorization,
+and runtime evidence remain owned by the external assembly; source tests do not
+promote this candidate to deployed or long-history-functional.
