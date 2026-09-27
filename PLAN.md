@@ -1,5 +1,15 @@
 # Plan
 
+## Active maintenance scope
+
+Real-copy compatibility maintenance is limited to the adapter's logical-clone
+and local source-evidence boundaries, based on `ee23a886...`, tested against the
+fixed Hermes 0.21.3 candidate `420791eca99856ec27168ddfd8237acb1ceb3cbb`.
+Preserve history and nonempty checkpoints; do not infer human authority from
+notification labels, clear metadata, change compiler/CAS/budgets, or deploy.
+Stop at the reviewed maintenance candidate and disposable-copy evidence.
+The accepted 0.21.0 gate below remains the public replay baseline.
+
 ## Product boundary
 
 Hermes remains the owner of canonical transcript storage, original-sentence

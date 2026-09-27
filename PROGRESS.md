@@ -1,5 +1,36 @@
 # Progress
 
+## 2026-09-27 — Real-copy source compatibility maintenance candidate
+
+- Based on `ee23a88632e5a914b619047499cf360d7044c925`; maintenance is
+  adapter-only. Compiler, checkpoint-v2 schema, CAS, transport, budgets and
+  Global Hot are unchanged. No production deployment or enablement.
+- Lost `internal_notification` display markers between otherwise matching
+  physical/lineage clones no longer invalidate the whole source. Only the
+  matching complete group becomes `unknown/conflict`; H13 remains the sole
+  positive source authority, including superseded obligations.
+- Validated compaction live-view witnesses identify physical summary wrappers,
+  not logical clone bodies. Same-row winner comparison remains exact; same-session
+  API-content digest collisions remain rejected. Cross-lineage provider sidecars
+  remain session-local under the accepted Wave 2 contract.
+- Lineage signatures now pair by visible key **and occurrence**, preserving
+  separate repeated dialogues and keeping notification conflicts group-local.
+- The fixed 0.21.3 candidate's real SessionDB/Lean adapter selection passes
+  53/53. Four new tests cover notification loss, wrapper identity and repeated
+  occurrences, including positive healthy-group controls.
+- Local host-independent suite: 223 tests, 18 expected skips. Full 0.21.3
+  integration replay was attempted with the accepted M5 test adapter, but sparse
+  staging / incomplete source transfer prevented a source-pure full run; it is
+  not Green. Do not substitute these narrower passes for full paired replay.
+- Owner-controlled work-copy evidence reads the existing nonempty checkpoint
+  exactly, continues it through synthetic CAS, and reopens it. The old plugin
+  store can decode the updated checkpoint, but its unchanged adapter still
+  hits the original source collision: this is not full old-runtime rollback
+  acceptance. Private evidence belongs to HermesPrivateAssembly's
+  `docs/evidence/Hermes-0213-Real-Copy-Rehearsal-2026-09-27.md`.
+- Earlier Wave 7/5 entries below remain historical accepted baselines, not
+  a claim that this maintenance head already passed public CI or external review.
+
 ## Current Wave 7 public replay candidate
 
 - Wave 5 Continuity is independently accepted at

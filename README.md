@@ -1,5 +1,13 @@
 # Hermes Continuity
 
+Maintenance note: the current adapter candidate preserves otherwise matching
+history when a legacy notification display marker disappears across clones;
+only that logical group loses trusted source classification. Validated physical
+compaction-wrapper witnesses do not redefine logical message identity. Repeated
+dialogues are paired by occurrence. This does not change checkpoint storage,
+budgets, or H13's positive classification authority. See `PROGRESS.md` for
+the fixed-host test and nonempty-checkpoint evidence boundaries.
+
 Hermes Continuity gives a Hermes conversation a bounded rolling bridge across
 context compression. It reads Hermes's canonical session history, builds an
 exact-source checkpoint, and inserts only the recent bridge into the current

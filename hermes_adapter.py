@@ -158,6 +158,16 @@ def _origin_evidence(
             raise _ProjectionError("message_origin_result_invalid")
         source_class = "unknown"
         proof_sha256 = ""
+    # An older physical clone can retain a notification marker that later
+    # generations lost. This grants no source class; it only withholds trust
+    # from the matching complete group, including superseded obligations.
+    notification_kinds: Dict[tuple[str, ...], set] = defaultdict(set)
+    for message in (*messages, *physical_obligations):
+        kind = message.get("display_kind")
+        if kind is None or kind == "internal_notification":
+            notification_kinds[_dedupe_key(message)].add(kind)
+    if any(len(kinds) == 2 for kinds in notification_kinds.values()):
+        source_class, status, proof_sha256 = "unknown", "conflict", ""
     return {
         "source_class": source_class,
         "origin_status": status,
@@ -222,10 +232,17 @@ def _signature(
     *,
     lifecycle: bool,
     ignore_origin: bool = False,
+    notification_compatible: bool = False,
 ) -> str:
     omitted = {"id"} if lifecycle else {"id", "active", "compacted"}
+    if not lifecycle:
+        # Validated host witness names a physical summary wrapper, not the
+        # restored live message. The same winning row is still checked exactly.
+        omitted.add("_continuity_compaction_live_view")
     if ignore_origin:
         omitted.update({"origin_proof", "_origin_proof"})
+    if notification_compatible and row.get("display_kind") in (None, "internal_notification"):
+        omitted.add("display_kind")
     return _json_text(
         {str(key): value for key, value in row.items() if str(key) not in omitted}
     )
@@ -254,6 +271,14 @@ def _audit_canonical_view(
     if not all(isinstance(row, Mapping) for row in (*canonical_rows, *raw_rows)):
         raise _ProjectionError("source_row_invalid")
     for row in (*canonical_rows, *raw_rows):
+        if "_continuity_compaction_live_view" in row:
+            witness = row["_continuity_compaction_live_view"]
+            if (row.get("role") not in {"user", "assistant"} or not isinstance(witness, Mapping)
+                or set(witness) != {"schema", "carrier_sha256"}
+                or witness.get("schema") != "hermes.compaction_live_view.v1"
+                or not isinstance(witness.get("carrier_sha256"), str)
+                or not _SHA256_RE.fullmatch(witness["carrier_sha256"])):
+                raise _ProjectionError("compaction_live_view_invalid")
         if row.get("active") not in {0, 1, False, True} or row.get("compacted") not in {
             0,
             1,
@@ -309,9 +334,10 @@ def _audit_canonical_view(
                 winner,
                 lifecycle=False,
                 ignore_origin=True,
+                notification_compatible=True,
             )
             if any(
-                _signature(row, lifecycle=False, ignore_origin=True)
+                _signature(row, lifecycle=False, ignore_origin=True, notification_compatible=True)
                 != clone_signature
                 for row in entries
             ):
@@ -449,7 +475,7 @@ def _failed_source(status: str, error: str) -> Dict[str, Any]:
     }
 
 
-def _lineage_row_signature(row: Mapping[str, Any]) -> str:
+def _lineage_row_signature(row: Mapping[str, Any], *, notification_compatible: bool = False) -> str:
     """Compare decoded persisted clone fields without physical ownership."""
 
     omitted = {
@@ -460,6 +486,8 @@ def _lineage_row_signature(row: Mapping[str, Any]) -> str:
         "origin_proof",
         "_origin_proof",
     }
+    if notification_compatible and row.get("display_kind") in (None, "internal_notification"):
+        omitted.add("display_kind")
     return _json_text(
         {
             str(key): value
@@ -661,6 +689,10 @@ def _project_canonical_source(
                     "persisted_signature": _sha256(
                         [_lineage_row_signature(message) for message in persisted_rows]
                     ),
+                    "notification_compatible_signature": _sha256([
+                        _lineage_row_signature(message, notification_compatible=True)
+                        for message in persisted_rows
+                    ]),
                     "source_evidence": evidence,
                 }
             )
@@ -880,7 +912,7 @@ class HermesSessionAdapter:
             return _failed_source("ambiguous", "recent_lineage_request_invalid")
 
         groups: List[Dict[str, Any]] = []
-        signatures: Dict[str, str] = {}
+        signatures: Dict[tuple[str, int], tuple[str, str]] = {}
         selected_evidence: List[Dict[str, str]] = []
         selected_occurrences: Dict[tuple[str, int], int] = {}
         prior_counts: Dict[str, int] = defaultdict(int)
@@ -920,21 +952,27 @@ class HermesSessionAdapter:
                     return _failed_source("ambiguous", "recent_lineage_proof_invalid")
                 visible_key = str(proof.get("visible_key") or "")
                 persisted_signature = str(proof.get("persisted_signature") or "")
+                compatible_signature = str(proof.get("notification_compatible_signature") or "")
                 evidence = proof.get("source_evidence")
                 if (
                     not _SHA256_RE.fullmatch(visible_key)
                     or not _SHA256_RE.fullmatch(persisted_signature)
+                    or not _SHA256_RE.fullmatch(compatible_signature)
                     or not _valid_origin_evidence(evidence)
                 ):
                     return _failed_source("ambiguous", "recent_lineage_proof_invalid")
-                known_signature = signatures.get(visible_key)
-                if known_signature is not None and known_signature != persisted_signature:
-                    return _failed_source("ambiguous", "lineage_clone_sidecar_collision")
-                signatures[visible_key] = persisted_signature
                 occurrence = session_counts[visible_key]
                 session_counts[visible_key] += 1
+                occurrence_key = (visible_key, occurrence)
+                known_signature = signatures.get(occurrence_key)
+                notification_conflict = False
+                if known_signature is not None and known_signature[0] != persisted_signature:
+                    if known_signature[1] != compatible_signature:
+                        return _failed_source("ambiguous", "lineage_clone_sidecar_collision")
+                    notification_conflict = True
+                signatures[occurrence_key] = (persisted_signature, compatible_signature)
                 if occurrence < prior_counts[visible_key]:
-                    selected_index = selected_occurrences.get((visible_key, occurrence))
+                    selected_index = selected_occurrences.get(occurrence_key)
                     if selected_index is None:
                         return _failed_source(
                             "ambiguous", "recent_lineage_proof_invalid"
@@ -942,8 +980,13 @@ class HermesSessionAdapter:
                     selected_evidence[selected_index] = _merge_origin_evidence(
                         selected_evidence[selected_index], evidence
                     )
+                    if notification_conflict:
+                        selected_evidence[selected_index] = {
+                            "source_class": "unknown", "origin_status": "conflict",
+                            "origin_proof_sha256": "",
+                        }
                     continue
-                selected_occurrences[(visible_key, occurrence)] = len(groups)
+                selected_occurrences[occurrence_key] = len(groups)
                 groups.append(dict(group))
                 selected_evidence.append(dict(evidence))
                 if len(groups) > max_groups:

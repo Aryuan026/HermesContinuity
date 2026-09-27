@@ -206,6 +206,41 @@ def checkpoint(source: dict, previous: dict | None = None) -> dict:
 
 
 class HermesSourceProjectionTests(unittest.TestCase):
+    def test_live_wrapper_proof_is_physical_not_logical_clone_identity(self):
+        old = row(1, "user", "live ask", 100.0, active=0, compacted=1)
+        live = {**old, "id": 2, "active": 1, "compacted": 0,
+                "_continuity_compaction_live_view": {
+                    "schema": "hermes.compaction_live_view.v1", "carrier_sha256": "a" * 64}}
+        self.assertEqual(hermes_adapter._audit_canonical_view(
+            "session-1", [live], [old, live]), [live])
+        second = {**old, "_continuity_compaction_live_view": {
+            "schema": "hermes.compaction_live_view.v1", "carrier_sha256": "b" * 64}}
+        self.assertEqual(hermes_adapter._audit_canonical_view(
+            "session-1", [live], [second, live]), [live])
+        changed = {**live, "_continuity_compaction_live_view": second["_continuity_compaction_live_view"]}
+        with self.assertRaisesRegex(ValueError, "canonical_view_winner_mismatch"):
+            hermes_adapter._audit_canonical_view("session-1", [changed], [old, live])
+        with self.assertRaisesRegex(ValueError, "canonical_clone_sidecar_collision"):
+            hermes_adapter._audit_canonical_view("session-1", [live],
+                [{**old, "_continuity_api_content_sha256": "c" * 64}, live])
+        malformed = {**live, "_continuity_compaction_live_view": {"schema": "bad"}}
+        with self.assertRaisesRegex(ValueError, "compaction_live_view_invalid"):
+            hermes_adapter._audit_canonical_view("session-1", [malformed], [old, malformed])
+
+    def test_notification_clone_kind_loss_preserves_full_source_and_checkpoint(self):
+        original = dialogue_rows(1, 100.0, "notification")
+        original[0]["display_kind"] = "internal_notification"
+        baseline = HermesSessionAdapter(FakeSessionDB(original)).read_source("session-1")
+        candidate = checkpoint(baseline)
+        archived = [{**item, "active": 0, "compacted": 1} for item in original]
+        live = [{**item, "id": item["id"] + 2, "display_kind": None} for item in original]
+        source = HermesSessionAdapter(FakeSessionDB([*archived, *live])).read_source("session-1")
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(source["groups"], baseline["groups"])
+        self.assertEqual(source["source_snapshot"], baseline["source_snapshot"])
+        self.assertEqual(context_compactor.normalize_thread_continuity_checkpoint(
+            candidate, source_groups=source["groups"]), candidate)
+
     def test_winning_row_origin_rewrite_between_views_fails_closed(self) -> None:
         human = build_message_origin_proof(CLI_USER)
         scheduled = build_message_origin_proof(CRON_AGENT)
@@ -694,6 +729,32 @@ class FakeBoundedWindowDB:
 
 
 class RecentLineageSourceTests(unittest.TestCase):
+    def test_repeated_visible_groups_keep_occurrence_local_signatures(self):
+        human = build_message_origin_proof(CLI_USER)
+        original = [
+            row(1, "user", "q", 99.0, tool_name="u1", origin_proof=human),
+            row(2, "assistant", "a", 100.0, tool_name="a1", origin_proof=human),
+            row(3, "user", "q", 98.0, tool_name="u2", origin_proof=human),
+            row(4, "assistant", "a", 100.0, tool_name="a2", origin_proof=human),
+        ]
+        for item in original:
+            item["session_id"] = "root"
+        for notification_loss in (False, True):
+            with self.subTest(notification_loss=notification_loss):
+                root = copy.deepcopy(original)
+                if notification_loss:
+                    root[0]["display_kind"] = "internal_notification"
+                tip = [{**item, "id": item["id"] + 10, "session_id": "tip",
+                        "display_kind": None} for item in original]
+                source = HermesSessionAdapter(FakeBoundedWindowDB(
+                    {"root": root, "tip": tip})).read_recent_lineage_source(
+                    ["root", "tip"], start_timestamp=90, end_timestamp=110,
+                    max_physical_rows=10, max_groups=10)
+                self.assertEqual(source["status"], "ready")
+                self.assertEqual(len(source["groups"]), 2)
+                self.assertEqual([p["origin_status"] for p in source["_group_source_evidence"]],
+                    ["conflict" if notification_loss else "verified", "verified"])
+
     def test_h13_classifies_whole_groups_without_session_or_display_inference(self) -> None:
         human = build_message_origin_proof(CLI_USER)
         scheduled = build_message_origin_proof(CRON_AGENT)
@@ -873,6 +934,38 @@ class RecentLineageSourceTests(unittest.TestCase):
             [proof["origin_status"] for proof in source["_group_source_evidence"]],
             ["conflict", "verified"],
         )
+
+    def test_notification_kind_loss_is_local_across_physical_and_lineage_clones(self):
+        human = build_message_origin_proof(CLI_USER)
+        for separate_session in (False, True):
+            for active, compacted in ((0, 1), (0, 0)):
+                with self.subTest(lineage=separate_session, active=active, compacted=compacted):
+                    original = dialogue_rows(1, 100.0, "notice")
+                    for item in original:
+                        item.update(session_id="root", active=active, compacted=compacted,
+                                    origin_proof=human)
+                    original[0]["display_kind"] = "internal_notification"
+                    # Separate lineage readers intentionally ignore wholly superseded
+                    # rows; that case is tested inside one physical session instead.
+                    if separate_session and not compacted:
+                        continue
+                    tip = "tip" if separate_session else "root"
+                    live = [{**item, "id": item["id"]+10, "session_id": tip,
+                             "active": 1, "compacted": 0, "display_kind": None}
+                            for item in original]
+                    good = dialogue_rows(20, 200.0, "human")
+                    for item in good:item.update(session_id=tip, origin_proof=human)
+                    db = FakeBoundedWindowDB({"root": original, "tip": [*live, *good]}
+                        if separate_session else {"root": [*original, *live, *good]})
+                    source = HermesSessionAdapter(db).read_recent_lineage_source(
+                        ["root", "tip"] if separate_session else ["root"],
+                        start_timestamp=90.0, end_timestamp=300.0,
+                        max_physical_rows=16, max_groups=8)
+                    self.assertEqual(source["status"], "ready")
+                    self.assertEqual([p["source_class"] for p in source["_group_source_evidence"]],
+                                     ["unknown", "human"])
+                    self.assertEqual([p["origin_status"] for p in source["_group_source_evidence"]],
+                                     ["conflict", "verified"])
 
     def test_cross_lineage_origin_conflict_is_local_to_the_cloned_group(self) -> None:
         human = build_message_origin_proof(CLI_USER)
