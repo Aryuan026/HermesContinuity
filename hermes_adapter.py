@@ -58,6 +58,7 @@ _CANONICAL_WINDOW_SOURCE_CLASSES = frozenset(
 _CANONICAL_WINDOW_FUTURE_TOLERANCE_SECONDS = 300
 _CANONICAL_WINDOW_MAX_PHYSICAL_ROWS = 2_048
 _CANONICAL_WINDOW_MAX_LINEAGE_SESSIONS = 64
+_FULL_PREFIX_MAX_PHYSICAL_ROWS = 2_048
 _HUMAN_SESSION_SOURCES = frozenset(
     {
         "api_server",
@@ -633,22 +634,45 @@ class HermesSessionAdapter:
         self,
         session_db: Any,
         metadata_store: "ContinuityMetadataStore | None" = None,
+        *,
+        max_full_prefix_physical_rows: int = _FULL_PREFIX_MAX_PHYSICAL_ROWS,
     ) -> None:
+        if (
+            type(max_full_prefix_physical_rows) is not int
+            or max_full_prefix_physical_rows < 1
+        ):
+            raise ValueError("max_full_prefix_physical_rows_invalid")
         self.session_db = session_db
         self.metadata_store = metadata_store
+        self.max_full_prefix_physical_rows = max_full_prefix_physical_rows
 
     def read_source(self, session_id: str) -> Dict[str, Any]:
         session_id = str(session_id or "").strip()
         if not session_id:
             return _failed_source("unavailable", "session_id_invalid")
         try:
+            raw_rows = self.session_db.get_messages(
+                session_id,
+                include_inactive=True,
+                limit=self.max_full_prefix_physical_rows + 1,
+            )
+            if not isinstance(raw_rows, list):
+                raise _ProjectionError("source_view_invalid")
+            if len(raw_rows) > self.max_full_prefix_physical_rows:
+                source = _failed_source(
+                    "overflow", "source_physical_row_limit_exceeded"
+                )
+                source["stats"].update(
+                    {
+                        "physical_row_count_at_least": len(raw_rows),
+                        "max_physical_rows": self.max_full_prefix_physical_rows,
+                    }
+                )
+                return source
             canonical_rows = self.session_db.get_messages(
                 session_id, include_compacted=True
             )
-            raw_rows = self.session_db.get_messages(
-                session_id, include_inactive=True
-            )
-            if not isinstance(canonical_rows, list) or not isinstance(raw_rows, list):
+            if not isinstance(canonical_rows, list):
                 raise _ProjectionError("source_view_invalid")
             canonical = _audit_canonical_view(session_id, canonical_rows, raw_rows)
         except _ProjectionError as exc:

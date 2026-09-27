@@ -23,7 +23,9 @@ and retrievable through Hermes `state.db` and native `session_search`.
 
 For each supported request, the plugin:
 
-1. reads the canonical `SessionDB` view through a read-only handle;
+1. probes the physical session size through a bounded read-only `SessionDB`
+   query, then reads the canonical view only when that full-prefix audit fits
+   inside the configured row budget;
 2. compiles a bounded checkpoint and recent bridge;
 3. projects that bridge into the current real user carrier;
 4. accepts only a host-resolved context window with explicit provenance,
@@ -47,6 +49,12 @@ transcript sentences. Delivery receipts and public traces contain only IDs,
 hashes, counts, status, and timestamps. Ambiguous clone history, source
 rewrites, unsupported carriers, and incomplete scans fail closed to the
 unchanged Hermes request.
+
+`max_full_prefix_physical_rows` defaults to 2,048. A session with more
+physical rows is left on Hermes's native request path before Continuity asks
+`SessionDB` to decode the complete compacted history. This is a latency and
+memory guard, not a replacement for the compact prefix-proof design required
+to provide Continuity bridges for arbitrarily long sessions.
 
 The metadata file is claimed by one plugin owner before any Continuity table is
 created. Registration/store initialization rejects Hermes canonical tables,

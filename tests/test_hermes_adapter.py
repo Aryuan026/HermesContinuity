@@ -99,16 +99,21 @@ class FakeSessionDB:
         session_id: str,
         include_inactive: bool = False,
         include_compacted: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict]:
         self.calls.append(
             {
                 "session_id": session_id,
                 "include_inactive": include_inactive,
                 "include_compacted": include_compacted,
+                "limit": limit,
+                "offset": offset,
             }
         )
         if include_inactive:
-            return copy.deepcopy(self.rows)
+            stop = None if limit is None else offset + limit
+            return copy.deepcopy(self.rows[offset:stop])
         if include_compacted:
             relevant = [
                 message
@@ -124,8 +129,11 @@ class FakeSessionDB:
                     current["id"],
                 ):
                     winners[key] = message
-            return copy.deepcopy(sorted(winners.values(), key=lambda message: message["id"]))
-        return copy.deepcopy([message for message in self.rows if message["active"] == 1])
+            rows = sorted(winners.values(), key=lambda message: message["id"])
+        else:
+            rows = [message for message in self.rows if message["active"] == 1]
+        stop = None if limit is None else offset + limit
+        return copy.deepcopy(rows[offset:stop])
 
 
 def dialogue_rows(start_id: int, timestamp: float, text: str) -> list[dict]:
@@ -159,6 +167,45 @@ def checkpoint(source: dict, previous: dict | None = None) -> dict:
 
 
 class HermesSourceProjectionTests(unittest.TestCase):
+    def test_full_prefix_overflow_stops_before_unbounded_canonical_read(self) -> None:
+        session_db = FakeSessionDB(
+            dialogue_rows(1, 100.0, "first")
+            + [row(3, "user", "overflow", 200.0)]
+        )
+        source = HermesSessionAdapter(
+            session_db,
+            max_full_prefix_physical_rows=2,
+        ).read_source("session-1")
+
+        self.assertEqual(source["status"], "overflow")
+        self.assertFalse(source["scan_complete"])
+        self.assertEqual(source["error"], "source_physical_row_limit_exceeded")
+        self.assertEqual(source["stats"]["physical_row_count_at_least"], 3)
+        self.assertEqual(source["stats"]["max_physical_rows"], 2)
+        self.assertEqual(
+            session_db.calls,
+            [
+                {
+                    "session_id": "session-1",
+                    "include_inactive": True,
+                    "include_compacted": False,
+                    "limit": 3,
+                    "offset": 0,
+                }
+            ],
+        )
+
+    def test_full_prefix_row_limit_must_be_positive_integer(self) -> None:
+        for value in (0, -1, True, 1.5, "2048"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "max_full_prefix_physical_rows_invalid"
+                ):
+                    HermesSessionAdapter(
+                        FakeSessionDB([]),
+                        max_full_prefix_physical_rows=value,
+                    )
+
     def test_same_text_with_distinct_timestamps_remains_distinct(self) -> None:
         rows = dialogue_rows(1, 100.0, "same") + dialogue_rows(3, 200.0, "same")
         source = HermesSessionAdapter(FakeSessionDB(rows)).read_source("session-1")
@@ -521,9 +568,16 @@ class HermesSourceProjectionTests(unittest.TestCase):
 
     def test_unexplained_canonical_view_or_multiple_active_rows_is_ambiguous(self) -> None:
         class MissingCanonical(FakeSessionDB):
-            def get_messages(self, session_id: str, include_inactive: bool = False,
-                             include_compacted: bool = False) -> list[dict]:
-                rows = super().get_messages(session_id, include_inactive, include_compacted)
+            def get_messages(
+                self,
+                session_id: str,
+                include_inactive: bool = False,
+                include_compacted: bool = False,
+                **kwargs,
+            ) -> list[dict]:
+                rows = super().get_messages(
+                    session_id, include_inactive, include_compacted, **kwargs
+                )
                 return [] if include_compacted else rows
 
         missing = HermesSessionAdapter(

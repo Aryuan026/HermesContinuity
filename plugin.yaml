@@ -1,5 +1,5 @@
 name: hermes-continuity
-version: 0.4.0
+version: 0.4.1
 manifest_version: 2
 api_version: 1
 description: Exact-source rolling continuity bridges for Hermes without owning its transcript or memory backend
@@ -19,6 +19,10 @@ config_schema:
     type: int
     default: 72
     description: Maximum age represented in the visible recent bridge
+  max_full_prefix_physical_rows:
+    type: int
+    default: 2048
+    description: Maximum physical rows scanned before full-prefix continuity leaves the native Hermes request unchanged
   source_token_limit:
     type: int
     default: 24000
