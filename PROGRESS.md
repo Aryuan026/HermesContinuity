@@ -113,7 +113,23 @@
 - After external acceptance, this block's exact SHA becomes the preferred v3
   rollback baseline; 34780f0 is retained as historical recovery only.
 
-The current review gate is Block 1 complete-entry protection and resource
-baseline. Accepted 0.21.3 work is preserved. Target installation, authorization,
-and runtime evidence remain owned by the external assembly; source tests do not
-promote this candidate to deployed or long-history-functional.
+## Block 1 accepted / Block 2 protocol review
+
+- Owner external review accepts Block 1 at
+  `1d6f502f2c21636d9f75b31fcc46f109c3bfece6`, tree
+  `cd27dc86cf53347c94946388025820a97ab620e7`. CI-P2-01 is closed; the successor
+  only adds explicit Bash/pipefail to the resource benchmark step.
+- Review readback of Actions `36329604375`: both Python lanes pass 42 host
+  tests plus 15 subtests, 219 plugin tests plus one existing conditional skip,
+  and all seven disposable benchmark cases. These are prior exact-head CI
+  evidence, not a new full-suite execution in this docs-only block.
+- This accepted SHA is the preferred future v3 **source** rollback baseline.
+  PR #3 acceptance does not itself merge, install, deploy or change Assembly pins.
+- Block 2 source inspection and its candidate protocol are in
+  [LONG_HISTORY_PROTOCOL.md](LONG_HISTORY_PROTOCOL.md). The proposal selects
+  conditional storage with per-use source validation, body-free incremental
+  preparation and compact v3 proofs. Protocol/concurrency tests remain required
+  implementation evidence, not claimed results of this specification.
+- Only documentation changes in this block. Block 3 remains unopened pending
+  protocol review. Accepted 0.21.3 work, Global Hot and all production code stay
+  unchanged; no host upgrade, real database access or server operation occurred.
