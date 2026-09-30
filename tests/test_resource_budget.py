@@ -1,11 +1,92 @@
 import importlib.util
+import asyncio
 from pathlib import Path
 import sys
+import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 
 class ResourceBudgetTests(unittest.TestCase):
+    def test_compile_unwind_releases_only_its_own_admission(self):
+        from test_runtime import runtime_module, ContinuityRuntime, FakeAdapter, FakeLlm, request
+        budget = runtime_module.ACTIVE_WORKSETS
+        other = object()
+        self.assertTrue(budget.acquire(other, 8*1024*1024))
+        try:
+            for error in (asyncio.CancelledError(), ValueError("compile failed")):
+                adapter = FakeAdapter({})
+                adapter.history_index = SimpleNamespace()
+                runtime = ContinuityRuntime(adapter, FakeLlm())
+                async def cancelled_compile():
+                    await asyncio.sleep(0)
+                    raise error
+                def compile_plan(*args, **kwargs):
+                    return asyncio.run(cancelled_compile())
+                try:
+                    with patch.object(runtime, "_compile_plan", side_effect=compile_plan):
+                        with self.assertRaises(type(error)):
+                            runtime._plan_for_request(request(), session_id="s", turn_id="t",
+                                model="m", provider="p", base_url="", context_window_tokens=10000,
+                                context_window_source="test", context_window_confidence="exact")
+                    self.assertEqual(runtime._turns, {})
+                    self.assertEqual(runtime._compiling, set())
+                    self.assertNotIn(runtime._budget_key(("s", "t")), budget._leases)
+                finally:
+                    runtime.clear()
+                    budget.release(runtime._budget_key(("s", "t")))
+            self.assertEqual(budget._leases[other], 8*1024*1024)
+            replacement = ContinuityRuntime(adapter, FakeLlm())
+            plan = runtime_module._TurnPlan("", workset_bytes=1)
+            try:
+                with patch.object(replacement, "_compile_plan", return_value=plan):
+                    result = replacement._plan_for_request(request(), session_id="s", turn_id="t",
+                        model="m", provider="p", base_url="", context_window_tokens=10000,
+                        context_window_source="test", context_window_confidence="exact")
+                self.assertIs(result, plan)
+                self.assertIn(replacement._budget_key(("s", "t")), budget._leases)
+            finally:
+                replacement.clear()
+            self.assertEqual(budget._leases[other], 8*1024*1024)
+        finally:
+            budget.release(other)
+
+    def test_clear_during_compile_retains_lease_until_worker_unwinds(self):
+        from test_runtime import runtime_module, ContinuityRuntime, FakeAdapter, FakeLlm, request
+        adapter = FakeAdapter({})
+        adapter.history_index = SimpleNamespace()
+        runtime = ContinuityRuntime(adapter, FakeLlm())
+        entered, finish = threading.Event(), threading.Event()
+        results = []
+        def compile_plan(*args, **kwargs):
+            entered.set()
+            self.assertTrue(finish.wait(5))
+            return runtime_module._TurnPlan("", workset_bytes=1)
+        def run():
+            results.append(runtime._plan_for_request(request(), session_id="s", turn_id="t",
+                model="m", provider="p", base_url="", context_window_tokens=10000,
+                context_window_source="test", context_window_confidence="exact"))
+        worker = threading.Thread(target=run)
+        key = runtime._budget_key(("s", "t"))
+        try:
+            with patch.object(runtime, "_compile_plan", side_effect=compile_plan):
+                worker.start()
+                self.assertTrue(entered.wait(5))
+                runtime.clear()
+                self.assertIn(key, runtime_module.ACTIVE_WORKSETS._leases)
+                finish.set()
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+            self.assertEqual(results[0].reason, "runtime_unloaded")
+            self.assertNotIn(key, runtime_module.ACTIVE_WORKSETS._leases)
+            self.assertEqual(runtime._turns, {})
+        finally:
+            finish.set()
+            worker.join(5)
+            runtime.clear()
+            runtime_module.ACTIVE_WORKSETS.release(key)
+
     def test_v3_checkpoint_budget_cannot_outgrow_pre_read_reservation(self):
         from test_checkpoint_store_v3 import checkpoint_store_v3
         from types import SimpleNamespace

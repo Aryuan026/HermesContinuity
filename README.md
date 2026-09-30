@@ -60,7 +60,9 @@ to provide Continuity bridges for arbitrarily long sessions.
 
 The additive `hermes-0.20.5-incremental-history.patch` enables body-free host
 change capture/canonical indexing and compact checkpoint v3. It applies after
-the original twelve patches; those artifacts are unchanged. Without it the
+the original twelve patches, followed by `hermes-0.20.5-history-value-guard.patch`
+to bound SQLite value materialization during probes and reads. The original
+thirteen artifacts are unchanged. Without the indexed host seam the
 accepted Block 1/v2 protection remains active.
 
 One background worker validates history in finite pages without calling a

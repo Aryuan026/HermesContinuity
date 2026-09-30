@@ -18,7 +18,8 @@ is implied by this document.
 - stop_condition: reproducible source/PR candidate for implementation review.
 
 The host is the existing compatibility lane: upstream `fcbd1076` plus the
-unchanged twelve patches, followed by `hermes-0.20.5-incremental-history.patch`.
+unchanged twelve patches, followed by `hermes-0.20.5-incremental-history.patch`
+and `hermes-0.20.5-history-value-guard.patch`.
 Do not apply it to a different upstream tree by assuming matching filenames.
 
 | Owner | Implementation / responsibility |
@@ -128,7 +129,60 @@ separate process. Provider and transport are synthetic. Each subprocess has an
 external timeout; Linux also applies a 1 GiB address-space limit. CI reruns the
 same script and uploads its structured results with Bash pipefail enabled.
 
-## Rollback
+## Block 3 review correction: value probes and cancelled compilation
+
+External review held candidate `2cfb512c` for a SQLite native-allocation P1
+and a cancelled-compiler admission P2. The correction retains the accepted
+protocol and original thirteen patch bytes; patch 14 is additive. Its host is
+`a488b6ebf46765a7323bb3e862bcbb77bccbd172`, tree
+`fa9a9030295b769c0e391ca860e3ebe1cd1e3b46`.
+
+Both the physical size probe and foreground page read apply a temporary
+`SQLITE_LIMIT_LENGTH` before touching message values. The limit respects a
+stricter borrowed limit, includes 4,096 bytes for row encoding, and is restored
+on every exit. Oversized SQLite values return the existing typed row-overflow
+state without decoding. Foreground reads use a savepoint, preserving an outer
+transaction on success and failure.
+
+Compilation owns its admission until the plan is installed under the runtime
+lock. A `finally` releases untransferred admission on cancellation, ordinary
+exceptions and unload. In-flight compilation retains its reservation during
+`clear()` until it unwinds; other profiles' leases are untouched. Cancellation
+continues to propagate. The P2 was an admission-ledger leak, not evidence of
+8 MiB of permanently retained transcript per cancellation.
+
+Local Python 3.12.13 verification: host history **42/42**, plugin **296 total /
+295 pass / one existing paired-Global-Hot skip**. A real async summary cancels
+through AIAgent/discovery, leaves no installed plan or lease, then actual
+manager unload/reload permits normal projection, settlement and next-turn
+reuse. A separate four-cancellation test preserves another profile's lease;
+normal/exception and compile-in-progress unload controls pass. These use
+synthetic provider/transport, not gateway `/stop` or real channel traffic.
+
+`tests/benchmark_history_value_guard.py` runs setup and measurement in separate
+processes with a 45s external deadline. It calls the actual SessionDB probe,
+preparation and recovery read. Local native-inclusive high-water measurements:
+
+| Stored API field | Prior patch-13 probe delta, KiB | Corrected probe + preparation delta, KiB | Result |
+|---|---:|---:|---|
+| 1 MiB | not measured | 23,280 | Ready, original bounded body retained |
+| 16 MiB | 16,672 | 336 | Overflow before decode; small session recovers |
+| 64 MiB | 65,792 | 336 | Overflow before decode; small session recovers |
+
+Prior-source controls load the exact `60a36dda` history module and invoke its
+actual probe; their measurement stops before preparation. Corrected oversized
+process peaks are about 38 MiB, not 336 KiB. The positive 1 MiB case peaks near
+61 MiB: encoded budgets do not guarantee an RSS ceiling. No real DB or server
+incident is reproduced here. CI runs the corrected checks on Python 3.11/3.12
+and uploads JSON, with explicit Bash pipefail.
+
+Retained scale checks **5/5** still produce a 48-row foreground workset,
+two projections/two receipts and one summary at 4,800 canonical rows and
+20,000 clones. Original twelve-patch resource checks **7/7** remain passing.
+These local results await public CI and external re-review; Block 3 remains
+an implementation candidate. Preferred source rollback remains `1d6f502f`.
+
+## Rollback procedure
 
 1. Stop accepting new work and unload the plugin worker before handing writers
    to old code; preserve the canonical database, including candidate-window data.
@@ -152,7 +206,7 @@ grant a restored derived index a fresh proof.
 | Assembly axis | Candidate change |
 |---|---|
 | Source / overlay | Yes: plugin v3 and additive host patch; not a selected runtime pin |
-| Artifact | Yes: thirteenth patch and source PR, digest recorded in PROVENANCE |
+| Artifact | Yes: thirteenth patch plus additive value-guard correction and source PR, digests recorded in PROVENANCE |
 | Runtime dependency | No: standard library and existing compatible Hermes |
 | Managed paths / preservation | Yes: additional derived tables inside existing profile-owned databases; v2/raw data retained |
 | Persistent units | No |

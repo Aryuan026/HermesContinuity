@@ -6,6 +6,8 @@ does not call Continuity request/execution/post hooks or settlement helpers.
 
 from __future__ import annotations
 
+import asyncio
+import importlib
 import os
 import re
 import sqlite3
@@ -309,6 +311,29 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             }
             self.assertEqual(loaded["hermes-continuity"]["error"], None)
             self.assertTrue(loaded["hermes-continuity"]["enabled"])
+            self._prepare_index()
+
+            cancelled_agent = self._agent()
+            self.agents.append(cancelled_agent)
+            cancelled_agent._interruptible_streaming_api_call = provider
+            manager = plugins.get_plugin_manager()
+            runtime = next(callback.__self__ for callback in manager._middleware["llm_request"]
+                           if type(getattr(callback, "__self__", None)).__name__ == "ContinuityRuntime")
+            budget = importlib.import_module(runtime.__module__).ACTIVE_WORKSETS
+            async def cancelled_summary(*args, **kwargs):
+                asyncio.current_task().cancel()
+                await asyncio.sleep(0)
+            with patch("agent.plugin_llm.PluginLlm.acomplete", new=cancelled_summary):
+                with self.assertRaises(asyncio.CancelledError):
+                    cancelled_agent.run_conversation("Cancelled long-history summary",
+                        conversation_history=[], task_id="cancelled-summary")
+            self.assertEqual(provider_bodies, [])
+            self.assertEqual(runtime._turns, {})
+            self.assertEqual(runtime._compiling, set())
+            self.assertFalse(any(key[0] is runtime._budget_identity for key in budget._leases))
+            plugins._reset_plugin_managers_for_tests()
+            hermes_config._config_cache = None
+            plugins.discover_plugins()
             self._prepare_index()
 
             first_agent = self._agent()

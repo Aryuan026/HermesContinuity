@@ -173,3 +173,25 @@
   Global Hot change, 0.21.3/0.21.5 rewrite, target installation, merge, real data
   access, deployment or observation has occurred. Assembly selected pins remain
   unchanged. External implementation review is still required.
+
+## Block 3 external-review correction candidate
+
+- External review held `2cfb512c` for two confirmed defects: SQLite may
+  materialize a large value during the size probe; cancelled compilation
+  retained process-wide workset admission before plan installation.
+- Shared SQLite value guards cover preparation probes and foreground reads,
+  with typed overflow and borrowed limit/transaction restoration. The exported
+  host correction is patch 14, at `a488b6ebf46765a7323bb3e862bcbb77bccbd172`;
+  original thirteen artifacts remain unchanged. Runtime admission now has a
+  compile-owned `finally` until successful plan transfer; cancellation still
+  propagates and other profile leases remain intact.
+- Local Python 3.12: host 42/42; plugin 296 total, 295 pass, one existing paired
+  skip; scale 5/5 and original resource benchmark 7/7. Actual-host native value
+  benchmark 3/3, with external process deadlines. Real async summary
+  cancellation plus manager unload/reload preserves the positive AIAgent
+  projection/settlement/reuse path with a synthetic provider.
+- Full measurements, prior-source controls and limitations are in
+  LONG_HISTORY_IMPLEMENTATION.md. CI now executes and uploads the native
+  benchmark on both declared Python versions, using Bash pipefail.
+- Next checkpoint is external correction review of PR #5. No merge, target
+  mutation, real-data access or promotion to accepted/deployed status.

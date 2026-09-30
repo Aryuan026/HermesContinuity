@@ -854,6 +854,7 @@ class ContinuityRuntime:
                 with self._lock:
                     self._compiling.discard(turn_key)
                 return _TurnPlan(current_sha, reason="workset_capacity_exceeded")
+        transferred = False
         try:
             plan = self._compile_plan(
                 request,
@@ -873,32 +874,28 @@ class ContinuityRuntime:
             if indexed:
                 plan.workset_bytes += plan.serialized_bytes()
             plan.created_at = self.monotonic()
-        except Exception:
-            if indexed:
-                ACTIVE_WORKSETS.release(self._budget_key(turn_key))
-            raise
+            with self._lock:
+                if self._closed:
+                    return _TurnPlan(current_sha, reason="runtime_unloaded")
+                if indexed:
+                    if plan.workset_bytes > 8*1024*1024:
+                        return _TurnPlan(current_sha, reason="workset_byte_limit_exceeded")
+                    ACTIVE_WORKSETS.acquire(self._budget_key(turn_key), plan.workset_bytes)
+                self._turns[turn_key] = plan
+                self._turns.move_to_end(turn_key)
+                if not self._trim_locked(protected_turns=(turn_key,)):
+                    if self._turns.get(turn_key) is plan:
+                        self._turns.pop(turn_key, None)
+                    return _TurnPlan(current_sha, reason="turn_capacity_exceeded")
+                transferred = True
+            return plan
         finally:
             with self._lock:
+                # Until installation succeeds, the compiler owns admission,
+                # including BaseException/cancellation and unload exits.
+                if indexed and not transferred:
+                    ACTIVE_WORKSETS.release(self._budget_key(turn_key))
                 self._compiling.discard(turn_key)
-        with self._lock:
-            if self._closed:
-                if indexed:
-                    ACTIVE_WORKSETS.release(self._budget_key(turn_key))
-                return _TurnPlan(current_sha, reason="runtime_unloaded")
-            if indexed:
-                if plan.workset_bytes > 8*1024*1024:
-                    ACTIVE_WORKSETS.release(self._budget_key(turn_key))
-                    return _TurnPlan(current_sha, reason="workset_byte_limit_exceeded")
-                ACTIVE_WORKSETS.acquire(self._budget_key(turn_key), plan.workset_bytes)
-            self._turns[turn_key] = plan
-            self._turns.move_to_end(turn_key)
-            if not self._trim_locked(protected_turns=(turn_key,)):
-                if self._turns.get(turn_key) is plan:
-                    self._turns.pop(turn_key, None)
-                if indexed:
-                    ACTIVE_WORKSETS.release(self._budget_key(turn_key))
-                return _TurnPlan(current_sha, reason="turn_capacity_exceeded")
-        return plan
 
     def _attempt_budget(
         self,

@@ -50,6 +50,7 @@ The exported patch SHA-256 values, in application order, are:
 11. `f3e70e70b0811beb390ef034d1c080497724f3061d93c83ae0329bdd7547f2c6`
 12. `ee52adf371717dc4529ddc6d9b678db92214afb3146393c695cdf45b617addd3`
 13. `1791c7a384b96d7b4e299334bd5b36c9ca20065e3e262e16aae0309ae9e5cfeb`
+14. `b7e388fcf5ffefbe4b3665974d0fa1ab6a2b4a425986df2a6de0254d4dde91f3`
 
 Patch 13 (`hermes-0.20.5-incremental-history.patch`) is the additive Block 3
 canonical journal/index seam. It is exported from compatibility-host commit
@@ -58,6 +59,14 @@ canonical journal/index seam. It is exported from compatibility-host commit
 unchanged first twelve patches. Those original artifacts are not rewritten.
 This is an implementation candidate on the named 0.20.5 lane, not a port to
 0.21.3 or a selected deployment artifact.
+
+Patch 14 (`hermes-0.20.5-history-value-guard.patch`) appends the
+Block 3 correction surface: SQLite value limits before size probes and page
+fetches, with borrowed connection limits and outer transactions restored.
+Compatibility-host commit `a488b6ebf46765a7323bb3e862bcbb77bccbd172`, tree
+`fa9a9030295b769c0e391ca860e3ebe1cd1e3b46`, is a direct child of the patch-13
+host above. The original thirteen patch artifacts remain byte-identical.
+External acceptance of this correction is pending.
 
 ## Extraction matrix
 

@@ -65,7 +65,8 @@ publication guarantee and checkpoint-v3 format before Block 3 implements them.
 The accepted specification is [LONG_HISTORY_PROTOCOL.md](LONG_HISTORY_PROTOCOL.md):
 host-owned change capture and bounded indexes, conditional checkpoint storage
 with validation on every use. The owner accepted Block 2 at `e54472f2` and
-authorized Block 3 implementation. Current work adds a thirteenth host patch,
+authorized Block 3 implementation. Current work adds the thirteenth host patch
+and its fourteenth value-guard correction,
 compact v3 storage/compiler input and bounded preparation; implementation
 review and deployment remain distinct. See LONG_HISTORY_IMPLEMENTATION.md.
 Index progress, provider delivery and checkpoint publication remain separate

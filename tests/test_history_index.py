@@ -402,6 +402,44 @@ class HistoryIndexTests(unittest.TestCase):
             budget.release(occupied)
             runtime.clear()
 
+    def test_real_async_summary_cancellation_releases_admission_for_new_runtime(self):
+        import asyncio
+        from test_runtime import runtime_module, ContinuityRuntime, FakeLlm, project, request
+        self.seed(24)
+        self.prepare()
+        class CancelledLlm:
+            async def acomplete(self, *args, **kwargs):
+                task = asyncio.current_task()
+                task.cancel()
+                await asyncio.sleep(0)
+        other_profile = object()
+        budget = runtime_module.ACTIVE_WORKSETS
+        self.assertTrue(budget.acquire(other_profile, 8*1024*1024))
+        try:
+            for turn in range(4):
+                runtime = ContinuityRuntime(self.adapter, CancelledLlm(),
+                    estimator=lambda messages: max(1, len(repr(messages))//8),
+                    clock=lambda: "2026-08-30T00:00:00+00:00")
+                try:
+                    with self.assertRaises(asyncio.CancelledError):
+                        project(runtime, request(), session="session-1", turn=f"cancel-{turn}")
+                    self.assertEqual(runtime._turns, {})
+                    self.assertEqual(runtime._compiling, set())
+                    self.assertNotIn(runtime._budget_key(("session-1", f"cancel-{turn}")), budget._leases)
+                finally:
+                    runtime.clear()
+                    budget.release(runtime._budget_key(("session-1", f"cancel-{turn}")))
+            runtime = ContinuityRuntime(self.adapter, FakeLlm(),
+                estimator=lambda messages: max(1, len(repr(messages))//8),
+                clock=lambda: "2026-08-30T00:00:00+00:00")
+            try:
+                self.assertIsNotNone(project(runtime, request(), session="session-1", turn="after-cancel"))
+            finally:
+                runtime.clear()
+            self.assertEqual(budget._leases[other_profile], 8*1024*1024)
+        finally:
+            budget.release(other_profile)
+
     def test_legacy_settings_cannot_raise_v3_admission_ceiling(self):
         self.adapter.max_full_prefix_physical_rows = 1000000
         self.adapter.max_full_prefix_bytes = 2**30
