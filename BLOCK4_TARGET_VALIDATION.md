@@ -73,3 +73,56 @@ explicit host epoch/capture invalidation before an old writer handoff. It was
 not exercised. A 48–72h observation window begins only after target deployment,
 and must include real projection, settlement, reuse and preparation progress,
 not merely the absence of a process exit.
+
+## Additive preparation correction
+
+The default row ceiling remains 256, and the plugin still requests eight
+pages / 50ms. Patch 15 reserves the second half of that quantum for closing
+the transaction and stops between completed rows in building, suffix reset
+and physical-prefix finalization. Cursor/member/prefix updates remain in the
+same transaction. Genuine expensive SQL is still interrupted by the original
+deadline and rolled back; scheduler delays and commit latency are not claimed
+to have a hard 50ms wall-clock bound. There is no new setting, retry scheduler
+or persistent tuning state. The plugin algorithm and original fourteen host
+patches are unchanged.
+
+The new deterministic slow-CPU case failed on the accepted host: its initial
+256-row transaction left no domain record. On the correction, completed rows
+commit without an early ready proof and eventually produce the complete
+256-row source. Additional slow reset and physical-prefix cases converge.
+Local host suite: **45/45** (including the retained genuine SQL-interruption
+test). Local plugin suite: **296 total, 294 passed, two conditional skips**.
+Five retained scale cases pass with two deliveries, one summary and reuse;
+the 4,800-canonical-row case keeps a 48-row foreground workset. Native
+value-guard benchmark remains a separate retained check.
+
+Target isolated source files match host `9364e363` exactly. With the same
+existing Python 3.11.15, the full plugin suite now passes: **296 total, 294
+passed, two conditional skips**, about 158 seconds. Its real
+`AIAgent.run_conversation` long-history test is synthetic-provider evidence,
+not owner-history compatibility or live delivery.
+
+A **fresh** set of individually consistent owner backups was used; the earlier
+32-row diagnostic index was not reused. The sole QQ domain contains 67,447
+physical rows. The default consumer advances through 458 preparation quanta
+in 21.463 seconds, reaches 29,460 canonical records, then returns
+`reverification_required / canonical_clone_audit_collision`. Peak process
+RSS is 47,288 KiB. This closes the zero-progress timeout reproduction but
+**does not** establish ready source, owner-history bridge or settlement.
+
+Bounded two-row diagnosis finds equal semantic keys but unequal raw/semantic
+signatures; differing columns are `id` and `display_kind`. No body, row ID or
+session identity is published. `display_kind` participates in source
+authority, so this correction does not ignore it or modify history to obtain
+a Green result. The remaining owner-history conflict is a distinct target
+compatibility question; deployment and the observation clock remain unstarted.
+
+The existing nonempty v2 checkpoint passes the candidate's bounded JSON/hash
+decoder and retains its v2 schema. This is **not** source-valid reuse,
+normalizer/source compatibility or v2→v3 migration evidence. The target chain
+stops before provider calls. Full-row fingerprints of the one owner row, one
+v2 checkpoint and all 94 legacy receipts remain identical before/after this
+copy check; no count-only compatibility claim is used. No production install,
+enablement, source change, restart or
+database mutation was performed. Gateway main PID and zero restart count
+remain unchanged. No pytest dependency was installed on the target.

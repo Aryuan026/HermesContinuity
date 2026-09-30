@@ -220,3 +220,34 @@
   target adaptation and its regression/review, then the same copy validation
   and authorized deployment. No macro-plan reopening, Global Hot change or
   newer Hermes baseline. The 48–72h observation clock has not started.
+
+## 2026-09-30 — Block 4 bounded preparation correction candidate
+
+- The owner authorized this target-granularity fix. Additive patch 15 exports
+  host `9364e363b0d57a17399972e0a094d55369e8fd41`, tree
+  `87846e90406265717a904fc7e0a581e41c032579`; original fourteen artifacts and
+  plugin production code are unchanged. It stops building/resetting/physical
+  pages between completed rows with transaction-close reserve, without
+  changing the default 256 rows / eight pages / 50ms or SQL interruption.
+- The new slow-CPU regression first reproduced zero durable progress on the
+  accepted host. Corrected host 45/45 via the real upstream test runner;
+  local plugin 296 total / 294 pass / two skips. Retained scale 5/5 and native
+  byte-guard 3/3 pass. Public exact-head successor CI is pending at commit time.
+- Target isolated source hashes match this host; existing Python 3.11.15 runs
+  the plugin suite with 296 total / 294 pass / two skips, about 158s. This
+  includes real-host synthetic projection/settlement/reload/reuse, not live QQ.
+- Fresh owner copies, without the diagnostic index, now commit default
+  preparation progress: 67,447 physical rows; 458 quanta / 21.463s to a
+  `canonical_clone_audit_collision` at 29,460 canonical records; peak RSS
+  47,288 KiB. Thus the timeout reproduction closes, but owner source readiness
+  remains blocked by a distinct persisted `display_kind` conflict. Bounded
+  diagnosis outputs column names only. No source authority was relaxed.
+- One existing nonempty v2 checkpoint passes bounded JSON/hash/schema decode;
+  full-row fingerprints of the owner row, v2 checkpoint and all 94 receipts
+  remain identical. No source-valid v2 reuse/migration is claimed, and this
+  owner-copy path invoked no provider. See BLOCK4_TARGET_VALIDATION.md.
+- Deliver the bounded fix as a reviewable PR. The owner-history conflict
+  remains a target qualification question; no merge/deploy/restart/original DB
+  write occurred. Gateway PID/restart count are unchanged, Global Hot and
+  0.21.x lanes untouched, selected Assembly pins unchanged. Observation has
+  not started. Preferred source rollback remains accepted Block 1 `1d6f502f`.

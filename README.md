@@ -62,7 +62,10 @@ The additive `hermes-0.20.5-incremental-history.patch` enables body-free host
 change capture/canonical indexing and compact checkpoint v3. It applies after
 the original twelve patches, followed by `hermes-0.20.5-history-value-guard.patch`
 to bound SQLite value materialization during probes and reads. The original
-thirteen artifacts are unchanged. Without the indexed host seam the
+fourteen artifacts are unchanged by the additional Block 4
+`hermes-0.20.5-history-quantum-progress.patch`: it closes preparation pages
+between complete rows with time reserved for cursor publication, retaining
+the original SQL deadline, row/byte ceilings and proof rules. Without the indexed host seam the
 accepted Block 1/v2 protection remains active.
 
 One background worker validates history in finite pages without calling a

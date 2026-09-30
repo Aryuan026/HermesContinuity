@@ -51,6 +51,7 @@ The exported patch SHA-256 values, in application order, are:
 12. `ee52adf371717dc4529ddc6d9b678db92214afb3146393c695cdf45b617addd3`
 13. `1791c7a384b96d7b4e299334bd5b36c9ca20065e3e262e16aae0309ae9e5cfeb`
 14. `b7e388fcf5ffefbe4b3665974d0fa1ab6a2b4a425986df2a6de0254d4dde91f3`
+15. `77aa8db643df87618413ec3c86333790ef53dc219fa8d70b82d2b797c880f0c5`
 
 Patch 13 (`hermes-0.20.5-incremental-history.patch`) is the additive Block 3
 canonical journal/index seam. It is exported from compatibility-host commit
@@ -66,7 +67,18 @@ fetches, with borrowed connection limits and outer transactions restored.
 Compatibility-host commit `a488b6ebf46765a7323bb3e862bcbb77bccbd172`, tree
 `fa9a9030295b769c0e391ca860e3ebe1cd1e3b46`, is a direct child of the patch-13
 host above. The original thirteen patch artifacts remain byte-identical.
-External acceptance of this correction is pending.
+The owner relayed Block 3 source acceptance at `191853bf`.
+
+Patch 15 (`hermes-0.20.5-history-quantum-progress.patch`) is the Block 4
+target preparation-granularity correction, host commit
+`9364e363b0d57a17399972e0a094d55369e8fd41`, tree
+`87846e90406265717a904fc7e0a581e41c032579`, a direct child of patch 14.
+Building, resetting and physical-prefix finalization stop between complete
+rows halfway through the existing quantum to leave time for legal cursor
+publication; the original SQL deadline and rollback remain in force. This is
+not a strict wall-clock guarantee or a change to source-validity, grouping,
+checkpoint or provider contracts. Original fourteen artifacts are unchanged.
+External review of this additional correction and target deployment are pending.
 
 ## Extraction matrix
 

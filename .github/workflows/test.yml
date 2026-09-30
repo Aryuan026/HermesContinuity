@@ -64,6 +64,7 @@ jobs:
           echo "HERMES_BASELINE_SOURCE_ROOT=$RUNNER_TEMP/hermes-baseline-module" >> "$GITHUB_ENV"
           git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-incremental-history.patch"
           git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-value-guard.patch"
+          git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-quantum-progress.patch"
       - name: Verify bounded canonical-history host
         run: |
           cd "$RUNNER_TEMP/hermes"
