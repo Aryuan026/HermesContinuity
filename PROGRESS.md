@@ -290,3 +290,27 @@
 - Target remains active/running with unchanged PID and zero restarts. No
   deployment or observation starts; no Global Hot, upstream, original DB or
   selected recovery change. See BLOCK4_TARGET_VALIDATION.md.
+
+## 2026-09-30 — owner-approved evidenced clone recovery candidate
+
+- The owner rejected quarantine/exclusion: preserve dialogue content, repair
+  producer metadata propagation, and recover only clones with explicit earlier
+  evidence. The former isolation proposal is not an implementation or fallback.
+- Additive patch 16 fixes shared Gateway replay and the indexed history view;
+  canonical rows, raw physical signatures, compiler/checkpoint/CAS/budgets and
+  Global Hot remain unchanged. Existing v1 index proofs are rejected and their
+  derived state rebuilt under rule v2 before any new proof is accepted.
+- Local exact host: 55 history tests and 11 actual Gateway tests pass. Plugin:
+  297 cases, 295 passed, two existing conditional skips. The real discovered
+  AIAgent test now includes old missing-tag clones, retaining original rows,
+  post-settlement, next-turn reuse, unload/reload and error/cancellation checks.
+  Indexed scale 5/5 and native value guard 3/3 remain Green.
+- Real owner-copy qualification crossed the prior tag collision but stopped at
+  `overflow / history_row_byte_limit_exceeded`: 67,447 physical rows, 46,856
+  indexed canonical records, 990 quanta / 42.729s, peak 42,288 KiB. This is not
+  a ready source or owner-history bridge/settlement/reuse result. No body or
+  private locator is published; the next byte boundary is diagnosed read-only.
+- No canonical exclusion, budget increase, production install/enable/restart,
+  merge, upstream upgrade, Global Hot change or observation start. Public
+  successor CI and external review remain pending; selected Assembly pins
+  remain unchanged. See BLOCK4_TARGET_VALIDATION.md for evidence boundaries.

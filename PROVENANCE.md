@@ -52,6 +52,7 @@ The exported patch SHA-256 values, in application order, are:
 13. `1791c7a384b96d7b4e299334bd5b36c9ca20065e3e262e16aae0309ae9e5cfeb`
 14. `b7e388fcf5ffefbe4b3665974d0fa1ab6a2b4a425986df2a6de0254d4dde91f3`
 15. `77aa8db643df87618413ec3c86333790ef53dc219fa8d70b82d2b797c880f0c5`
+16. `a6c726f18cd7fdb49b95c2a843e6d2e90f0ea383f324be897a6aca00f7eb46cc`
 
 Patch 13 (`hermes-0.20.5-incremental-history.patch`) is the additive Block 3
 canonical journal/index seam. It is exported from compatibility-host commit
@@ -79,6 +80,19 @@ publication; the original SQL deadline and rollback remain in force. This is
 not a strict wall-clock guarantee or a change to source-validity, grouping,
 checkpoint or provider contracts. Original fourteen artifacts are unchanged.
 External review of this additional correction and target deployment are pending.
+
+Patch 16 (`hermes-0.20.5-history-origin-recovery.patch`) is exported from host
+`ff67db0d2fdf1a08c02aedccedb77f29a7549a24`, tree
+`d9553785cda565b177b077f7784309bd116264cf`, a direct child of patch 15.
+The shared Gateway replay helper preserves producer display metadata before
+compaction. Indexed history restores a missing user-clone notification tag
+only from its earlier archived explicit notification, after both complete raw
+and decoded signatures match with that one field restored. Physical member
+signatures and canonical message rows are not rewritten. Rule identity v2
+invalidates old proofs and rebuilds their derived index with the existing
+bounded worker; no checkpoint or database schema is changed. The first fifteen
+artifacts, plugin compiler and Global Hot remain unchanged. This source
+candidate is not deployed and does not establish whole-owner-history readiness.
 
 ## Extraction matrix
 

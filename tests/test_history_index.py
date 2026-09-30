@@ -53,6 +53,22 @@ class HistoryIndexTests(unittest.TestCase):
             self.assertEqual(result["status"], "progress", result)
         self.fail("history preparation did not finish within bounded work steps")
 
+    def test_evidenced_notification_clone_remains_in_complete_dialogue(self):
+        self.writer.append_message("session-1", "user", "notification", timestamp=1787961600,
+                                   display_kind="internal_notification")
+        missing = dict(self.writer.get_messages("session-1")[0], display_kind=None)
+        self.writer.archive_and_compact("session-1", [missing])
+        self.writer.archive_and_compact("session-1", [missing])
+        self.writer.append_message("session-1", "assistant", "reply", timestamp=1787961601)
+        before = [tuple(row) for row in self.writer._conn.execute("SELECT * FROM messages ORDER BY id")]
+        self.prepare()
+        source = self.adapter.read_source("session-1", reference_at="2026-08-30T00:00:00+00:00")
+        self.assertEqual(source["status"], "ready", source)
+        self.assertEqual(source["source_proof"]["group_count"], 1)
+        self.assertEqual([message["content"] for message in source["groups"][0]["messages"]],
+                         ["notification", "reply"])
+        self.assertEqual([tuple(row) for row in self.writer._conn.execute("SELECT * FROM messages ORDER BY id")], before)
+
     def test_more_than_2048_rows_has_compact_proof_and_bounded_suffix(self):
         self.seed(1200)
         self.prepare()

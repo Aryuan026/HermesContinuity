@@ -65,10 +65,11 @@ jobs:
           git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-incremental-history.patch"
           git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-value-guard.patch"
           git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-quantum-progress.patch"
+          git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-origin-recovery.patch"
       - name: Verify bounded canonical-history host
         run: |
           cd "$RUNNER_TEMP/hermes"
-          HERMES_PYTHON="$(command -v python)" bash scripts/run_tests.sh --file-retries 0 tests/test_hermes_state_history.py
+          HERMES_PYTHON="$(command -v python)" bash scripts/run_tests.sh --file-retries 0 tests/test_hermes_state_history.py tests/gateway/test_replay_entry_fields.py
       - name: Verify indexed plugin and real host entrypoint
         run: python -B -m unittest discover -s tests -v
       - name: Disposable indexed-history scale benchmark

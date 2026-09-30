@@ -222,3 +222,67 @@ automatic restarts at this readback. No install, enablement, restart, source
 switch, merge or natural provider/QQ traffic occurred. Selected recovery pins
 and procedures remain unchanged; no Assembly update is required for this
 diagnostic/evidence-only increment.
+
+## Owner-approved propagation and evidenced recovery (patch 16)
+
+The owner **rejected** the historical quarantine/exclusion proposal above.
+It is not a fallback or an acceptance gate. The approved product delta keeps
+all dialogue content, repairs the shared Gateway replay loss, and restores
+only proven missing clone provenance in a derived index/view. No canonical
+message row is rewritten and no text-based origin inference is introduced.
+
+Current Gateway `_build_gateway_agent_history` routes ordinary messages through
+`_build_replay_entry`, which previously omitted both producer display fields.
+The fix preserves those fields, including a detached nested metadata copy,
+before existing compaction/persistence. Provider-bound copies still strip them.
+This is a reproduced reachable loss mechanism, not a retrospective assertion
+that this writer created every historical missing value.
+
+The indexed recovery requires an earlier archived `internal_notification`
+user row, a later user clone whose kind is NULL, and complete raw-key,
+semantic-key, raw-signature and semantic-signature equality after restoring
+only that tag. Other content/metadata/API/provider-field conflicts, explicit
+contradictory kinds, invalid lifecycle and active collisions remain errors.
+Raw physical signatures remain distinct and are reverified. The recovered
+label counts toward page bytes. Canonical rule v2 rejects old tokens and
+seals until the existing finite worker rebuilds their derived index; schemas,
+checkpoint storage, compiler, CAS and provider budgets are unchanged.
+The separate legacy/recent-window path used by Global Hot remains strict;
+this candidate does not claim to repair every independent reader.
+
+Host `ff67db0d2fdf1a08c02aedccedb77f29a7549a24`, tree
+`d9553785cda565b177b077f7784309bd116264cf`, is a direct child of patch 15.
+All first fifteen exported artifacts remain byte-identical. Local Python 3.12:
+55 history tests, 11 actual Gateway tests, and 42 overlay/middleware tests
+(15 subtests) pass. Plugin: 297 cases / 295 passed / two existing conditional
+skips. Its actual discovered AIAgent long-history entry now includes archived
+missing-tag clones, retains those physical rows, and still verifies settled
+delivery, next-turn reuse, manager unload/reload and error/cancellation behavior.
+Scale 5/5 and native-value 3/3 benchmarks retain their positive controls.
+
+A new individually consistent copy of the previously retained owner snapshots
+was made inside the protected task workbench; the production originals were
+not accessed for this copy. Under the existing Python 3.11.15, rule-v1 index
+rebuild passes the former label collision and advances to 46,856 canonical
+records, then stops: `overflow / history_row_byte_limit_exceeded`. The 67,447
+physical-row domain takes 990 quanta / 42.729s with peak RSS 42,288 KiB.
+A size-only, at-most-256-row probe finds one row over 4 MiB: its content is
+22,596,510 encoded bytes. No body, row ID or session identity is emitted.
+This is a distinct giant-row read boundary, **not ready source, owner-history
+projection, settlement or reuse evidence**. No protection is disabled and no
+group is excluded to turn this result Green.
+
+After the stopped preparation, full-field fingerprints of the copied owner
+row, nonempty v2 checkpoint and all 94 legacy receipts still match their
+retained baseline. This proves preservation of those old records, not their
+source-valid reuse or a v2-to-v3 migration.
+
+Recovery-truth axes: candidate source/artifact and acceptance truth change;
+managed runtime paths, units, secrets, production dependencies and selected
+rollback do not. Missing local HTTP dependencies were added only to a
+disposable test venv for actual Gateway tests, not the server or repository.
+The candidate is unselected: no Assembly relock, deployment, enablement,
+restart, merge, upstream upgrade, Global Hot change or observation start.
+Public successor CI and external review must be recorded separately. Handling
+the giant row without losing memory or returning to unbounded reads remains
+the next qualification problem, not an implemented product change here.

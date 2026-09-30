@@ -124,6 +124,13 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
         self.session_db = SessionDB(self.home / "state.db")
         self.session_db.create_session("long-mouth", "cli")
         now = time.time() - 1_800
+        self.session_db.append_message("long-mouth", "user", "legacy notification",
+                                       timestamp=now-2, display_kind="internal_notification")
+        missing = dict(self.session_db.get_messages("long-mouth")[0], display_kind=None)
+        self.session_db.archive_and_compact("long-mouth", [missing])
+        self.session_db.archive_and_compact("long-mouth", [missing])
+        self.session_db.append_message("long-mouth", "assistant", "legacy reply", timestamp=now-1)
+        self.legacy_row_ids = [row[0] for row in self.session_db._conn.execute("SELECT id FROM messages")]
         for start in range(0, 1_200, 100):
             self.session_db.append_messages_batch(
                 "long-mouth",
@@ -301,6 +308,11 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
                            "admission": leases}, sort_keys=True)
 
     def test_real_host_v3_settlement_reload_reuse_and_error(self) -> None:
+        # The old Gateway replay lost producer tags before compaction. Keep
+        # those physical rows unchanged and exercise the normal host entry.
+        placeholders = ",".join("?" for _ in self.legacy_row_ids)
+        before = [tuple(row) for row in self.session_db._conn.execute(
+            f"SELECT * FROM messages WHERE id IN ({placeholders}) ORDER BY id", self.legacy_row_ids)]
         provider_bodies: list[dict] = []
 
         def provider(request, *, on_first_delta=None):
@@ -465,6 +477,8 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
                 _sqlite_count(continuity_db, "continuity_receipts"),
                 receipts_before_error,
             )
+        self.assertEqual([tuple(row) for row in self.session_db._conn.execute(
+            f"SELECT * FROM messages WHERE id IN ({placeholders}) ORDER BY id", self.legacy_row_ids)], before)
 
 
 if __name__ == "__main__":

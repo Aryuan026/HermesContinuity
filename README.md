@@ -68,6 +68,13 @@ between complete rows with time reserved for cursor publication, retaining
 the original SQL deadline, row/byte ceilings and proof rules. Without the indexed host seam the
 accepted Block 1/v2 protection remains active.
 
+`hermes-0.20.5-history-origin-recovery.patch` additionally preserves producer
+tags in Gateway replay and recovers a proven lost notification tag in indexed
+clone views. It does not discard dialogue groups, rewrite canonical rows or
+infer human origin from text. All other signature conflicts remain errors;
+old index proofs are revalidated under canonical rule v2. This indexed repair
+does not relax the separate legacy/recent-window reader used by Global Hot.
+
 One background worker validates history in finite pages without calling a
 model. The foreground reads only a bounded recent complete-group window;
 index completion does not summarize all history or grant retirement authority.
