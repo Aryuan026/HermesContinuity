@@ -1,0 +1,3860 @@
+From 60a36dda4387db20ce5777ead59e7a308672b061 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 02:02:14 +0800
+Subject: [PATCH] feat(history): add bounded canonical proof preparation and
+ rollback invalidation
+
+---
+ hermes_state.py                    |   23 +-
+ hermes_state_history.py            | 2637 ++++++++++++++++++++++++++++
+ tests/test_hermes_state_history.py | 1102 ++++++++++++
+ 3 files changed, 3761 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_state_history.py
+ create mode 100644 tests/test_hermes_state_history.py
+
+diff --git a/hermes_state.py b/hermes_state.py
+index d0a7ae9..b90efb3 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -84,6 +84,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
+ from hermes_state_portability import SessionPortabilityMixin
+ from hermes_state_schema import SessionSchemaMixin
+ from hermes_state_search import SessionSearchMixin
++from hermes_state_history import SessionHistoryMixin
+ 
+ try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
+     import psutil
+@@ -3091,7 +3092,12 @@ def classify_session_status(
+     return SESSION_STATUS_COMPLETE
+ 
+ 
+-class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
++class SessionDB(
++    SessionHistoryMixin,
++    SessionSearchMixin,
++    SessionSchemaMixin,
++    SessionPortabilityMixin,
++):
+     """
+     SQLite-backed session storage with FTS5 search.
+ 
+@@ -3288,6 +3294,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         # in place at most once per SessionDB instance so a genuinely
+         # unrecoverable database can't put writers into a rebuild loop.
+         self._fts_runtime_rebuild_attempted = False
++        self._history_fail_open_attempted = False
+         # One-shot guard for the runtime connection-reopen recovery on the
+         # write path. A connection whose backing file was replaced/truncated
+         # by a sibling process surfaces as "file is not a database" on every
+@@ -3431,6 +3438,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 self._conn.execute("PRAGMA foreign_keys=ON")
+                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                 self._init_schema()
++                self._init_history_schema()
+ 
+             def _connect_and_init_with_lock_patience():
+                 # Lock contention during open: _init_schema's DDL/reconcile
+@@ -4015,8 +4023,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             try:
+                 with self._lock:
+                     self._conn.execute("BEGIN IMMEDIATE")
++                    history_notifications = ()
+                     try:
++                        history_baseline = self._history_notification_baseline(
++                            self._conn
++                        )
+                         result = fn(self._conn)
++                        history_notifications = self._history_collect_notifications(
++                            self._conn, history_baseline
++                        )
+                         self._conn.commit()
+                     except BaseException:
+                         try:
+@@ -4024,6 +4039,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                         except Exception:
+                             pass
+                         raise
++                self._history_dispatch_notifications(history_notifications)
+                 # Success — periodic best-effort checkpoint + FTS merge.
+                 self._write_count += 1
+                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+@@ -4068,6 +4084,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     ) from exc
+                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                     continue
++                if self._enter_history_fail_open(exc):
++                    continue
+                 # Non-lock error or patience exhausted — propagate.
+                 raise
+             except sqlite3.DatabaseError as exc:
+@@ -4087,6 +4105,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     if not self._reconnect_after_notadb():
+                         raise
+                     continue
++                if self._enter_history_fail_open(exc):
++                    continue
+                 # Corrupt FTS shadow tables make every write raise the
+                 # malformed/corrupt error class through the FTS sync triggers
+                 # while the canonical messages table is intact. Recover here,
+@@ -4183,6 +4203,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 new_conn.execute("PRAGMA foreign_keys=ON")
+                 self._fts_cjk_loaded = load_fts5_cjk_extension(new_conn)
+                 self._init_schema()
++                self._init_history_schema()
+         except Exception as exc:
+             logger.error(
+                 "state.db reconnect after 'file is not a database' failed (%s); "
+diff --git a/hermes_state_history.py b/hermes_state_history.py
+new file mode 100644
+index 0000000..517ab2a
+--- /dev/null
++++ b/hermes_state_history.py
+@@ -0,0 +1,2637 @@
++"""Bounded canonical-history preparation for :class:`hermes_state.SessionDB`.
++
++The canonical transcript remains in ``messages``.  The tables in this module
++contain only locators, digests, counters, and progress.  Public methods expose
++bounded pages through a closed proof token; callers never receive a writable
++SQLite handle.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++import math
++import re
++import sqlite3
++import threading
++import time
++import uuid
++from contextlib import contextmanager
++from typing import Any, Callable, Dict, Mapping, Optional, Sequence
++
++
++HISTORY_RULE_VERSION = "hermes.canonical_history_rule.v1"
++HISTORY_PREFIX_SCHEMA = "hermes.canonical_history_prefix.v1"
++HISTORY_CURSOR_SCHEMA = "hermes.canonical_history_cursor.v1"
++HISTORY_PREPARE_SCHEMA = "hermes.canonical_history_prepare.v1"
++HISTORY_PAGE_SCHEMA = "hermes.canonical_history_page.v1"
++HISTORY_SEAL_SCHEMA = "hermes.canonical_history_seal.v1"
++HISTORY_VALIDATION_SCHEMA = "hermes.canonical_history_validation.v1"
++HISTORY_INVALIDATION_SCHEMA = "hermes.canonical_history_invalidation.v1"
++
++_PREFIX_KEYS = frozenset(
++    {
++        "schema",
++        "realm_id",
++        "incarnation",
++        "activation_epoch",
++        "domain_id",
++        "topology_revision",
++        "canonical_rule_version",
++        "indexed_change_seq",
++        "end_anchor",
++        "canonical_count",
++        "prefix_hash",
++    }
++)
++_CURSOR_KEYS = frozenset(
++    {
++        "schema",
++        "realm_id",
++        "incarnation",
++        "activation_epoch",
++        "domain_id",
++        "topology_revision",
++        "canonical_rule_version",
++        "indexed_change_seq",
++        "target_end_anchor",
++        "target_count",
++        "after_position",
++        "pending_boundary_anchor",
++    }
++)
++_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/+~=-]{0,511}$")
++_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
++_ANCHOR_RE = re.compile(r"^hca_[0-9a-f]{64}$")
++_PROCESS_NONCE = "hhp_" + uuid.uuid4().hex
++_LEASE_SECONDS = 30.0
++_WORKER_CACHE_KIB = 8 * 1024
++_MAX_LISTENER_DOMAINS = 32
++_LISTENER_LOCK = threading.RLock()
++_LISTENERS: Dict[str, Dict[str, Dict[str, Callable[[str, int], None]]]] = {}
++logger = logging.getLogger(__name__)
++
++
++class HistoryListenerRegistration:
++    """Identity-bound handle for one process-local history listener."""
++
++    def __init__(self, path: str, domain_id: str, token: str) -> None:
++        self._path = path
++        self._domain_id = domain_id
++        self._token = token
++        self._closed = False
++
++    def close(self) -> None:
++        if self._closed:
++            return
++        self._closed = True
++        with _LISTENER_LOCK:
++            by_domain = _LISTENERS.get(self._path)
++            callbacks = by_domain.get(self._domain_id) if by_domain else None
++            if callbacks is not None:
++                callbacks.pop(self._token, None)
++                if not callbacks:
++                    by_domain.pop(self._domain_id, None)
++            if by_domain is not None and not by_domain:
++                _LISTENERS.pop(self._path, None)
++
++_TRIGGER_NAMES = (
++    "hermes_history_messages_insert",
++    "hermes_history_messages_update",
++    "hermes_history_messages_delete",
++    "hermes_history_sessions_insert",
++    "hermes_history_sessions_update",
++    "hermes_history_sessions_delete",
++    "hermes_history_changes_insert_guard",
++    "hermes_history_changes_update_guard",
++    "hermes_history_changes_delete_guard",
++)
++_TABLE_COLUMNS = {
++    "hermes_history_state": {
++        "singleton",
++        "realm_id",
++        "realm_binding",
++        "incarnation",
++        "activation_epoch",
++        "activation_process",
++        "owner_id",
++        "lease_expires_at",
++        "capture_enabled",
++        "message_columns_digest",
++        "retained_floor",
++        "journal_tail",
++        "retained_count",
++    },
++    "hermes_history_changes": {
++        "change_seq",
++        "object_kind",
++        "operation",
++        "old_session_id",
++        "old_row_id",
++        "new_session_id",
++        "new_row_id",
++    },
++    "hermes_history_domains": {
++        "domain_id",
++        "topology_revision",
++        "canonical_rule_version",
++        "activation_epoch",
++        "phase",
++        "target_max_message_id",
++        "scan_base_change_seq",
++        "indexed_change_seq",
++        "cursor_message_id",
++        "physical_cursor_position",
++        "canonical_count",
++        "end_anchor",
++        "prefix_hash",
++        "invalidated_from_position",
++        "failure_reason",
++        "updated_at",
++    },
++    "hermes_history_buckets": {
++        "domain_id",
++        "anchor",
++        "position",
++        "raw_key_digest",
++        "semantic_key_digest",
++        "raw_signature",
++        "semantic_signature",
++        "earliest_message_id",
++        "winner_message_id",
++        "winner_stored_bytes",
++        "physical_count",
++        "active_count",
++        "active",
++        "compacted",
++        "last_physical_change_seq",
++        "physical_prefix_max_seq",
++        "canonical_digest",
++        "prefix_hash",
++    },
++    "hermes_history_members": {
++        "domain_id",
++        "message_id",
++        "anchor",
++        "raw_key_digest",
++        "semantic_key_digest",
++        "raw_signature",
++        "semantic_signature",
++        "stored_bytes",
++        "active",
++        "compacted",
++    },
++}
++
++_HISTORY_SCHEMA_SQL = """
++CREATE TABLE IF NOT EXISTS hermes_history_state (
++    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
++    realm_id TEXT NOT NULL,
++    realm_binding TEXT NOT NULL,
++    incarnation TEXT NOT NULL,
++    activation_epoch TEXT NOT NULL,
++    activation_process TEXT NOT NULL,
++    owner_id TEXT NOT NULL,
++    lease_expires_at REAL NOT NULL,
++    capture_enabled INTEGER NOT NULL CHECK (capture_enabled IN (0, 1)),
++    message_columns_digest TEXT NOT NULL,
++    retained_floor INTEGER NOT NULL DEFAULT 0,
++    journal_tail INTEGER NOT NULL DEFAULT 0,
++    retained_count INTEGER NOT NULL DEFAULT 0
++);
++
++CREATE TABLE IF NOT EXISTS hermes_history_changes (
++    change_seq INTEGER PRIMARY KEY AUTOINCREMENT,
++    object_kind TEXT NOT NULL,
++    operation TEXT NOT NULL,
++    old_session_id TEXT,
++    old_row_id INTEGER,
++    new_session_id TEXT,
++    new_row_id INTEGER
++);
++CREATE INDEX IF NOT EXISTS idx_hermes_history_changes_old
++    ON hermes_history_changes(old_session_id, change_seq);
++CREATE INDEX IF NOT EXISTS idx_hermes_history_changes_new
++    ON hermes_history_changes(new_session_id, change_seq);
++
++CREATE TABLE IF NOT EXISTS hermes_history_domains (
++    domain_id TEXT PRIMARY KEY,
++    topology_revision TEXT NOT NULL,
++    canonical_rule_version TEXT NOT NULL,
++    activation_epoch TEXT NOT NULL,
++    phase TEXT NOT NULL,
++    target_max_message_id INTEGER NOT NULL,
++    scan_base_change_seq INTEGER NOT NULL,
++    indexed_change_seq INTEGER NOT NULL,
++    cursor_message_id INTEGER NOT NULL,
++    physical_cursor_position INTEGER NOT NULL,
++    canonical_count INTEGER NOT NULL,
++    end_anchor TEXT NOT NULL,
++    prefix_hash TEXT NOT NULL,
++    invalidated_from_position INTEGER,
++    failure_reason TEXT NOT NULL DEFAULT '',
++    updated_at REAL NOT NULL
++);
++CREATE INDEX IF NOT EXISTS idx_hermes_history_domains_watermark
++    ON hermes_history_domains(indexed_change_seq);
++
++CREATE TABLE IF NOT EXISTS hermes_history_buckets (
++    domain_id TEXT NOT NULL,
++    anchor TEXT NOT NULL,
++    position INTEGER NOT NULL,
++    raw_key_digest TEXT NOT NULL,
++    semantic_key_digest TEXT NOT NULL,
++    raw_signature TEXT NOT NULL,
++    semantic_signature TEXT NOT NULL,
++    earliest_message_id INTEGER NOT NULL,
++    winner_message_id INTEGER NOT NULL,
++    winner_stored_bytes INTEGER NOT NULL,
++    physical_count INTEGER NOT NULL,
++    active_count INTEGER NOT NULL,
++    active INTEGER NOT NULL,
++    compacted INTEGER NOT NULL,
++    last_physical_change_seq INTEGER NOT NULL,
++    physical_prefix_max_seq INTEGER NOT NULL,
++    canonical_digest TEXT NOT NULL,
++    prefix_hash TEXT NOT NULL,
++    PRIMARY KEY (domain_id, anchor),
++    UNIQUE (domain_id, position),
++    UNIQUE (domain_id, semantic_key_digest)
++);
++CREATE INDEX IF NOT EXISTS idx_hermes_history_buckets_winner
++    ON hermes_history_buckets(domain_id, winner_message_id);
++
++CREATE TABLE IF NOT EXISTS hermes_history_members (
++    domain_id TEXT NOT NULL,
++    message_id INTEGER NOT NULL,
++    anchor TEXT NOT NULL,
++    raw_key_digest TEXT NOT NULL,
++    semantic_key_digest TEXT NOT NULL,
++    raw_signature TEXT NOT NULL,
++    semantic_signature TEXT NOT NULL,
++    stored_bytes INTEGER NOT NULL,
++    active INTEGER NOT NULL,
++    compacted INTEGER NOT NULL,
++    PRIMARY KEY (domain_id, message_id)
++);
++CREATE INDEX IF NOT EXISTS idx_hermes_history_members_anchor
++    ON hermes_history_members(domain_id, anchor, message_id);
++"""
++
++_HISTORY_TRIGGER_SQL = """
++CREATE TRIGGER IF NOT EXISTS hermes_history_messages_insert
++AFTER INSERT ON messages BEGIN
++  INSERT INTO hermes_history_changes
++    (object_kind, operation, new_session_id, new_row_id)
++  VALUES ('message', 'insert', new.session_id, new.id);
++END;
++CREATE TRIGGER IF NOT EXISTS hermes_history_messages_update
++AFTER UPDATE ON messages BEGIN
++  INSERT INTO hermes_history_changes
++    (object_kind, operation, old_session_id, old_row_id,
++     new_session_id, new_row_id)
++  VALUES ('message', 'update', old.session_id, old.id,
++          new.session_id, new.id);
++END;
++CREATE TRIGGER IF NOT EXISTS hermes_history_messages_delete
++AFTER DELETE ON messages BEGIN
++  INSERT INTO hermes_history_changes
++    (object_kind, operation, old_session_id, old_row_id)
++  VALUES ('message', 'delete', old.session_id, old.id);
++END;
++CREATE TRIGGER IF NOT EXISTS hermes_history_sessions_insert
++AFTER INSERT ON sessions BEGIN
++  INSERT INTO hermes_history_changes
++    (object_kind, operation, new_session_id)
++  VALUES ('session', 'insert', new.id);
++END;
++CREATE TRIGGER IF NOT EXISTS hermes_history_sessions_update
++AFTER UPDATE OF source, user_id, session_key, chat_id, chat_type, thread_id,
++  origin_json, model_config, parent_session_id, started_at, ended_at, end_reason
++ON sessions BEGIN
++  INSERT INTO hermes_history_changes
++    (object_kind, operation, old_session_id, new_session_id)
++  VALUES ('session', 'update', old.id, new.id);
++END;
++CREATE TRIGGER IF NOT EXISTS hermes_history_sessions_delete
++AFTER DELETE ON sessions BEGIN
++  INSERT INTO hermes_history_changes
++    (object_kind, operation, old_session_id)
++  VALUES ('session', 'delete', old.id);
++END;
++CREATE TRIGGER IF NOT EXISTS hermes_history_changes_insert_guard
++AFTER INSERT ON hermes_history_changes BEGIN
++  UPDATE hermes_history_state SET journal_tail = new.change_seq,
++    retained_count = retained_count + 1
++  WHERE singleton = 1;
++END;
++CREATE TRIGGER IF NOT EXISTS hermes_history_changes_update_guard
++AFTER UPDATE ON hermes_history_changes BEGIN
++  UPDATE hermes_history_state SET capture_enabled=0, activation_epoch='',
++    activation_process='', owner_id='', lease_expires_at=0
++  WHERE singleton = 1;
++  UPDATE hermes_history_domains SET phase='reverification_required',
++    invalidated_from_position=1, failure_reason='history_journal_modified';
++END;
++CREATE TRIGGER IF NOT EXISTS hermes_history_changes_delete_guard
++AFTER DELETE ON hermes_history_changes BEGIN
++  UPDATE hermes_history_state SET retained_count = retained_count - 1
++  WHERE singleton = 1 AND old.change_seq > retained_floor;
++  UPDATE hermes_history_state SET capture_enabled=0, activation_epoch='',
++    activation_process='', owner_id='', lease_expires_at=0
++  WHERE singleton = 1 AND old.change_seq > retained_floor;
++  UPDATE hermes_history_domains SET phase='reverification_required',
++    invalidated_from_position=1, failure_reason='history_journal_gap'
++  WHERE old.change_seq > (
++    SELECT retained_floor FROM hermes_history_state WHERE singleton = 1
++  );
++END;
++"""
++
++
++def _expected_table_shapes() -> Dict[str, tuple[tuple[Any, ...], ...]]:
++    conn = sqlite3.connect(":memory:")
++    try:
++        conn.executescript(_HISTORY_SCHEMA_SQL)
++        return {
++            table: tuple(
++                (
++                    str(row[1]),
++                    str(row[2]).upper(),
++                    int(row[3]),
++                    row[4],
++                    int(row[5]),
++                )
++                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
++            )
++            for table in _TABLE_COLUMNS
++        }
++    finally:
++        conn.close()
++
++
++_EXPECTED_TABLE_SHAPES = _expected_table_shapes()
++
++_HISTORY_INDEX_COLUMNS = {
++    "idx_hermes_history_changes_old": ("old_session_id", "change_seq"),
++    "idx_hermes_history_changes_new": ("new_session_id", "change_seq"),
++    "idx_hermes_history_domains_watermark": ("indexed_change_seq",),
++    "idx_hermes_history_buckets_winner": ("domain_id", "winner_message_id"),
++    "idx_hermes_history_members_anchor": ("domain_id", "anchor", "message_id"),
++}
++
++
++def _normalize_sql(sql: str) -> str:
++    normalized = " ".join(str(sql or "").strip().rstrip(";").split()).lower()
++    return normalized.replace("create trigger if not exists", "create trigger", 1)
++
++
++def _trigger_declarations() -> tuple[Dict[str, str], Dict[str, str]]:
++    declarations: Dict[str, str] = {}
++    expected: Dict[str, str] = {}
++    pattern = re.compile(
++        r"CREATE TRIGGER IF NOT EXISTS\s+(\w+)\s+(.*?\bEND;)",
++        re.IGNORECASE | re.DOTALL,
++    )
++    for match in pattern.finditer(_HISTORY_TRIGGER_SQL):
++        name = match.group(1)
++        declaration = f"CREATE TRIGGER IF NOT EXISTS {name} {match.group(2)}"
++        declarations[name] = declaration
++        expected[name] = _normalize_sql(declaration)
++    if set(expected) != set(_TRIGGER_NAMES):  # import-time authoring guard
++        raise RuntimeError("history trigger declaration set is inconsistent")
++    return declarations, expected
++
++
++_TRIGGER_DECLARATIONS, _EXPECTED_TRIGGER_SQL = _trigger_declarations()
++
++
++def _new_marker(prefix: str) -> str:
++    return prefix + uuid.uuid4().hex
++
++
++def _is_nonnegative_int(value: Any) -> bool:
++    return type(value) is int and value >= 0
++
++
++def _require_code(value: Any, name: str) -> str:
++    if not isinstance(value, str) or not _CODE_RE.fullmatch(value):
++        raise ValueError(f"{name} is invalid")
++    return value
++
++
++def _require_digest(value: Any, name: str) -> str:
++    if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
++        raise ValueError(f"{name} must be a sha256 digest")
++    return value
++
++
++def _require_anchor(value: Any, name: str, *, empty: bool = False) -> str:
++    if empty and value == "":
++        return ""
++    if not isinstance(value, str) or not _ANCHOR_RE.fullmatch(value):
++        raise ValueError(f"{name} is invalid")
++    return value
++
++
++def _json_value(value: Any) -> Any:
++    if isinstance(value, bytes):
++        return {"$bytes": value.hex()}
++    if isinstance(value, tuple):
++        return [_json_value(item) for item in value]
++    if isinstance(value, list):
++        return [_json_value(item) for item in value]
++    if isinstance(value, Mapping):
++        return {str(key): _json_value(item) for key, item in value.items()}
++    if value is None or isinstance(value, (str, int, float, bool)):
++        return value
++    return {"$type": type(value).__name__, "$repr": repr(value)}
++
++
++def _json_bytes(value: Any) -> bytes:
++    return json.dumps(
++        _json_value(value), ensure_ascii=True, sort_keys=True, separators=(",", ":")
++    ).encode("ascii")
++
++
++def _digest(value: Any) -> str:
++    return hashlib.sha256(_json_bytes(value)).hexdigest()
++
++
++def _chain_digest(*parts: Any) -> str:
++    digest = hashlib.sha256()
++    for part in parts:
++        payload = _json_bytes(part)
++        digest.update(len(payload).to_bytes(8, "big"))
++        digest.update(payload)
++    return digest.hexdigest()
++
++
++def _prefix_zero(domain_id: str) -> str:
++    return _chain_digest(
++        "hermes.canonical_history_prefix_chain.v1",
++        domain_id,
++        HISTORY_RULE_VERSION,
++    )
++
++
++def _normalize_prefix_token(value: Mapping[str, Any]) -> Dict[str, Any]:
++    if not isinstance(value, Mapping) or set(value) != _PREFIX_KEYS:
++        raise ValueError("history prefix token fields are invalid")
++    token = dict(value)
++    if token.get("schema") != HISTORY_PREFIX_SCHEMA:
++        raise ValueError("history prefix token schema is unsupported")
++    for key in (
++        "realm_id",
++        "incarnation",
++        "activation_epoch",
++        "domain_id",
++        "topology_revision",
++        "canonical_rule_version",
++    ):
++        _require_code(token.get(key), key)
++    if token["canonical_rule_version"] != HISTORY_RULE_VERSION:
++        raise ValueError("history rule version is unsupported")
++    if not _is_nonnegative_int(token.get("indexed_change_seq")):
++        raise ValueError("indexed_change_seq is invalid")
++    if not _is_nonnegative_int(token.get("canonical_count")):
++        raise ValueError("canonical_count is invalid")
++    count = token["canonical_count"]
++    _require_anchor(token.get("end_anchor"), "end_anchor", empty=count == 0)
++    if count == 0 and token["end_anchor"] != "":
++        raise ValueError("empty prefix must have an empty anchor")
++    if count > 0 and token["end_anchor"] == "":
++        raise ValueError("non-empty prefix must have an anchor")
++    _require_digest(token.get("prefix_hash"), "prefix_hash")
++    if count == 0 and token["prefix_hash"] != _prefix_zero(token["domain_id"]):
++        raise ValueError("empty prefix hash is invalid")
++    return token
++
++
++def make_history_cursor(
++    target: Mapping[str, Any],
++    *,
++    after_position: int = 0,
++    pending_boundary_anchor: str = "",
++) -> Dict[str, Any]:
++    """Construct a closed keyset cursor bound to one prefix token."""
++
++    token = _normalize_prefix_token(target)
++    if not _is_nonnegative_int(after_position) or after_position > token["canonical_count"]:
++        raise ValueError("after_position is outside the target prefix")
++    _require_anchor(
++        pending_boundary_anchor,
++        "pending_boundary_anchor",
++        empty=True,
++    )
++    return {
++        "schema": HISTORY_CURSOR_SCHEMA,
++        "realm_id": token["realm_id"],
++        "incarnation": token["incarnation"],
++        "activation_epoch": token["activation_epoch"],
++        "domain_id": token["domain_id"],
++        "topology_revision": token["topology_revision"],
++        "canonical_rule_version": token["canonical_rule_version"],
++        "indexed_change_seq": token["indexed_change_seq"],
++        "target_end_anchor": token["end_anchor"],
++        "target_count": token["canonical_count"],
++        "after_position": after_position,
++        "pending_boundary_anchor": pending_boundary_anchor,
++    }
++
++
++def _normalize_cursor(value: Mapping[str, Any], target: Mapping[str, Any]) -> Dict[str, Any]:
++    if not isinstance(value, Mapping) or set(value) != _CURSOR_KEYS:
++        raise ValueError("history cursor fields are invalid")
++    cursor = dict(value)
++    if cursor.get("schema") != HISTORY_CURSOR_SCHEMA:
++        raise ValueError("history cursor schema is unsupported")
++    expected = make_history_cursor(
++        target,
++        after_position=cursor.get("after_position"),
++        pending_boundary_anchor=cursor.get("pending_boundary_anchor"),
++    )
++    if cursor != expected:
++        raise ValueError("history cursor does not belong to target")
++    return cursor
++
++
++class SessionHistoryMixin:
++    """Body-free canonical index mixed into ``SessionDB``."""
++
++    def register_history_listener(
++        self,
++        domain_id: str,
++        callback: Callable[[str, int], None],
++    ) -> HistoryListenerRegistration:
++        """Register one process-local, body-free post-commit listener."""
++
++        _require_code(domain_id, "domain_id")
++        if not callable(callback):
++            raise TypeError("history listener callback must be callable")
++        path = str(self.db_path.resolve())
++        token = uuid.uuid4().hex
++        with _LISTENER_LOCK:
++            by_domain = _LISTENERS.setdefault(path, {})
++            if domain_id not in by_domain and len(by_domain) >= _MAX_LISTENER_DOMAINS:
++                if not by_domain:
++                    _LISTENERS.pop(path, None)
++                raise RuntimeError("history listener domain capacity reached")
++            by_domain.setdefault(domain_id, {})[token] = callback
++        return HistoryListenerRegistration(path, domain_id, token)
++
++    def _history_notification_baseline(
++        self, conn: sqlite3.Connection
++    ) -> Optional[tuple[int, tuple[str, ...]]]:
++        path = str(self.db_path.resolve())
++        with _LISTENER_LOCK:
++            domains = tuple(_LISTENERS.get(path, {}))
++        if not domains:
++            return None
++        try:
++            row = conn.execute(
++                "SELECT journal_tail, capture_enabled FROM hermes_history_state "
++                "WHERE singleton=1"
++            ).fetchone()
++        except sqlite3.Error:
++            return None
++        if row is None or not int(row["capture_enabled"]):
++            return None
++        return int(row["journal_tail"]), domains
++
++    @staticmethod
++    def _history_collect_notifications(
++        conn: sqlite3.Connection,
++        baseline: Optional[tuple[int, tuple[str, ...]]],
++    ) -> tuple[tuple[str, int], ...]:
++        if baseline is None:
++            return ()
++        before, domains = baseline
++        try:
++            row = conn.execute(
++                "SELECT journal_tail, capture_enabled FROM hermes_history_state "
++                "WHERE singleton=1"
++            ).fetchone()
++        except sqlite3.Error:
++            return ()
++        if row is None or not int(row["capture_enabled"]):
++            return ()
++        tail = int(row["journal_tail"])
++        if tail <= before:
++            return ()
++        affected = []
++        for domain_id in domains:
++            try:
++                old_match = conn.execute(
++                    "SELECT 1 FROM hermes_history_changes "
++                    "WHERE old_session_id=? AND change_seq>? "
++                    "AND change_seq<=? LIMIT 1",
++                    (domain_id, before, tail),
++                ).fetchone()
++                new_match = conn.execute(
++                    "SELECT 1 FROM hermes_history_changes "
++                    "WHERE new_session_id=? AND change_seq>? "
++                    "AND change_seq<=? LIMIT 1",
++                    (domain_id, before, tail),
++                ).fetchone()
++            except sqlite3.Error:
++                return ()
++            if old_match is not None or new_match is not None:
++                affected.append((domain_id, tail))
++        return tuple(affected)
++
++    def _history_dispatch_notifications(
++        self, notifications: Sequence[tuple[str, int]]
++    ) -> None:
++        if not notifications:
++            return
++        path = str(self.db_path.resolve())
++        for domain_id, tail in notifications:
++            with _LISTENER_LOCK:
++                callbacks = tuple(
++                    _LISTENERS.get(path, {}).get(domain_id, {}).values()
++                )
++            for callback in callbacks:
++                try:
++                    callback(domain_id, tail)
++                except Exception:
++                    logger.exception("history listener callback failed")
++
++    @contextmanager
++    def _history_worker_limits(self):
++        """Temporarily bound this connection's preparation cache footprint."""
++
++        with self._lock:
++            cache_size = int(self._conn.execute("PRAGMA cache_size").fetchone()[0])
++            temp_store = int(self._conn.execute("PRAGMA temp_store").fetchone()[0])
++            self._conn.execute(f"PRAGMA cache_size=-{_WORKER_CACHE_KIB}")
++            # Keep transient sort/index work out of the Python process RSS.
++            # Page/row/deadline bounds still cap every statement's input.
++            self._conn.execute("PRAGMA temp_store=FILE")
++        try:
++            yield
++        finally:
++            with self._lock:
++                self._conn.execute(f"PRAGMA cache_size={cache_size}")
++                self._conn.execute(f"PRAGMA temp_store={temp_store}")
++
++    @staticmethod
++    def _history_message_columns(conn: sqlite3.Connection) -> Sequence[str]:
++        rows = conn.execute("PRAGMA table_info(messages)").fetchall()
++        columns = [str(row[1]) for row in rows]
++        if not columns or "id" not in columns or "session_id" not in columns:
++            raise sqlite3.DatabaseError("messages schema is incompatible with history index")
++        return columns
++
++    @classmethod
++    def _history_message_columns_digest(cls, conn: sqlite3.Connection) -> str:
++        rows = conn.execute("PRAGMA table_info(messages)").fetchall()
++        return _digest([list(row) for row in rows])
++
++    @staticmethod
++    def _history_contract_ok(conn: sqlite3.Connection) -> bool:
++        required_tables = {
++            "hermes_history_state",
++            "hermes_history_changes",
++            "hermes_history_domains",
++            "hermes_history_buckets",
++            "hermes_history_members",
++        }
++        tables = {
++            str(row[0])
++            for row in conn.execute(
++                "SELECT name FROM sqlite_master WHERE type='table' "
++                "AND name LIKE 'hermes_history_%'"
++            ).fetchall()
++        }
++        if not required_tables.issubset(tables):
++            return False
++        for table, expected_columns in _TABLE_COLUMNS.items():
++            table_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
++            actual_columns = {str(row[1]) for row in table_info}
++            if actual_columns != expected_columns:
++                return False
++            actual_shape = tuple(
++                (
++                    str(row[1]),
++                    str(row[2]).upper(),
++                    int(row[3]),
++                    row[4],
++                    int(row[5]),
++                )
++                for row in table_info
++            )
++            if actual_shape != _EXPECTED_TABLE_SHAPES[table]:
++                return False
++        for index, expected_columns in _HISTORY_INDEX_COLUMNS.items():
++            rows = conn.execute(f"PRAGMA index_info({index})").fetchall()
++            if tuple(str(row[2]) for row in rows) != expected_columns:
++                return False
++        triggers = {
++            str(row[0]): _normalize_sql(str(row[1] or ""))
++            for row in conn.execute(
++                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
++                "AND name LIKE 'hermes_history_%'"
++            ).fetchall()
++        }
++        if set(triggers) != set(_TRIGGER_NAMES):
++            return False
++        return triggers == _EXPECTED_TRIGGER_SQL
++
++    def _init_history_schema(self) -> None:
++        """Install derived tables and builtin triggers on a writable handle."""
++
++        conn = self._conn
++        had_state = conn.execute(
++            "SELECT 1 FROM sqlite_master WHERE type='table' "
++            "AND name='hermes_history_state'"
++        ).fetchone() is not None
++        prior_contract_ok = had_state and self._history_contract_ok(conn)
++        if had_state and not prior_contract_ok:
++            for index in _HISTORY_INDEX_COLUMNS:
++                conn.execute(f"DROP INDEX IF EXISTS {index}")
++        conn.executescript(_HISTORY_SCHEMA_SQL)
++        columns_digest = self._history_message_columns_digest(conn)
++        realm_binding = _digest(
++            [
++                "hermes.canonical_history_realm.v1",
++                str(self.db_path.parent.resolve()),
++            ]
++        )
++        row = conn.execute(
++            "SELECT * FROM hermes_history_state WHERE singleton=1"
++        ).fetchone()
++        if row is None:
++            conn.execute(
++                "INSERT INTO hermes_history_state "
++                "(singleton, realm_id, realm_binding, incarnation, activation_epoch, "
++                "activation_process, owner_id, lease_expires_at, capture_enabled, "
++                "message_columns_digest, retained_floor, journal_tail) "
++                "VALUES (1, ?, ?, ?, '', '', '', 0, 1, ?, 0, 0)",
++                (
++                    _new_marker("hhr_"),
++                    realm_binding,
++                    _new_marker("hhi_"),
++                    columns_digest,
++                ),
++            )
++            had_state = False
++        disabled = conn.execute(
++            "SELECT value FROM state_meta WHERE key='history_capture_disabled'"
++        ).fetchone()
++        stored = conn.execute(
++            "SELECT capture_enabled, message_columns_digest, realm_binding "
++            "FROM hermes_history_state WHERE singleton=1"
++        ).fetchone()
++        realm_changed = bool(had_state and stored[2] != realm_binding)
++        incompatible = bool(had_state and (not prior_contract_ok or stored[1] != columns_digest))
++        if realm_changed:
++            new_epoch = _new_marker("hha_")
++            conn.execute(
++                "UPDATE hermes_history_state SET realm_id=?, realm_binding=?, "
++                "incarnation=?, activation_epoch=?, activation_process='', "
++                "owner_id='', lease_expires_at=0, message_columns_digest=? "
++                "WHERE singleton=1",
++                (
++                    _new_marker("hhr_"),
++                    realm_binding,
++                    _new_marker("hhi_"),
++                    new_epoch,
++                    columns_digest,
++                ),
++            )
++            conn.execute(
++                "UPDATE hermes_history_domains SET activation_epoch=?, "
++                "phase='reverification_required', invalidated_from_position=1, "
++                "failure_reason='history_realm_changed'",
++                (new_epoch,),
++            )
++        if incompatible:
++            conn.execute(
++                "UPDATE hermes_history_domains SET phase='reverification_required', "
++                "invalidated_from_position=1, failure_reason='history_contract_changed'"
++            )
++            conn.execute(
++                "UPDATE hermes_history_state SET activation_epoch=?, "
++                "activation_process='', owner_id='', lease_expires_at=0, "
++                "message_columns_digest=? WHERE singleton=1",
++                (_new_marker("hha_"), columns_digest),
++            )
++        if disabled is not None or not bool(stored[0]):
++            self._drop_history_triggers(conn)
++            conn.execute(
++                "UPDATE hermes_history_state SET capture_enabled=0 WHERE singleton=1"
++            )
++            return
++        if not prior_contract_ok or not self._history_contract_ok(conn):
++            self._replace_history_triggers(conn)
++
++    @staticmethod
++    def _drop_history_triggers(conn: sqlite3.Connection) -> None:
++        for name in _TRIGGER_NAMES:
++            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++
++    @classmethod
++    def _replace_history_triggers(cls, conn: sqlite3.Connection) -> None:
++        cls._drop_history_triggers(conn)
++        for name in _TRIGGER_NAMES:
++            conn.execute(_TRIGGER_DECLARATIONS[name])
++
++    def _is_history_index_error(self, exc: sqlite3.Error) -> bool:
++        text = str(exc).lower()
++        if "hermes_history_" in text or "history index" in text:
++            return True
++        try:
++            return not self._history_contract_ok(self._conn)
++        except sqlite3.Error:
++            return True
++
++    def _enter_history_fail_open(self, exc: sqlite3.Error) -> bool:
++        """Disable broken capture and allow the canonical write to retry."""
++
++        if getattr(self, "_history_fail_open_attempted", False):
++            return False
++        if not self._is_history_index_error(exc):
++            return False
++        self._history_fail_open_attempted = True
++        try:
++            with self._lock:
++                self._conn.execute("BEGIN IMMEDIATE")
++                try:
++                    self._conn.execute(
++                        "INSERT INTO state_meta(key, value) VALUES "
++                        "('history_capture_disabled', '1') "
++                        "ON CONFLICT(key) DO UPDATE SET value='1'"
++                    )
++                    if self._conn.execute(
++                        "SELECT 1 FROM sqlite_master WHERE type='table' "
++                        "AND name='hermes_history_state'"
++                    ).fetchone():
++                        self._conn.execute(
++                            "UPDATE hermes_history_state SET capture_enabled=0, "
++                            "activation_epoch=?, activation_process='', owner_id='', "
++                            "lease_expires_at=0 WHERE singleton=1",
++                            (_new_marker("hha_"),),
++                        )
++                    if self._conn.execute(
++                        "SELECT 1 FROM sqlite_master WHERE type='table' "
++                        "AND name='hermes_history_domains'"
++                    ).fetchone():
++                        self._conn.execute(
++                            "UPDATE hermes_history_domains SET "
++                            "phase='reverification_required', "
++                            "invalidated_from_position=1, "
++                            "failure_reason='history_capture_fault'"
++                        )
++                    self._drop_history_triggers(self._conn)
++                    self._conn.commit()
++                except BaseException:
++                    self._conn.rollback()
++                    raise
++        except sqlite3.Error:
++            return False
++        return True
++
++    def _history_with_writer(self, method: str, *args: Any, **kwargs: Any) -> Any:
++        if not self.read_only:
++            return getattr(self, method)(*args, **kwargs)
++        # The caller keeps a SELECT-only handle.  This private host-owned
++        # delegate exposes only the narrow history methods, never the writer.
++        with type(self)(db_path=self.db_path, read_only=False) as writer:
++            return getattr(writer, method)(*args, **kwargs)
++
++    @staticmethod
++    def _history_journal_contiguous(
++        conn: sqlite3.Connection, state: Mapping[str, Any]
++    ) -> bool:
++        """Verify retained journal endpoints without scanning the journal."""
++
++        floor = int(state["retained_floor"])
++        tail = int(state["journal_tail"])
++        retained_count = int(state["retained_count"])
++        if (
++            floor < 0
++            or tail < floor
++            or retained_count < 0
++            or retained_count != tail - floor
++        ):
++            return False
++        first = conn.execute(
++            "SELECT change_seq FROM hermes_history_changes "
++            "WHERE change_seq>? ORDER BY change_seq LIMIT 1",
++            (floor,),
++        ).fetchone()
++        last = conn.execute(
++            "SELECT change_seq FROM hermes_history_changes "
++            "WHERE change_seq>? ORDER BY change_seq DESC LIMIT 1",
++            (floor,),
++        ).fetchone()
++        if floor == tail:
++            return first is None and last is None
++        return (
++            first is not None
++            and last is not None
++            and int(first[0]) == floor + 1
++            and int(last[0]) == tail
++        )
++
++    @staticmethod
++    def _history_rebaseline_journal(conn: sqlite3.Connection) -> int:
++        """Discard an untrusted journal after scheduling full revalidation."""
++
++        sequence = conn.execute(
++            "SELECT seq FROM sqlite_sequence WHERE name='hermes_history_changes'"
++        ).fetchone()
++        state = conn.execute(
++            "SELECT retained_floor, journal_tail FROM hermes_history_state "
++            "WHERE singleton=1"
++        ).fetchone()
++        last = conn.execute(
++            "SELECT change_seq FROM hermes_history_changes "
++            "ORDER BY change_seq DESC LIMIT 1"
++        ).fetchone()
++        baseline = max(
++            int(sequence[0]) if sequence is not None else 0,
++            int(state[0]) if state is not None else 0,
++            int(state[1]) if state is not None else 0,
++            int(last[0]) if last is not None else 0,
++        )
++        conn.execute(
++            "UPDATE hermes_history_state SET retained_floor=?, journal_tail=? "
++            "WHERE singleton=1",
++            (baseline, baseline),
++        )
++        conn.execute(
++            "UPDATE hermes_history_state SET retained_count=0 WHERE singleton=1"
++        )
++        return baseline
++
++    @classmethod
++    def _history_prune_journal(
++        cls, conn: sqlite3.Connection, *, max_rows: int
++    ) -> int:
++        """Delete one bounded, globally consumed contiguous journal prefix."""
++
++        state = dict(
++            conn.execute(
++                "SELECT * FROM hermes_history_state WHERE singleton=1"
++            ).fetchone()
++        )
++        if not cls._history_journal_contiguous(conn, state):
++            raise sqlite3.DatabaseError("history journal continuity lost")
++        safe_row = conn.execute(
++            "SELECT MIN(indexed_change_seq) FROM hermes_history_domains"
++        ).fetchone()
++        safe_through = (
++            int(safe_row[0])
++            if safe_row is not None and safe_row[0] is not None
++            else int(state["journal_tail"])
++        )
++        floor = int(state["retained_floor"])
++        stale = conn.execute(
++            "SELECT change_seq FROM hermes_history_changes "
++            "WHERE change_seq<=? ORDER BY change_seq LIMIT ?",
++            (floor, max_rows),
++        ).fetchall()
++        if stale:
++            conn.executemany(
++                "DELETE FROM hermes_history_changes WHERE change_seq=?",
++                ((int(row[0]),) for row in stale),
++            )
++            return len(stale)
++        if safe_through <= floor:
++            return 0
++        rows = conn.execute(
++            "SELECT change_seq FROM hermes_history_changes "
++            "WHERE change_seq>? AND change_seq<=? ORDER BY change_seq LIMIT ?",
++            (floor, safe_through, max_rows),
++        ).fetchall()
++        if not rows:
++            raise sqlite3.DatabaseError("history journal retained range is missing")
++        sequences = [int(row[0]) for row in rows]
++        if sequences != list(range(floor + 1, floor + 1 + len(sequences))):
++            raise sqlite3.DatabaseError("history journal contains an internal gap")
++        new_floor = sequences[-1]
++        conn.execute(
++            "UPDATE hermes_history_state SET retained_floor=?, "
++            "retained_count=retained_count-? WHERE singleton=1",
++            (new_floor, len(sequences)),
++        )
++        conn.execute(
++            "DELETE FROM hermes_history_changes WHERE change_seq<=?",
++            (new_floor,),
++        )
++        return len(sequences)
++
++    @staticmethod
++    def _history_domain_topology(conn: sqlite3.Connection, domain_id: str) -> Optional[str]:
++        row = conn.execute(
++            "SELECT id, source, user_id, session_key, chat_id, chat_type, "
++            "thread_id, origin_json, model_config, parent_session_id, "
++            "ended_at, end_reason, "
++            "(SELECT end_reason FROM sessions parent "
++            " WHERE parent.id=sessions.parent_session_id) AS parent_end_reason "
++            "FROM sessions WHERE id=?",
++            (domain_id,),
++        ).fetchone()
++        if row is None:
++            return None
++        topology = dict(row)
++        raw_config = topology.pop("model_config", None)
++        try:
++            config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
++        except (TypeError, json.JSONDecodeError):
++            config = {"_invalid_model_config": raw_config}
++        if not isinstance(config, Mapping):
++            config = {"_invalid_model_config": config}
++        # Runtime provider knobs and UI preferences live beside the lineage
++        # markers in model_config.  Only the markers are topology: refreshing
++        # a browser/model lock must not invalidate a canonical transcript.
++        topology["lineage_markers"] = {
++            key: config.get(key)
++            for key in ("_branched_from", "_delegate_from", "_reset_from")
++            if key in config
++        }
++        topology["ended"] = topology.pop("ended_at", None) is not None
++        return "hht_" + _digest(topology)
++
++    @staticmethod
++    def _history_result(
++        state: Mapping[str, Any],
++        domain: Optional[Mapping[str, Any]],
++        *,
++        status: str,
++        reason: str = "",
++        pages: int = 0,
++        rows: int = 0,
++        stored_bytes: int = 0,
++        more: bool = False,
++        head_token: Optional[Mapping[str, Any]] = None,
++    ) -> Dict[str, Any]:
++        domain = dict(domain or {})
++        return {
++            "schema": HISTORY_PREPARE_SCHEMA,
++            "status": status,
++            "reason": reason,
++            "realm_id": str(state.get("realm_id") or ""),
++            "incarnation": str(state.get("incarnation") or ""),
++            "activation_epoch": str(state.get("activation_epoch") or ""),
++            "domain_id": str(domain.get("domain_id") or ""),
++            "topology_revision": str(domain.get("topology_revision") or ""),
++            "canonical_rule_version": HISTORY_RULE_VERSION,
++            "phase": str(domain.get("phase") or ""),
++            "indexed_change_seq": int(domain.get("indexed_change_seq") or 0),
++            "target_change_seq": int(domain.get("scan_base_change_seq") or 0),
++            "target_max_message_id": int(domain.get("target_max_message_id") or 0),
++            "canonical_count": int(domain.get("canonical_count") or 0),
++            "end_anchor": str(domain.get("end_anchor") or ""),
++            "prefix_hash": str(domain.get("prefix_hash") or ""),
++            "invalidated_from_position": domain.get("invalidated_from_position"),
++            "pages_processed": pages,
++            "physical_rows_processed": rows,
++            "stored_bytes_processed": stored_bytes,
++            "more": bool(more),
++            "head_token": dict(head_token) if head_token is not None else None,
++        }
++
++    @staticmethod
++    def _history_prefix_token(
++        state: Mapping[str, Any],
++        domain: Mapping[str, Any],
++        *,
++        count: Optional[int] = None,
++        anchor: Optional[str] = None,
++        prefix_hash: Optional[str] = None,
++        indexed_change_seq: Optional[int] = None,
++    ) -> Dict[str, Any]:
++        canonical_count = int(domain["canonical_count"] if count is None else count)
++        return {
++            "schema": HISTORY_PREFIX_SCHEMA,
++            "realm_id": str(state["realm_id"]),
++            "incarnation": str(state["incarnation"]),
++            "activation_epoch": str(domain["activation_epoch"]),
++            "domain_id": str(domain["domain_id"]),
++            "topology_revision": str(domain["topology_revision"]),
++            "canonical_rule_version": HISTORY_RULE_VERSION,
++            "indexed_change_seq": int(
++                domain["indexed_change_seq"]
++                if indexed_change_seq is None
++                else indexed_change_seq
++            ),
++            "end_anchor": str(domain["end_anchor"] if anchor is None else anchor),
++            "canonical_count": canonical_count,
++            "prefix_hash": str(domain["prefix_hash"] if prefix_hash is None else prefix_hash),
++        }
++
++    def _history_claim(
++        self,
++        conn: sqlite3.Connection,
++        *,
++        owner_id: str,
++        activation_epoch: Optional[str],
++    ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
++        now = time.time()
++        row = dict(
++            conn.execute("SELECT * FROM hermes_history_state WHERE singleton=1").fetchone()
++        )
++        if not self._history_journal_contiguous(conn, row):
++            conn.execute(
++                "UPDATE hermes_history_state SET capture_enabled=0 WHERE singleton=1"
++            )
++            row["capture_enabled"] = 0
++        if not row["capture_enabled"] or not self._history_contract_ok(conn):
++            # Recovery is explicit at the preparation seam.  It rotates the
++            # activation and forces every prior proof through revalidation.
++            self._replace_history_triggers(conn)
++            new_epoch = _new_marker("hha_")
++            self._history_rebaseline_journal(conn)
++            conn.execute("DELETE FROM state_meta WHERE key='history_capture_disabled'")
++            conn.execute(
++                "UPDATE hermes_history_state SET capture_enabled=1, "
++                "activation_epoch=?, activation_process=?, owner_id=?, "
++                "lease_expires_at=?, message_columns_digest=? WHERE singleton=1",
++                (
++                    new_epoch,
++                    _PROCESS_NONCE,
++                    owner_id,
++                    now + _LEASE_SECONDS,
++                    self._history_message_columns_digest(conn),
++                ),
++            )
++            conn.execute(
++                "UPDATE hermes_history_domains SET activation_epoch=?, "
++                "phase='reverification_required', invalidated_from_position=1, "
++                "failure_reason='history_capture_reactivated'",
++                (new_epoch,),
++            )
++            row = dict(
++                conn.execute("SELECT * FROM hermes_history_state WHERE singleton=1").fetchone()
++            )
++
++        live = float(row["lease_expires_at"] or 0) > now
++        same_process = row["activation_process"] == _PROCESS_NONCE
++        # Plugin-manager reloads in the same trusted host process use a new
++        # owner id but must retain committed progress and the host activation.
++        # A different process may take over only after the lease expires.
++        if live and not same_process:
++            return None, "preparation_owner_busy"
++        if activation_epoch is not None and activation_epoch != row["activation_epoch"]:
++            return None, "activation_epoch_changed"
++        if not row["activation_epoch"]:
++            new_epoch = _new_marker("hha_")
++        elif not same_process and not live:
++            new_epoch = _new_marker("hha_")
++            conn.execute(
++                "UPDATE hermes_history_domains SET activation_epoch=?, "
++                "phase='reverification_required', invalidated_from_position=1, "
++                "failure_reason='preparation_process_changed'",
++                (new_epoch,),
++            )
++        else:
++            new_epoch = str(row["activation_epoch"])
++        conn.execute(
++            "UPDATE hermes_history_state SET activation_epoch=?, "
++            "activation_process=?, owner_id=?, lease_expires_at=? WHERE singleton=1",
++            (new_epoch, _PROCESS_NONCE, owner_id, now + _LEASE_SECONDS),
++        )
++        return dict(
++            conn.execute("SELECT * FROM hermes_history_state WHERE singleton=1").fetchone()
++        ), None
++
++    @staticmethod
++    def _history_probe_expression(columns: Sequence[str]) -> str:
++        terms = [
++            f"COALESCE(length(CAST(\"{column}\" AS BLOB)), 0)"
++            for column in columns
++        ]
++        return " + ".join(terms) or "0"
++
++    def _history_probe_page(
++        self,
++        conn: sqlite3.Connection,
++        domain: Mapping[str, Any],
++        *,
++        max_rows: int,
++        max_bytes: int,
++    ) -> tuple[list[sqlite3.Row], Dict[int, int], int, bool, Optional[str]]:
++        columns = self._history_message_columns(conn)
++        expression = self._history_probe_expression(columns)
++        probes = conn.execute(
++            f"SELECT id, ({expression}) AS stored_bytes FROM messages "
++            "WHERE session_id=? AND id>? AND id<=? ORDER BY id LIMIT ?",
++            (
++                domain["domain_id"],
++                domain["cursor_message_id"],
++                domain["target_max_message_id"],
++                max_rows + 1,
++            ),
++        ).fetchall()
++        if not probes:
++            return [], {}, 0, False, None
++        selected: list[int] = []
++        selected_sizes: Dict[int, int] = {}
++        total = 0
++        for probe in probes[:max_rows]:
++            size = int(probe["stored_bytes"] or 0)
++            if size > max_bytes and not selected:
++                return [], {}, 0, True, "history_row_byte_limit_exceeded"
++            if total + size > max_bytes:
++                break
++            selected.append(int(probe["id"]))
++            selected_sizes[int(probe["id"])] = size
++            total += size
++        if not selected:
++            return [], {}, 0, True, "history_page_byte_limit_exceeded"
++        placeholders = ",".join("?" for _ in selected)
++        payload = conn.execute(
++            f"SELECT * FROM messages WHERE session_id=? AND id IN ({placeholders}) "
++            "ORDER BY id",
++            (domain["domain_id"], *selected),
++        ).fetchall()
++        more = len(probes) > len(selected)
++        return payload, selected_sizes, total, more, None
++
++    def _history_row_material(
++        self, row: sqlite3.Row, stored_bytes: int
++    ) -> Dict[str, Any]:
++        raw = dict(row)
++        decoded = self._decode_message_rows([row])[0]
++        raw_active = raw.get("active")
++        raw_compacted = raw.get("compacted")
++        lifecycle_valid = (
++            type(raw_active) is int
++            and raw_active in {0, 1}
++            and type(raw_compacted) is int
++            and raw_compacted in {0, 1}
++        )
++        raw_key = [
++            raw.get("role"),
++            raw.get("content"),
++            raw.get("timestamp"),
++            raw.get("tool_call_id"),
++            raw.get("tool_calls"),
++            raw.get("tool_name"),
++        ]
++        semantic_key = [
++            decoded.get("role"),
++            decoded.get("content"),
++            decoded.get("timestamp"),
++            decoded.get("tool_call_id"),
++            decoded.get("tool_calls"),
++            decoded.get("tool_name"),
++        ]
++        raw_signature = _digest(
++            {key: value for key, value in raw.items() if key not in {"id", "active", "compacted"}}
++        )
++        semantic_signature = _digest(
++            {
++                key: value
++                for key, value in decoded.items()
++                if key not in {"id", "active", "compacted"}
++            }
++        )
++        semantic_key_digest = _digest(semantic_key)
++        anchor = "hca_" + _digest(
++            ["hermes.canonical_history_anchor.v1", raw.get("session_id"), semantic_key_digest]
++        )
++        return {
++            "message_id": int(raw["id"]),
++            "anchor": anchor,
++            "raw_key_digest": _digest(raw_key),
++            "semantic_key_digest": semantic_key_digest,
++            "raw_signature": raw_signature,
++            "semantic_signature": semantic_signature,
++            "stored_bytes": stored_bytes,
++            "active": int(raw_active) if lifecycle_valid else -1,
++            "compacted": int(raw_compacted) if lifecycle_valid else -1,
++        }
++
++    def _history_index_row(
++        self,
++        conn: sqlite3.Connection,
++        domain: Dict[str, Any],
++        row: sqlite3.Row,
++        stored_bytes: int,
++    ) -> Optional[str]:
++        material = self._history_row_material(row, stored_bytes)
++        # Rewound rows remain durable but are absent from the canonical view,
++        # matching SessionDB.get_messages(include_compacted=True) plus the
++        # raw lifecycle audit.  Their restore/update is journaled and causes
++        # the affected suffix to be rebuilt from the current row.
++        if (material["active"], material["compacted"]) == (0, 0):
++            return None
++        if (material["active"], material["compacted"]) not in {(1, 0), (0, 1)}:
++            return "source_lifecycle_invalid"
++        existing_member = conn.execute(
++            "SELECT * FROM hermes_history_members WHERE domain_id=? AND message_id=?",
++            (domain["domain_id"], material["message_id"]),
++        ).fetchone()
++        if existing_member is not None:
++            old = dict(existing_member)
++            comparable = {
++                key: old[key]
++                for key in (
++                    "anchor",
++                    "raw_key_digest",
++                    "semantic_key_digest",
++                    "raw_signature",
++                    "semantic_signature",
++                    "stored_bytes",
++                    "active",
++                    "compacted",
++                )
++            }
++            if comparable == {key: material[key] for key in comparable}:
++                return None
++            return "indexed_row_changed_without_invalidation"
++        bucket_row = conn.execute(
++            "SELECT * FROM hermes_history_buckets "
++            "WHERE domain_id=? AND semantic_key_digest=?",
++            (domain["domain_id"], material["semantic_key_digest"]),
++        ).fetchone()
++        if bucket_row is None:
++            position = int(domain["canonical_count"]) + 1
++            canonical_digest = _chain_digest(
++                "hermes.canonical_history_record.v1",
++                domain["domain_id"],
++                material["anchor"],
++                material["semantic_signature"],
++            )
++            prefix_hash = _chain_digest(domain["prefix_hash"], canonical_digest)
++            conn.execute(
++                "INSERT INTO hermes_history_buckets "
++                "(domain_id, anchor, position, raw_key_digest, semantic_key_digest, "
++                "raw_signature, semantic_signature, earliest_message_id, "
++                "winner_message_id, winner_stored_bytes, physical_count, "
++                "active_count, active, compacted, last_physical_change_seq, "
++                "physical_prefix_max_seq, canonical_digest, prefix_hash) "
++                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 0, ?, ?)",
++                (
++                    domain["domain_id"],
++                    material["anchor"],
++                    position,
++                    material["raw_key_digest"],
++                    material["semantic_key_digest"],
++                    material["raw_signature"],
++                    material["semantic_signature"],
++                    material["message_id"],
++                    material["message_id"],
++                    material["stored_bytes"],
++                    material["active"],
++                    material["active"],
++                    material["compacted"],
++                    domain["scan_base_change_seq"],
++                    canonical_digest,
++                    prefix_hash,
++                ),
++            )
++            domain["canonical_count"] = position
++            domain["end_anchor"] = material["anchor"]
++            domain["prefix_hash"] = prefix_hash
++        else:
++            bucket = dict(bucket_row)
++            if (
++                bucket["raw_key_digest"] != material["raw_key_digest"]
++                or bucket["raw_signature"] != material["raw_signature"]
++                or bucket["semantic_signature"] != material["semantic_signature"]
++            ):
++                return "canonical_clone_audit_collision"
++            if material["active"] and int(bucket["active_count"]) > 0:
++                return "canonical_active_collision"
++            if not material["active"] and int(bucket["active_count"]) > 0:
++                return "canonical_clone_order_invalid"
++            winner_id = material["message_id"]
++            winner_bytes = material["stored_bytes"]
++            active_count = int(bucket["active_count"]) + material["active"]
++            domain["physical_cursor_position"] = min(
++                int(domain["physical_cursor_position"]),
++                int(bucket["position"]) - 1,
++            )
++            conn.execute(
++                "UPDATE hermes_history_buckets SET winner_message_id=?, "
++                "winner_stored_bytes=?, physical_count=physical_count+1, "
++                "active_count=?, active=?, compacted=?, last_physical_change_seq=? "
++                "WHERE domain_id=? AND anchor=?",
++                (
++                    winner_id,
++                    winner_bytes,
++                    active_count,
++                    material["active"],
++                    material["compacted"],
++                    domain["scan_base_change_seq"],
++                    domain["domain_id"],
++                    material["anchor"],
++                ),
++            )
++        conn.execute(
++            "INSERT INTO hermes_history_members "
++            "(domain_id, message_id, anchor, raw_key_digest, semantic_key_digest, "
++            "raw_signature, semantic_signature, stored_bytes, active, compacted) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++            (
++                domain["domain_id"],
++                material["message_id"],
++                material["anchor"],
++                material["raw_key_digest"],
++                material["semantic_key_digest"],
++                material["raw_signature"],
++                material["semantic_signature"],
++                material["stored_bytes"],
++                material["active"],
++                material["compacted"],
++            ),
++        )
++        return None
++
++    @staticmethod
++    def _history_reset_suffix(
++        conn: sqlite3.Connection,
++        domain: Dict[str, Any],
++        position: int,
++    ) -> None:
++        position = max(1, min(position, int(domain["canonical_count"]) + 1))
++        if domain.get("phase") == "resetting" and type(
++            domain.get("invalidated_from_position")
++        ) is int:
++            position = min(position, int(domain["invalidated_from_position"]))
++        domain["phase"] = "resetting"
++        domain["invalidated_from_position"] = position
++        domain["physical_cursor_position"] = min(
++            int(domain["physical_cursor_position"]), position - 1
++        )
++
++    @staticmethod
++    def _history_reset_suffix_page(
++        conn: sqlite3.Connection,
++        domain: Dict[str, Any],
++        *,
++        max_rows: int,
++    ) -> tuple[int, bool]:
++        """Delete one bounded suffix page and persist reset progress."""
++
++        position = domain.get("invalidated_from_position")
++        if type(position) is not int or position < 1:
++            raise sqlite3.DatabaseError("history reset position is invalid")
++        domain_id = domain["domain_id"]
++        processed = 0
++        restart = 1
++        while processed < max_rows:
++            bucket = conn.execute(
++                "SELECT anchor, position, earliest_message_id "
++                "FROM hermes_history_buckets WHERE domain_id=? AND position>=? "
++                "ORDER BY position DESC LIMIT 1",
++                (domain_id, position),
++            ).fetchone()
++            if bucket is None:
++                break
++            remaining = max_rows - processed
++            members = conn.execute(
++                "SELECT message_id FROM hermes_history_members "
++                "WHERE domain_id=? AND anchor=? "
++                "ORDER BY message_id DESC LIMIT ?",
++                (domain_id, bucket["anchor"], remaining),
++            ).fetchall()
++            if members:
++                conn.executemany(
++                    "DELETE FROM hermes_history_members "
++                    "WHERE domain_id=? AND message_id=?",
++                    ((domain_id, int(row["message_id"])) for row in members),
++                )
++                processed += len(members)
++                if processed >= max_rows:
++                    return processed, False
++            restart = int(bucket["earliest_message_id"])
++            conn.execute(
++                "DELETE FROM hermes_history_buckets "
++                "WHERE domain_id=? AND anchor=?",
++                (domain_id, str(bucket["anchor"])),
++            )
++            processed += 1
++
++        remaining_bucket = conn.execute(
++            "SELECT 1 FROM hermes_history_buckets "
++            "WHERE domain_id=? AND position>=? LIMIT 1",
++            (domain_id, position),
++        ).fetchone()
++        if remaining_bucket is not None:
++            return processed, False
++        previous = conn.execute(
++            "SELECT anchor, prefix_hash FROM hermes_history_buckets "
++            "WHERE domain_id=? AND position=?",
++            (domain_id, position - 1),
++        ).fetchone()
++        domain["canonical_count"] = position - 1
++        domain["end_anchor"] = str(previous["anchor"]) if previous else ""
++        domain["prefix_hash"] = (
++            str(previous["prefix_hash"]) if previous else _prefix_zero(domain_id)
++        )
++        domain["cursor_message_id"] = restart - 1
++        domain["phase"] = "building"
++        return processed, True
++
++    @staticmethod
++    def _history_affected_position(
++        conn: sqlite3.Connection,
++        domain_id: str,
++        changes: Sequence[sqlite3.Row],
++        cursor_message_id: int,
++    ) -> Optional[int]:
++        affected: Optional[int] = None
++        for change in changes:
++            if change["object_kind"] == "session":
++                # The current normalized session topology is compared before
++                # journal classification.  Session UPDATE triggers may fire
++                # for a no-op assignment or a runtime-only model_config key;
++                # neither changes any canonical message bucket.
++                continue
++            ids = {
++                value
++                for value in (change["old_row_id"], change["new_row_id"])
++                if type(value) is int
++            }
++            for message_id in ids:
++                row = conn.execute(
++                    "SELECT b.position FROM hermes_history_members m "
++                    "JOIN hermes_history_buckets b ON b.domain_id=m.domain_id "
++                    "AND b.anchor=m.anchor WHERE m.domain_id=? AND m.message_id=?",
++                    (domain_id, message_id),
++                ).fetchone()
++                if row is not None:
++                    position = int(row[0])
++                    affected = position if affected is None else min(affected, position)
++                elif message_id <= cursor_message_id:
++                    return 1
++            if change["operation"] in {"update", "delete"} and not ids:
++                return 1
++        return affected
++
++    def _history_changes_are_unique_tail(
++        self,
++        conn: sqlite3.Connection,
++        domain: Mapping[str, Any],
++        changes: Sequence[sqlite3.Row],
++        *,
++        max_bytes: int,
++    ) -> bool:
++        """Prove a bounded journal slice adds only new post-target anchors."""
++
++        message_ids: list[int] = []
++        target = int(domain["target_max_message_id"])
++        for change in changes:
++            if change["object_kind"] == "session":
++                continue
++            message_id = change["new_row_id"]
++            if (
++                change["object_kind"] != "message"
++                or change["operation"] != "insert"
++                or change["old_row_id"] is not None
++                or type(message_id) is not int
++                or message_id <= target
++                or change["new_session_id"] != domain["domain_id"]
++            ):
++                return False
++            message_ids.append(message_id)
++        if not message_ids:
++            return False
++        if len(message_ids) != len(set(message_ids)):
++            return False
++        columns = self._history_message_columns(conn)
++        expression = self._history_probe_expression(columns)
++        placeholders = ",".join("?" for _ in message_ids)
++        probes = conn.execute(
++            f"SELECT id, ({expression}) AS stored_bytes FROM messages "
++            f"WHERE session_id=? AND id IN ({placeholders}) ORDER BY id",
++            (domain["domain_id"], *message_ids),
++        ).fetchall()
++        if len(probes) != len(message_ids):
++            return False
++        sizes = {int(row["id"]): int(row["stored_bytes"] or 0) for row in probes}
++        if any(size > max_bytes for size in sizes.values()):
++            return False
++        total = sum(sizes.values())
++        if total > max_bytes:
++            return False
++        rows = conn.execute(
++            f"SELECT * FROM messages WHERE session_id=? "
++            f"AND id IN ({placeholders}) ORDER BY id",
++            (domain["domain_id"], *message_ids),
++        ).fetchall()
++        seen: set[str] = set()
++        for row in rows:
++            material = self._history_row_material(row, sizes[int(row["id"])])
++            if (material["active"], material["compacted"]) not in {(1, 0), (0, 1)}:
++                return False
++            semantic_key = material["semantic_key_digest"]
++            if semantic_key in seen:
++                return False
++            seen.add(semantic_key)
++            collision = conn.execute(
++                "SELECT 1 FROM hermes_history_buckets "
++                "WHERE domain_id=? AND semantic_key_digest=?",
++                (domain["domain_id"], semantic_key),
++            ).fetchone()
++            if collision is not None:
++                return False
++        return True
++
++    @staticmethod
++    def _history_finalize_physical_page(
++        conn: sqlite3.Connection,
++        domain: Dict[str, Any],
++        *,
++        max_rows: int,
++    ) -> tuple[int, bool]:
++        """Advance one bounded prefix-max page over finalized buckets."""
++
++        cursor = int(domain["physical_cursor_position"])
++        previous = 0
++        if cursor:
++            row = conn.execute(
++                "SELECT physical_prefix_max_seq FROM hermes_history_buckets "
++                "WHERE domain_id=? AND position=?",
++                (domain["domain_id"], cursor),
++            ).fetchone()
++            if row is None:
++                raise sqlite3.DatabaseError("history physical prefix cursor is missing")
++            previous = int(row[0])
++        rows = conn.execute(
++            "SELECT position, last_physical_change_seq "
++            "FROM hermes_history_buckets WHERE domain_id=? AND position>? "
++            "ORDER BY position LIMIT ?",
++            (domain["domain_id"], cursor, max_rows + 1),
++        ).fetchall()
++        selected = rows[:max_rows]
++        expected = cursor + 1
++        updates = []
++        for row in selected:
++            position = int(row["position"])
++            if position != expected:
++                raise sqlite3.DatabaseError("history physical prefix contains a gap")
++            previous = max(previous, int(row["last_physical_change_seq"]))
++            updates.append((previous, domain["domain_id"], position))
++            expected += 1
++        if updates:
++            conn.executemany(
++                "UPDATE hermes_history_buckets SET physical_prefix_max_seq=? "
++                "WHERE domain_id=? AND position=?",
++                updates,
++            )
++            domain["physical_cursor_position"] = updates[-1][2]
++        complete = (
++            len(rows) <= max_rows
++            and int(domain["physical_cursor_position"]) == int(domain["canonical_count"])
++        )
++        return len(selected), complete
++
++    @staticmethod
++    def _history_save_domain(conn: sqlite3.Connection, domain: Mapping[str, Any]) -> None:
++        conn.execute(
++            "UPDATE hermes_history_domains SET topology_revision=?, "
++            "canonical_rule_version=?, activation_epoch=?, phase=?, "
++            "target_max_message_id=?, scan_base_change_seq=?, "
++            "indexed_change_seq=?, cursor_message_id=?, physical_cursor_position=?, "
++            "canonical_count=?, "
++            "end_anchor=?, prefix_hash=?, invalidated_from_position=?, "
++            "failure_reason=?, updated_at=? WHERE domain_id=?",
++            (
++                domain["topology_revision"],
++                HISTORY_RULE_VERSION,
++                domain["activation_epoch"],
++                domain["phase"],
++                domain["target_max_message_id"],
++                domain["scan_base_change_seq"],
++                domain["indexed_change_seq"],
++                domain["cursor_message_id"],
++                domain["physical_cursor_position"],
++                domain["canonical_count"],
++                domain["end_anchor"],
++                domain["prefix_hash"],
++                domain.get("invalidated_from_position"),
++                domain.get("failure_reason", ""),
++                time.time(),
++                domain["domain_id"],
++            ),
++        )
++
++    def prepare_history_step(
++        self,
++        domain_id: str,
++        *,
++        owner_id: str,
++        activation_epoch: Optional[str] = None,
++        max_pages: int = 8,
++        max_rows_per_page: int = 256,
++        max_page_bytes: int = 4 * 1024 * 1024,
++        max_changes: int = 256,
++        deadline_ms: int = 100,
++    ) -> Dict[str, Any]:
++        """Advance one bounded preparation quantum for a session domain."""
++
++        _require_code(domain_id, "domain_id")
++        _require_code(owner_id, "owner_id")
++        if activation_epoch is not None:
++            _require_code(activation_epoch, "activation_epoch")
++        for value, name in (
++            (max_pages, "max_pages"),
++            (max_rows_per_page, "max_rows_per_page"),
++            (max_page_bytes, "max_page_bytes"),
++            (max_changes, "max_changes"),
++            (deadline_ms, "deadline_ms"),
++        ):
++            if type(value) is not int or value <= 0:
++                raise ValueError(f"{name} must be a positive integer")
++        if self.read_only:
++            return self._history_with_writer(
++                "prepare_history_step",
++                domain_id,
++                owner_id=owner_id,
++                activation_epoch=activation_epoch,
++                max_pages=max_pages,
++                max_rows_per_page=max_rows_per_page,
++                max_page_bytes=max_page_bytes,
++                max_changes=max_changes,
++                deadline_ms=deadline_ms,
++            )
++
++        # A confirmed derived-index fault may have removed a journal table.
++        # Recreate only the host-owned schema before entering the bounded
++        # write transaction; _history_claim then rotates activation and
++        # forces canonical revalidation before any proof can become ready.
++        if not self._history_contract_ok(self._conn):
++            with self._lock:
++                self._init_history_schema()
++
++        deadline = time.monotonic() + deadline_ms / 1000.0
++
++        def _do_body(conn: sqlite3.Connection) -> Dict[str, Any]:
++            state, claim_error = self._history_claim(
++                conn, owner_id=owner_id, activation_epoch=activation_epoch
++            )
++            fallback_state = dict(
++                conn.execute("SELECT * FROM hermes_history_state WHERE singleton=1").fetchone()
++            )
++            if claim_error:
++                return self._history_result(
++                    fallback_state,
++                    {"domain_id": domain_id},
++                    status="busy" if claim_error == "preparation_owner_busy" else "incompatible",
++                    reason=claim_error,
++                )
++            assert state is not None
++            topology = self._history_domain_topology(conn, domain_id)
++            if topology is None:
++                return self._history_result(
++                    state,
++                    {"domain_id": domain_id},
++                    status="incompatible",
++                    reason="history_domain_missing",
++                )
++            current_seq = int(state["journal_tail"])
++            max_id_row = conn.execute(
++                "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id=?",
++                (domain_id,),
++            ).fetchone()
++            current_max_id = int(max_id_row[0])
++            existing = conn.execute(
++                "SELECT * FROM hermes_history_domains WHERE domain_id=?",
++                (domain_id,),
++            ).fetchone()
++            if existing is None:
++                conn.execute(
++                    "INSERT INTO hermes_history_domains "
++                    "(domain_id, topology_revision, canonical_rule_version, "
++                    "activation_epoch, phase, target_max_message_id, "
++                    "scan_base_change_seq, indexed_change_seq, cursor_message_id, "
++                    "physical_cursor_position, canonical_count, end_anchor, prefix_hash, "
++                    "invalidated_from_position, failure_reason, updated_at) "
++                    "VALUES (?, ?, ?, ?, 'building', ?, ?, ?, 0, 0, 0, '', ?, NULL, '', ?)",
++                    (
++                        domain_id,
++                        topology,
++                        HISTORY_RULE_VERSION,
++                        state["activation_epoch"],
++                        current_max_id,
++                        current_seq,
++                        current_seq,
++                        _prefix_zero(domain_id),
++                        time.time(),
++                    ),
++                )
++                existing = conn.execute(
++                    "SELECT * FROM hermes_history_domains WHERE domain_id=?",
++                    (domain_id,),
++                ).fetchone()
++            domain = dict(existing)
++            if domain["activation_epoch"] != state["activation_epoch"]:
++                domain["activation_epoch"] = state["activation_epoch"]
++                self._history_reset_suffix(conn, domain, 1)
++                domain["target_max_message_id"] = current_max_id
++                domain["scan_base_change_seq"] = current_seq
++                domain["failure_reason"] = "activation_epoch_changed"
++            if domain["topology_revision"] != topology:
++                domain["topology_revision"] = topology
++                # Topology is part of the proof identity, not of the canonical
++                # message digest.  Rotating it invalidates old tokens without
++                # rereading an otherwise unchanged transcript.
++                domain["failure_reason"] = ""
++
++            if domain["phase"] in {"reverification_required", "fault"}:
++                self._history_reset_suffix(conn, domain, 1)
++                domain["target_max_message_id"] = current_max_id
++                domain["scan_base_change_seq"] = current_seq
++                domain["failure_reason"] = ""
++            if domain["phase"] == "resetting":
++                reset_rows, _complete = self._history_reset_suffix_page(
++                    conn, domain, max_rows=max_rows_per_page
++                )
++                self._history_save_domain(conn, domain)
++                return self._history_result(
++                    state,
++                    domain,
++                    status="progress",
++                    pages=1,
++                    rows=reset_rows,
++                    more=True,
++                )
++
++            if domain["phase"] == "physicalizing":
++                pending = conn.execute(
++                    "SELECT * FROM hermes_history_changes WHERE change_seq>? "
++                    "AND change_seq<=? AND (old_session_id=? OR new_session_id=?) "
++                    "ORDER BY change_seq LIMIT ?",
++                    (
++                        domain["indexed_change_seq"],
++                        current_seq,
++                        domain_id,
++                        domain_id,
++                        max_changes + 1,
++                    ),
++                ).fetchall()
++                affected = (
++                    1
++                    if len(pending) > max_changes
++                    else self._history_affected_position(
++                        conn, domain_id, pending, int(domain["cursor_message_id"])
++                    )
++                )
++                if affected is not None:
++                    self._history_reset_suffix(conn, domain, affected)
++                    domain["target_max_message_id"] = current_max_id
++                    domain["scan_base_change_seq"] = current_seq
++                    domain["failure_reason"] = ""
++                    self._history_save_domain(conn, domain)
++                    return self._history_result(
++                        state, domain, status="progress", more=True
++                    )
++                message_pending = any(
++                    change["object_kind"] == "message" for change in pending
++                )
++                deferred_tail = (
++                    message_pending
++                    and len(pending) <= max_changes
++                    and self._history_changes_are_unique_tail(
++                        conn, domain, pending, max_bytes=max_page_bytes
++                    )
++                )
++                if message_pending and not deferred_tail:
++                    domain["phase"] = "building"
++                else:
++                    domain["indexed_change_seq"] = current_seq
++                if pending:
++                    domain["target_max_message_id"] = current_max_id
++                    domain["scan_base_change_seq"] = current_seq
++                    domain["failure_reason"] = ""
++                if domain["phase"] == "physicalizing":
++                    finalized, complete = self._history_finalize_physical_page(
++                        conn, domain, max_rows=max_rows_per_page
++                    )
++                    if complete:
++                        domain["phase"] = "ready"
++                        domain["invalidated_from_position"] = None
++                    self._history_save_domain(conn, domain)
++                    if complete:
++                        self._history_prune_journal(conn, max_rows=max_changes)
++                        token = self._history_prefix_token(state, domain)
++                        return self._history_result(
++                            state,
++                            domain,
++                            status="ready",
++                            pages=1 if finalized else 0,
++                            head_token=token,
++                        )
++                    return self._history_result(
++                        state,
++                        domain,
++                        status="progress",
++                        pages=1,
++                        more=True,
++                    )
++
++            if domain["phase"] in {"ready", "reverification_required", "fault"}:
++                pending = conn.execute(
++                    "SELECT * FROM hermes_history_changes WHERE change_seq>? "
++                    "AND change_seq<=? AND (old_session_id=? OR new_session_id=?) "
++                    "ORDER BY change_seq LIMIT ?",
++                    (
++                        domain["indexed_change_seq"],
++                        current_seq,
++                        domain_id,
++                        domain_id,
++                        max_changes + 1,
++                    ),
++                ).fetchall()
++                if len(pending) > max_changes:
++                    # The current canonical snapshot is still available.  A
++                    # conservative full, paged revalidation is finite; trying
++                    # to classify an unbounded journal burst in this quantum
++                    # is not.  This consumes no bodies outside later pages.
++                    affected = 1
++                else:
++                    affected = self._history_affected_position(
++                        conn, domain_id, pending, int(domain["cursor_message_id"])
++                    )
++                if affected is not None:
++                    self._history_reset_suffix(conn, domain, affected)
++                    domain["target_max_message_id"] = current_max_id
++                    domain["scan_base_change_seq"] = current_seq
++                    domain["failure_reason"] = ""
++                    self._history_save_domain(conn, domain)
++                    return self._history_result(
++                        state, domain, status="progress", more=True
++                    )
++                message_pending = any(
++                    change["object_kind"] == "message" for change in pending
++                )
++                if message_pending:
++                    domain["phase"] = "building"
++                if pending:
++                    domain["target_max_message_id"] = current_max_id
++                    domain["scan_base_change_seq"] = current_seq
++                    domain["failure_reason"] = ""
++                elif (
++                    domain["phase"] == "ready"
++                    and int(domain["target_max_message_id"])
++                    > int(domain["cursor_message_id"])
++                ):
++                    domain["phase"] = "building"
++                    domain["scan_base_change_seq"] = int(
++                        domain["indexed_change_seq"]
++                    )
++                if domain["phase"] == "ready":
++                    # Consume unrelated domains' changes without rebuilding
++                    # this domain's canonical prefix.
++                    domain["indexed_change_seq"] = current_seq
++                    self._history_save_domain(conn, domain)
++                    self._history_prune_journal(conn, max_rows=max_changes)
++                    token = self._history_prefix_token(state, domain)
++                    return self._history_result(
++                        state, domain, status="ready", head_token=token
++                    )
++
++            pages = physical_rows = byte_count = 0
++            overflow_reason: Optional[str] = None
++            # One page per BEGIN IMMEDIATE.  The public quantum loops outside
++            # the transaction, so canonical writers get a scheduling point
++            # between pages instead of waiting behind an eight-page lock.
++            while pages < 1 and time.monotonic() < deadline:
++                (
++                    payload,
++                    probed_sizes,
++                    page_bytes,
++                    more_rows,
++                    overflow_reason,
++                ) = self._history_probe_page(
++                    conn,
++                    domain,
++                    max_rows=max_rows_per_page,
++                    max_bytes=max_page_bytes,
++                )
++                if overflow_reason:
++                    domain["phase"] = "overflow"
++                    domain["failure_reason"] = overflow_reason
++                    break
++                if not payload:
++                    # Gaps from deleted AUTOINCREMENT ids can leave the fixed
++                    # physical ceiling above the final extant row.
++                    domain["cursor_message_id"] = domain["target_max_message_id"]
++                    break
++                for row in payload:
++                    failure = self._history_index_row(
++                        conn, domain, row, int(probed_sizes[int(row["id"])])
++                    )
++                    if failure:
++                        domain["phase"] = "fault"
++                        domain["failure_reason"] = failure
++                        domain["invalidated_from_position"] = 1
++                        break
++                    domain["cursor_message_id"] = int(row["id"])
++                    physical_rows += 1
++                pages += 1
++                byte_count += page_bytes
++                if domain["phase"] == "fault" or not more_rows:
++                    break
++
++            if domain["phase"] == "overflow":
++                self._history_save_domain(conn, domain)
++                return self._history_result(
++                    state,
++                    domain,
++                    status="overflow",
++                    reason=domain["failure_reason"],
++                    pages=pages,
++                    rows=physical_rows,
++                    stored_bytes=byte_count,
++                )
++            if domain["phase"] == "fault":
++                self._history_save_domain(conn, domain)
++                return self._history_result(
++                    state,
++                    domain,
++                    status="reverification_required",
++                    reason=domain["failure_reason"],
++                    pages=pages,
++                    rows=physical_rows,
++                    stored_bytes=byte_count,
++                )
++
++            if int(domain["cursor_message_id"]) >= int(domain["target_max_message_id"]):
++                seal_seq = int(state["journal_tail"])
++                changes = conn.execute(
++                    "SELECT * FROM hermes_history_changes WHERE change_seq>? "
++                    "AND change_seq<=? AND (old_session_id=? OR new_session_id=?) "
++                    "ORDER BY change_seq LIMIT ?",
++                    (
++                        domain["scan_base_change_seq"],
++                        seal_seq,
++                        domain_id,
++                        domain_id,
++                        max_changes + 1,
++                    ),
++                ).fetchall()
++                if len(changes) > max_changes:
++                    self._history_reset_suffix(conn, domain, 1)
++                    domain["target_max_message_id"] = current_max_id
++                    domain["scan_base_change_seq"] = seal_seq
++                    domain["failure_reason"] = ""
++                    self._history_save_domain(conn, domain)
++                    return self._history_result(
++                        state, domain, status="progress", more=True
++                    )
++                else:
++                    affected = self._history_affected_position(
++                        conn, domain_id, changes, int(domain["cursor_message_id"])
++                    )
++                    if affected is not None:
++                        self._history_reset_suffix(conn, domain, affected)
++                        domain["target_max_message_id"] = current_max_id
++                        domain["scan_base_change_seq"] = seal_seq
++                        self._history_save_domain(conn, domain)
++                        return self._history_result(
++                            state, domain, status="progress", more=True
++                        )
++                    message_changes = any(
++                        change["object_kind"] == "message" for change in changes
++                    )
++                    deferred_tail = (
++                        message_changes
++                        and self._history_changes_are_unique_tail(
++                            conn, domain, changes, max_bytes=max_page_bytes
++                        )
++                    )
++                    if message_changes and not deferred_tail:
++                        domain["phase"] = "building"
++                        domain["target_max_message_id"] = current_max_id
++                        domain["scan_base_change_seq"] = seal_seq
++                    else:
++                        domain["phase"] = (
++                            "physicalizing"
++                            if int(domain["canonical_count"]) > 0
++                            else "ready"
++                        )
++                        domain["indexed_change_seq"] = seal_seq
++                        if deferred_tail:
++                            domain["target_max_message_id"] = current_max_id
++                            domain["scan_base_change_seq"] = seal_seq
++                        domain["invalidated_from_position"] = None
++                        domain["failure_reason"] = ""
++
++            self._history_save_domain(conn, domain)
++            if domain["phase"] == "ready":
++                self._history_prune_journal(conn, max_rows=max_changes)
++                token = self._history_prefix_token(state, domain)
++                return self._history_result(
++                    state,
++                    domain,
++                    status="ready",
++                    pages=pages,
++                    rows=physical_rows,
++                    stored_bytes=byte_count,
++                    head_token=token,
++                )
++            return self._history_result(
++                state,
++                domain,
++                status="progress",
++                reason=str(domain.get("failure_reason") or ""),
++                pages=pages,
++                rows=physical_rows,
++                stored_bytes=byte_count,
++                more=True,
++            )
++
++        def _do(conn: sqlite3.Connection) -> Dict[str, Any]:
++            conn.set_progress_handler(
++                lambda: 1 if time.monotonic() >= deadline else 0,
++                1000,
++            )
++            try:
++                return _do_body(conn)
++            finally:
++                conn.set_progress_handler(None, 0)
++
++        total_pages = total_rows = total_bytes = 0
++        latest: Optional[Dict[str, Any]] = None
++        with self._history_worker_limits():
++            for _page in range(max_pages):
++                try:
++                    latest = self._execute_write(_do)
++                except sqlite3.OperationalError as exc:
++                    if "interrupted" not in str(exc).lower():
++                        raise
++                    with self._read_ctx() as conn:
++                        state_row = conn.execute(
++                            "SELECT * FROM hermes_history_state WHERE singleton=1"
++                        ).fetchone()
++                        domain_row = conn.execute(
++                            "SELECT * FROM hermes_history_domains WHERE domain_id=?",
++                            (domain_id,),
++                        ).fetchone()
++                    latest = self._history_result(
++                        dict(state_row or {}),
++                        dict(domain_row or {"domain_id": domain_id}),
++                        status="progress",
++                        reason="history_query_budget_exhausted",
++                        more=True,
++                    )
++                    latest["pages_processed"] = total_pages
++                    latest["physical_rows_processed"] = total_rows
++                    latest["stored_bytes_processed"] = total_bytes
++                    return latest
++                total_pages += int(latest["pages_processed"])
++                total_rows += int(latest["physical_rows_processed"])
++                total_bytes += int(latest["stored_bytes_processed"])
++                latest["pages_processed"] = total_pages
++                latest["physical_rows_processed"] = total_rows
++                latest["stored_bytes_processed"] = total_bytes
++                if latest["status"] != "progress" or not latest["more"]:
++                    return latest
++                if time.monotonic() >= deadline:
++                    return latest
++        assert latest is not None
++        return latest
++
++    def invalidate_history_for_rollback(self) -> Dict[str, Any]:
++        """Invalidate proofs and detach capture before an older host takes over."""
++
++        if self.read_only:
++            return self._history_with_writer("invalidate_history_for_rollback")
++
++        def _do(conn: sqlite3.Connection) -> Dict[str, Any]:
++            state = dict(
++                conn.execute(
++                    "SELECT * FROM hermes_history_state WHERE singleton=1"
++                ).fetchone()
++            )
++            disabled = conn.execute(
++                "SELECT 1 FROM state_meta WHERE key='history_capture_disabled'"
++            ).fetchone()
++            if state["capture_enabled"] or disabled is None:
++                epoch = _new_marker("hha_")
++                conn.execute(
++                    "UPDATE hermes_history_state SET capture_enabled=0, "
++                    "activation_epoch=?, activation_process='', owner_id='', "
++                    "lease_expires_at=0 WHERE singleton=1",
++                    (epoch,),
++                )
++                conn.execute(
++                    "UPDATE hermes_history_domains SET activation_epoch=?, "
++                    "phase='reverification_required', invalidated_from_position=1, "
++                    "failure_reason='history_rollback_handoff'",
++                    (epoch,),
++                )
++            else:
++                epoch = str(state["activation_epoch"])
++            conn.execute(
++                "INSERT INTO state_meta(key, value) VALUES "
++                "('history_capture_disabled', 'rollback') "
++                "ON CONFLICT(key) DO UPDATE SET value='rollback'"
++            )
++            self._drop_history_triggers(conn)
++            return {
++                "schema": HISTORY_INVALIDATION_SCHEMA,
++                "status": "invalidated",
++                "reason": "rollback_handoff",
++                "activation_epoch": epoch,
++                "capture_enabled": False,
++            }
++
++        return self._execute_write(_do)
++
++    @staticmethod
++    def _history_validation_result(
++        status: str,
++        reason: str,
++        *,
++        current_seq: int = 0,
++        invalidated_from: Optional[int] = None,
++    ) -> Dict[str, Any]:
++        return {
++            "schema": HISTORY_VALIDATION_SCHEMA,
++            "status": status,
++            "reason": reason,
++            "current_indexed_change_seq": current_seq,
++            "invalidated_from_position": invalidated_from,
++        }
++
++    def _history_validate_token_conn(
++        self, conn: sqlite3.Connection, token: Mapping[str, Any]
++    ) -> Dict[str, Any]:
++        try:
++            normalized = _normalize_prefix_token(token)
++        except ValueError as exc:
++            return self._history_validation_result("incompatible", str(exc))
++        if not self._history_contract_ok(conn):
++            return self._history_validation_result(
++                "incompatible", "history_contract_missing"
++            )
++        state_row = conn.execute(
++            "SELECT * FROM hermes_history_state WHERE singleton=1"
++        ).fetchone()
++        domain_row = conn.execute(
++            "SELECT * FROM hermes_history_domains WHERE domain_id=?",
++            (normalized["domain_id"],),
++        ).fetchone()
++        if state_row is None or domain_row is None:
++            return self._history_validation_result("incompatible", "history_domain_missing")
++        state = dict(state_row)
++        domain = dict(domain_row)
++        current_seq = int(domain["indexed_change_seq"])
++        if not state["capture_enabled"] or not self._history_journal_contiguous(
++            conn, state
++        ):
++            return self._history_validation_result(
++                "incompatible", "history_journal_untrusted", current_seq=current_seq
++            )
++        if (
++            normalized["realm_id"] != state["realm_id"]
++            or normalized["incarnation"] != state["incarnation"]
++            or normalized["activation_epoch"] != domain["activation_epoch"]
++            or normalized["topology_revision"] != domain["topology_revision"]
++        ):
++            return self._history_validation_result(
++                "incompatible", "history_identity_changed", current_seq=current_seq
++            )
++        current_topology = self._history_domain_topology(
++            conn, normalized["domain_id"]
++        )
++        if current_topology != domain["topology_revision"]:
++            return self._history_validation_result(
++                "incompatible", "history_topology_changed", current_seq=current_seq
++            )
++        if int(normalized["indexed_change_seq"]) > current_seq:
++            return self._history_validation_result(
++                "incompatible", "history_watermark_from_future", current_seq=current_seq
++            )
++        pending = conn.execute(
++            "SELECT 1 FROM hermes_history_changes WHERE change_seq>? "
++            "AND (old_session_id=? OR new_session_id=?) LIMIT 1",
++            (
++                current_seq,
++                normalized["domain_id"],
++                normalized["domain_id"],
++            ),
++        ).fetchone()
++        if pending is not None or domain["phase"] != "ready":
++            return self._history_validation_result(
++                "pending",
++                "history_changes_pending",
++                current_seq=current_seq,
++                invalidated_from=domain["invalidated_from_position"],
++            )
++        count = int(normalized["canonical_count"])
++        if count == 0:
++            actual_anchor = ""
++            actual_hash = _prefix_zero(normalized["domain_id"])
++            physical_prefix_max = 0
++        else:
++            row = conn.execute(
++                "SELECT anchor, prefix_hash, physical_prefix_max_seq "
++                "FROM hermes_history_buckets "
++                "WHERE domain_id=? AND position=?",
++                (normalized["domain_id"], count),
++            ).fetchone()
++            if row is None:
++                return self._history_validation_result(
++                    "changed", "history_prefix_shortened", current_seq=current_seq
++                )
++            actual_anchor, actual_hash = str(row["anchor"]), str(row["prefix_hash"])
++            physical_prefix_max = int(row["physical_prefix_max_seq"])
++        if (
++            actual_anchor != normalized["end_anchor"]
++            or actual_hash != normalized["prefix_hash"]
++        ):
++            return self._history_validation_result(
++                "changed",
++                "history_prefix_changed",
++                current_seq=current_seq,
++                invalidated_from=domain["invalidated_from_position"],
++            )
++        physical_refresh = None
++        watermark = int(normalized["indexed_change_seq"])
++        if physical_prefix_max > watermark:
++            low, high = 1, count
++            while low < high:
++                middle = (low + high) // 2
++                probe = conn.execute(
++                    "SELECT physical_prefix_max_seq FROM hermes_history_buckets "
++                    "WHERE domain_id=? AND position=?",
++                    (normalized["domain_id"], middle),
++                ).fetchone()
++                if probe is None:
++                    return self._history_validation_result(
++                        "changed",
++                        "history_physical_prefix_missing",
++                        current_seq=current_seq,
++                    )
++                if int(probe[0]) > watermark:
++                    high = middle
++                else:
++                    low = middle + 1
++            physical_refresh = low
++        return self._history_validation_result(
++            "valid",
++            "",
++            current_seq=current_seq,
++            invalidated_from=physical_refresh,
++        )
++
++    def validate_history_prefix(self, token: Mapping[str, Any]) -> Dict[str, Any]:
++        """Validate a prefix proof without starting preparation or a model."""
++
++        with self._read_ctx() as conn:
++            conn.execute("BEGIN")
++            try:
++                return self._history_validate_token_conn(conn, token)
++            finally:
++                conn.rollback()
++
++    def seal_history_prefix(
++        self,
++        domain_id: str,
++        *,
++        activation_epoch: str,
++        end_anchor: Optional[str],
++    ) -> Dict[str, Any]:
++        """Mint a proof for a prepared complete prefix ending at ``anchor``."""
++
++        _require_code(domain_id, "domain_id")
++        _require_code(activation_epoch, "activation_epoch")
++        anchor = "" if end_anchor is None else _require_anchor(end_anchor, "end_anchor")
++        with self._read_ctx() as conn:
++            conn.execute("BEGIN")
++            try:
++                if not self._history_contract_ok(conn):
++                    return {
++                        "schema": HISTORY_SEAL_SCHEMA,
++                        "status": "incompatible",
++                        "reason": "history_contract_missing",
++                        "token": None,
++                    }
++                state_row = conn.execute(
++                    "SELECT * FROM hermes_history_state WHERE singleton=1"
++                ).fetchone()
++                domain_row = conn.execute(
++                    "SELECT * FROM hermes_history_domains WHERE domain_id=?",
++                    (domain_id,),
++                ).fetchone()
++                if state_row is None or domain_row is None:
++                    return {
++                        "schema": HISTORY_SEAL_SCHEMA,
++                        "status": "incompatible",
++                        "reason": "history_domain_missing",
++                        "token": None,
++                    }
++                state, domain = dict(state_row), dict(domain_row)
++                if domain["activation_epoch"] != activation_epoch:
++                    return {
++                        "schema": HISTORY_SEAL_SCHEMA,
++                        "status": "incompatible",
++                        "reason": "activation_epoch_changed",
++                        "token": None,
++                    }
++                validation = self._history_validate_token_conn(
++                    conn, self._history_prefix_token(state, domain)
++                )
++                if validation["status"] != "valid":
++                    return {
++                        "schema": HISTORY_SEAL_SCHEMA,
++                        "status": validation["status"],
++                        "reason": validation["reason"],
++                        "token": None,
++                    }
++                if anchor == "":
++                    token = self._history_prefix_token(
++                        state,
++                        domain,
++                        count=0,
++                        anchor="",
++                        prefix_hash=_prefix_zero(domain_id),
++                    )
++                else:
++                    row = conn.execute(
++                        "SELECT position, prefix_hash FROM hermes_history_buckets "
++                        "WHERE domain_id=? AND anchor=?",
++                        (domain_id, anchor),
++                    ).fetchone()
++                    if row is None:
++                        return {
++                            "schema": HISTORY_SEAL_SCHEMA,
++                            "status": "changed",
++                            "reason": "history_anchor_unknown",
++                            "token": None,
++                        }
++                    token = self._history_prefix_token(
++                        state,
++                        domain,
++                        count=int(row["position"]),
++                        anchor=anchor,
++                        prefix_hash=str(row["prefix_hash"]),
++                    )
++                return {
++                    "schema": HISTORY_SEAL_SCHEMA,
++                    "status": "valid",
++                    "reason": "",
++                    "token": token,
++                }
++            finally:
++                conn.rollback()
++
++    def read_history_page(
++        self,
++        domain_id: str,
++        *,
++        target: Mapping[str, Any],
++        cursor: Optional[Mapping[str, Any]] = None,
++        max_rows: int = 256,
++        max_bytes: int = 4 * 1024 * 1024,
++    ) -> Dict[str, Any]:
++        """Read one keyset page after proving the fixed target is current."""
++
++        _require_code(domain_id, "domain_id")
++        token = _normalize_prefix_token(target)
++        if token["domain_id"] != domain_id:
++            raise ValueError("target belongs to a different history domain")
++        if type(max_rows) is not int or max_rows <= 0:
++            raise ValueError("max_rows must be a positive integer")
++        if type(max_bytes) is not int or max_bytes <= 0:
++            raise ValueError("max_bytes must be a positive integer")
++        page_cursor = (
++            make_history_cursor(token)
++            if cursor is None
++            else _normalize_cursor(cursor, token)
++        )
++        with self._read_ctx() as conn:
++            conn.execute("BEGIN")
++            try:
++                validation = self._history_validate_token_conn(conn, token)
++                if validation["status"] != "valid":
++                    return {
++                        "schema": HISTORY_PAGE_SCHEMA,
++                        "status": validation["status"],
++                        "reason": validation["reason"],
++                        "target": token,
++                        "rows": [],
++                        "entries": [],
++                        "page_token": None,
++                        "next_cursor": None,
++                        "scan_complete": False,
++                        "returned_rows": 0,
++                        "stored_bytes": 0,
++                    }
++                index_rows = conn.execute(
++                    "SELECT * FROM hermes_history_buckets WHERE domain_id=? "
++                    "AND position>? AND position<=? ORDER BY position LIMIT ?",
++                    (
++                        domain_id,
++                        page_cursor["after_position"],
++                        token["canonical_count"],
++                        max_rows + 1,
++                    ),
++                ).fetchall()
++                selected = []
++                total = 0
++                for index_row in index_rows[:max_rows]:
++                    size = int(index_row["winner_stored_bytes"])
++                    if size > max_bytes and not selected:
++                        return {
++                            "schema": HISTORY_PAGE_SCHEMA,
++                            "status": "overflow",
++                            "reason": "history_row_byte_limit_exceeded",
++                            "target": token,
++                            "rows": [],
++                            "entries": [],
++                            "page_token": None,
++                            "next_cursor": None,
++                            "scan_complete": False,
++                            "returned_rows": 0,
++                            "stored_bytes": 0,
++                        }
++                    if total + size > max_bytes:
++                        break
++                    selected.append(index_row)
++                    total += size
++                if not selected and index_rows:
++                    raise AssertionError("history page budget selection made no progress")
++                winner_ids = [int(row["winner_message_id"]) for row in selected]
++                raw_rows: list[sqlite3.Row] = []
++                if winner_ids:
++                    placeholders = ",".join("?" for _ in winner_ids)
++                    fetched = conn.execute(
++                        f"SELECT * FROM messages WHERE session_id=? "
++                        f"AND id IN ({placeholders})",
++                        (domain_id, *winner_ids),
++                    ).fetchall()
++                    by_id = {int(row["id"]): row for row in fetched}
++                    if set(by_id) != set(winner_ids):
++                        return {
++                            "schema": HISTORY_PAGE_SCHEMA,
++                            "status": "changed",
++                            "reason": "history_winner_missing",
++                            "target": token,
++                            "rows": [],
++                            "entries": [],
++                            "page_token": None,
++                            "next_cursor": None,
++                            "scan_complete": False,
++                            "returned_rows": 0,
++                            "stored_bytes": 0,
++                        }
++                    raw_rows = [by_id[value] for value in winner_ids]
++                decoded = self._decode_message_rows(raw_rows)
++                entries = [
++                    {
++                        "anchor": str(row["anchor"]),
++                        "position": int(row["position"]),
++                        "canonical_count": int(row["position"]),
++                        "prefix_hash": str(row["prefix_hash"]),
++                        "stored_bytes": int(row["winner_stored_bytes"]),
++                        "physical_count": int(row["physical_count"]),
++                        "active": int(row["active"]),
++                        "compacted": int(row["compacted"]),
++                    }
++                    for row in selected
++                ]
++                if selected:
++                    last = selected[-1]
++                    page_token = {
++                        **token,
++                        "end_anchor": str(last["anchor"]),
++                        "canonical_count": int(last["position"]),
++                        "prefix_hash": str(last["prefix_hash"]),
++                    }
++                    next_cursor = make_history_cursor(
++                        token,
++                        after_position=int(last["position"]),
++                        pending_boundary_anchor=page_cursor["pending_boundary_anchor"],
++                    )
++                else:
++                    page_token = None
++                    next_cursor = page_cursor
++                complete = (
++                    not selected
++                    or int(selected[-1]["position"]) >= int(token["canonical_count"])
++                )
++                return {
++                    "schema": HISTORY_PAGE_SCHEMA,
++                    "status": "ready",
++                    "reason": "",
++                    "target": token,
++                    "rows": decoded,
++                    "entries": entries,
++                    "page_token": page_token,
++                    "next_cursor": None if complete else next_cursor,
++                    "scan_complete": complete,
++                    "returned_rows": len(decoded),
++                    "stored_bytes": total,
++                }
++            finally:
++                conn.rollback()
++
++
++__all__ = [
++    "HISTORY_PREFIX_SCHEMA",
++    "HISTORY_RULE_VERSION",
++    "SessionHistoryMixin",
++    "make_history_cursor",
++]
+diff --git a/tests/test_hermes_state_history.py b/tests/test_hermes_state_history.py
+new file mode 100644
+index 0000000..e6d1910
+--- /dev/null
++++ b/tests/test_hermes_state_history.py
+@@ -0,0 +1,1102 @@
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++import hermes_state_history
++from hermes_state import SessionDB
++from hermes_state_history import (
++    HISTORY_CURSOR_SCHEMA,
++    HISTORY_PREFIX_SCHEMA,
++    make_history_cursor,
++)
++
++
++@pytest.fixture
++def history_db(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("history", source="cli")
++    try:
++        yield db
++    finally:
++        db.close()
++
++
++def _append_turn(db: SessionDB, number: int) -> None:
++    db.append_message("history", "user", f"user-{number}", timestamp=number * 2)
++    db.append_message(
++        "history", "assistant", f"assistant-{number}", timestamp=number * 2 + 1
++    )
++
++
++def _prepare(db: SessionDB, *, owner: str = "test-owner") -> dict:
++    epoch = None
++    for _ in range(20):
++        result = db.prepare_history_step(
++            "history",
++            owner_id=owner,
++            activation_epoch=epoch,
++            max_pages=2,
++            max_rows_per_page=2,
++        )
++        epoch = result["activation_epoch"] or epoch
++        if result["status"] != "progress":
++            return result
++    raise AssertionError("history preparation did not finish")
++
++
++def test_readonly_handle_prepares_and_reads_keyset_pages(history_db):
++    for number in range(3):
++        _append_turn(history_db, number)
++
++    with SessionDB(history_db.db_path, read_only=True) as reader:
++        prepared = _prepare(reader)
++        assert prepared["status"] == "ready"
++        token = prepared["head_token"]
++        assert token["schema"] == HISTORY_PREFIX_SCHEMA
++        assert set(token) == {
++            "schema",
++            "realm_id",
++            "incarnation",
++            "activation_epoch",
++            "domain_id",
++            "topology_revision",
++            "canonical_rule_version",
++            "indexed_change_seq",
++            "end_anchor",
++            "canonical_count",
++            "prefix_hash",
++        }
++
++        first = reader.read_history_page(
++            "history", target=token, max_rows=2, max_bytes=1024 * 1024
++        )
++        assert first["status"] == "ready"
++        assert [row["content"] for row in first["rows"]] == ["user-0", "assistant-0"]
++        assert first["scan_complete"] is False
++        assert first["next_cursor"]["schema"] == HISTORY_CURSOR_SCHEMA
++
++        second = reader.read_history_page(
++            "history",
++            target=token,
++            cursor=first["next_cursor"],
++            max_rows=2,
++            max_bytes=1024 * 1024,
++        )
++        assert [row["content"] for row in second["rows"]] == [
++            "user-1",
++            "assistant-1",
++        ]
++
++        random_access = reader.read_history_page(
++            "history",
++            target=token,
++            cursor=make_history_cursor(token, after_position=4),
++            max_rows=2,
++        )
++        assert [row["content"] for row in random_access["rows"]] == [
++            "user-2",
++            "assistant-2",
++        ]
++        assert random_access["scan_complete"] is True
++
++
++def test_page_byte_budget_refuses_before_payload_decode(history_db, monkeypatch):
++    history_db.append_message("history", "user", "x" * 1024)
++    prepared = _prepare(history_db)
++    assert prepared["status"] == "ready"
++
++    def _decode_must_not_run(_rows):
++        raise AssertionError("payload decoded before byte budget rejection")
++
++    monkeypatch.setattr(history_db, "_decode_message_rows", _decode_must_not_run)
++    page = history_db.read_history_page(
++        "history", target=prepared["head_token"], max_bytes=32
++    )
++    assert page["status"] == "overflow"
++    assert page["reason"] == "history_row_byte_limit_exceeded"
++    assert page["rows"] == []
++
++
++def test_prepare_reports_pages_for_shared_quantum(history_db):
++    for number in range(4):
++        _append_turn(history_db, number)
++
++    result = history_db.prepare_history_step(
++        "history",
++        owner_id="quantum-owner",
++        max_pages=3,
++        max_rows_per_page=1,
++        deadline_ms=1_000,
++    )
++
++    assert result["status"] == "progress"
++    assert result["pages_processed"] == 3
++    assert result["physical_rows_processed"] == 3
++
++
++def test_prepare_interrupts_expensive_sql_and_restores_worker_pragmas(
++    history_db, monkeypatch
++):
++    _append_turn(history_db, 1)
++    history_db._conn.execute("PRAGMA cache_size=-12345")
++    history_db._conn.execute("PRAGMA temp_store=MEMORY")
++
++    def _slow_probe(conn, _domain, **_kwargs):
++        conn.execute(
++            "WITH RECURSIVE counter(value) AS ("
++            "VALUES(0) UNION ALL SELECT value + 1 FROM counter "
++            "WHERE value < 100000000) SELECT sum(value) FROM counter"
++        ).fetchone()
++        raise AssertionError("SQL progress handler did not interrupt the query")
++
++    monkeypatch.setattr(history_db, "_history_probe_page", _slow_probe)
++    result = history_db.prepare_history_step(
++        "history",
++        owner_id="deadline-owner",
++        max_pages=1,
++        deadline_ms=25,
++    )
++
++    assert result["status"] == "progress"
++    assert result["reason"] == "history_query_budget_exhausted"
++    assert history_db._conn.execute("PRAGMA cache_size").fetchone()[0] == -12345
++    assert history_db._conn.execute("PRAGMA temp_store").fetchone()[0] == 2
++
++
++def test_seal_partial_prefix_and_validate_after_append(history_db):
++    _append_turn(history_db, 1)
++    prepared = _prepare(history_db)
++    token = prepared["head_token"]
++    page = history_db.read_history_page("history", target=token)
++    first_anchor = page["entries"][0]["anchor"]
++
++    sealed = history_db.seal_history_prefix(
++        "history",
++        activation_epoch=prepared["activation_epoch"],
++        end_anchor=first_anchor,
++    )
++    assert sealed["status"] == "valid"
++    assert sealed["token"]["canonical_count"] == 1
++
++    history_db.append_message("history", "user", "later")
++    assert history_db.validate_history_prefix(sealed["token"])["status"] == "pending"
++    assert _prepare(history_db)["status"] == "ready"
++    validation = history_db.validate_history_prefix(sealed["token"])
++    assert validation["status"] == "valid"
++    assert validation["invalidated_from_position"] is None
++
++
++def test_update_invalidates_old_prefix_after_bounded_rebuild(history_db):
++    _append_turn(history_db, 1)
++    original = _prepare(history_db)["head_token"]
++    first_id = history_db.get_messages("history")[0]["id"]
++
++    history_db._execute_write(
++        lambda conn: conn.execute(
++            "UPDATE messages SET content='edited' WHERE id=?", (first_id,)
++        )
++    )
++    assert history_db.validate_history_prefix(original)["status"] == "pending"
++    rebuilt = _prepare(history_db)
++    assert rebuilt["status"] == "ready"
++    validation = history_db.validate_history_prefix(original)
++    assert validation["status"] == "changed"
++    assert rebuilt["head_token"]["prefix_hash"] != original["prefix_hash"]
++
++
++def test_rewind_removes_rows_and_restore_reintroduces_them(history_db):
++    _append_turn(history_db, 1)
++    _append_turn(history_db, 2)
++    initial = _prepare(history_db)
++    target_id = history_db.get_messages("history")[2]["id"]
++
++    history_db.rewind_to_message("history", target_id)
++    rewound = _prepare(history_db)
++    assert rewound["status"] == "ready"
++    assert rewound["canonical_count"] == 2
++    assert history_db.validate_history_prefix(initial["head_token"])["status"] == "changed"
++
++    assert history_db.restore_rewound("history", target_id) == 2
++    restored = _prepare(history_db)
++    assert restored["status"] == "ready"
++    assert restored["canonical_count"] == 4
++    assert restored["head_token"]["prefix_hash"] == initial["head_token"]["prefix_hash"]
++
++
++def test_compaction_clones_collapse_but_sidecar_collision_fails_closed(history_db):
++    _append_turn(history_db, 1)
++    initial = history_db.get_messages("history")
++    history_db.archive_and_compact("history", initial)
++
++    prepared = _prepare(history_db)
++    assert prepared["status"] == "ready"
++    assert prepared["canonical_count"] == 2
++    page = history_db.read_history_page("history", target=prepared["head_token"])
++    assert [entry["physical_count"] for entry in page["entries"]] == [2, 2]
++
++    history_db.set_latest_matching_message_display_kind(
++        "history", role="user", content="user-1", display_kind="changed"
++    )
++    failed = _prepare(history_db)
++    assert failed["status"] == "reverification_required"
++    assert failed["reason"] == "canonical_clone_audit_collision"
++
++
++def test_clone_lifecycle_keeps_logical_token_valid_but_requests_physical_refresh(
++    history_db,
++):
++    _append_turn(history_db, 1)
++    old_token = _prepare(history_db)["head_token"]
++    history_db.archive_and_compact("history", history_db.get_messages("history"))
++
++    refreshed = _prepare(history_db)
++    assert refreshed["status"] == "ready"
++    assert refreshed["head_token"]["prefix_hash"] == old_token["prefix_hash"]
++    validation = history_db.validate_history_prefix(old_token)
++    assert validation["status"] == "valid"
++    assert validation["invalidated_from_position"] == 1
++
++
++def test_physical_validation_uses_point_lookups_for_large_old_prefix(history_db):
++    history_db._execute_write(
++        lambda conn: conn.executemany(
++            "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) "
++            "VALUES ('history', 'user', ?, ?, 1, 0)",
++            [(f"message-{number}", number) for number in range(512)],
++        )
++    )
++    old = history_db.prepare_history_step(
++        "history",
++        owner_id="physical-proof",
++        max_pages=8,
++        max_rows_per_page=256,
++        deadline_ms=1_000,
++    )
++    assert old["status"] == "ready"
++    history_db.archive_and_compact(
++        "history", history_db.get_messages("history", include_compacted=True)
++    )
++    refreshed = {"status": "progress"}
++    for _ in range(8):
++        refreshed = history_db.prepare_history_step(
++            "history",
++            owner_id="physical-proof",
++            activation_epoch=old["activation_epoch"],
++            max_pages=8,
++            max_rows_per_page=256,
++            deadline_ms=1_000,
++        )
++        if refreshed["status"] == "ready":
++            break
++    assert refreshed["status"] == "ready"
++
++    plan = history_db._conn.execute(
++        "EXPLAIN QUERY PLAN SELECT physical_prefix_max_seq "
++        "FROM hermes_history_buckets WHERE domain_id=? AND position=?",
++        ("history", 256),
++    ).fetchall()
++    assert "index" in " ".join(str(row[3]).lower() for row in plan)
++
++    def _validation_steps(token):
++        steps = 0
++
++        def _step():
++            nonlocal steps
++            steps += 1
++            return 0
++
++        history_db._conn.set_progress_handler(_step, 1)
++        try:
++            return history_db._history_validate_token_conn(history_db._conn, token), steps
++        finally:
++            history_db._conn.set_progress_handler(None, 0)
++
++    current_result, current_steps = _validation_steps(refreshed["head_token"])
++    old_result, old_steps = _validation_steps(old["head_token"])
++    assert current_result["status"] == "valid"
++    assert old_result["status"] == "valid"
++    assert old_result["invalidated_from_position"] == 1
++    assert old_steps <= current_steps + 600
++
++
++def test_future_watermark_cannot_mask_physical_changes(history_db):
++    _append_turn(history_db, 1)
++    prepared = _prepare(history_db)
++    future = dict(prepared["head_token"])
++    future["indexed_change_seq"] += 1
++
++    validation = history_db.validate_history_prefix(future)
++
++    assert validation["status"] == "incompatible"
++    assert validation["reason"] == "history_watermark_from_future"
++
++
++def test_journal_is_transactional_and_contains_no_message_body(history_db):
++    before = history_db._conn.execute(
++        "SELECT COALESCE(MAX(change_seq), 0) FROM hermes_history_changes"
++    ).fetchone()[0]
++
++    def _rollback(conn):
++        conn.execute(
++            "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) "
++            "VALUES ('history', 'user', 'secret-body', 1, 1, 0)"
++        )
++        raise RuntimeError("rollback")
++
++    with pytest.raises(RuntimeError, match="rollback"):
++        history_db._execute_write(_rollback)
++    after = history_db._conn.execute(
++        "SELECT COALESCE(MAX(change_seq), 0) FROM hermes_history_changes"
++    ).fetchone()[0]
++    assert after == before
++    assert history_db._conn.execute(
++        "SELECT 1 FROM messages WHERE content='secret-body'"
++    ).fetchone() is None
++    journal_columns = {
++        row[1]
++        for row in history_db._conn.execute(
++            "PRAGMA table_info(hermes_history_changes)"
++        ).fetchall()
++    }
++    assert journal_columns == {
++        "change_seq",
++        "object_kind",
++        "operation",
++        "old_session_id",
++        "old_row_id",
++        "new_session_id",
++        "new_row_id",
++    }
++
++
++def test_broken_journal_fails_open_for_canonical_write_then_reverifies(history_db):
++    _append_turn(history_db, 1)
++    old = _prepare(history_db)["head_token"]
++    history_db._conn.execute("DROP TABLE hermes_history_changes")
++
++    row_id = history_db.append_message("history", "user", "survives-index-fault")
++    assert row_id > 0
++    assert history_db.get_messages("history")[-1]["content"] == "survives-index-fault"
++    assert history_db._conn.execute(
++        "SELECT value FROM state_meta WHERE key='history_capture_disabled'"
++    ).fetchone()[0] == "1"
++    assert history_db.validate_history_prefix(old)["status"] == "incompatible"
++
++    recovered = _prepare(history_db)
++    assert recovered["status"] == "ready"
++    assert recovered["activation_epoch"] != old["activation_epoch"]
++    assert recovered["canonical_count"] == 3
++
++
++def test_cursor_and_token_reject_bool_and_cross_target_mutation(history_db):
++    _append_turn(history_db, 1)
++    token = _prepare(history_db)["head_token"]
++    with pytest.raises(ValueError, match="after_position"):
++        make_history_cursor(token, after_position=True)
++    cursor = make_history_cursor(token)
++    cursor["target_count"] += 1
++    with pytest.raises(ValueError, match="does not belong"):
++        history_db.read_history_page("history", target=token, cursor=cursor)
++
++
++def test_direct_sql_and_session_topology_changes_are_captured(history_db):
++    _append_turn(history_db, 1)
++    token = _prepare(history_db)["head_token"]
++    history_db._execute_write(
++        lambda conn: conn.execute(
++            "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) "
++            "VALUES ('history', 'user', 'direct', 99, 1, 0)"
++        )
++    )
++    assert history_db.validate_history_prefix(token)["status"] == "pending"
++    assert _prepare(history_db)["status"] == "ready"
++
++    next_token = _prepare(history_db)["head_token"]
++    history_db._execute_write(
++        lambda conn: conn.execute(
++            "UPDATE sessions SET source='tui' WHERE id='history'"
++        )
++    )
++    assert history_db.validate_history_prefix(next_token)["status"] == "incompatible"
++    topology_rebuilt = _prepare(history_db)
++    assert topology_rebuilt["status"] == "ready"
++    assert topology_rebuilt["head_token"]["topology_revision"] != next_token[
++        "topology_revision"
++    ]
++
++
++def test_parent_compression_transition_invalidates_child_topology(history_db):
++    history_db.create_session("child", source="cli", parent_session_id="history")
++    history_db.append_message("child", "user", "child-message", timestamp=1)
++    epoch = None
++    prepared = None
++    for _ in range(10):
++        prepared = history_db.prepare_history_step(
++            "child",
++            owner_id="child-topology",
++            activation_epoch=epoch,
++            max_pages=2,
++            max_rows_per_page=2,
++        )
++        epoch = prepared.get("activation_epoch") or epoch
++        if prepared["status"] == "ready":
++            break
++    assert prepared is not None and prepared["status"] == "ready"
++
++    history_db.end_session("history", "compression")
++
++    validation = history_db.validate_history_prefix(prepared["head_token"])
++    assert validation["status"] == "incompatible"
++    assert validation["reason"] == "history_topology_changed"
++
++
++def test_noop_session_metadata_update_only_indexes_new_tail(history_db):
++    for number in range(8):
++        _append_turn(history_db, number)
++    old = _prepare(history_db)["head_token"]
++    history_db._execute_write(
++        lambda conn: conn.execute(
++            "UPDATE sessions SET model_config=? WHERE id='history'",
++            ('{"browser_model_lock":"runtime-only"}',),
++        )
++    )
++    history_db.append_message("history", "user", "one-new-tail", timestamp=1000)
++
++    result = history_db.prepare_history_step(
++        "history",
++        owner_id="test-owner",
++        activation_epoch=old["activation_epoch"],
++        max_pages=2,
++        max_rows_per_page=1,
++        deadline_ms=1_000,
++    )
++
++    assert result["status"] == "ready"
++    assert result["canonical_count"] == old["canonical_count"] + 1
++    assert result["physical_rows_processed"] == 1
++    assert history_db.validate_history_prefix(old)["status"] == "valid"
++
++
++def test_continuous_unique_tail_reaches_finite_ready_snapshot(history_db):
++    for number in range(10):
++        _append_turn(history_db, number)
++    epoch = None
++    ready = None
++    for number in range(100):
++        result = history_db.prepare_history_step(
++            "history",
++            owner_id="continuous-writer",
++            activation_epoch=epoch,
++            max_pages=1,
++            max_rows_per_page=4,
++            deadline_ms=100,
++        )
++        epoch = result.get("activation_epoch") or epoch
++        history_db.append_message(
++            "history",
++            "user" if number % 2 == 0 else "assistant",
++            f"continuous-tail-{number}",
++            timestamp=10_000 + number,
++        )
++        if result["status"] == "ready":
++            ready = result
++            break
++        assert result["status"] == "progress"
++    assert ready is not None
++    assert ready["canonical_count"] >= 20
++
++
++def test_large_clone_suffix_reset_deletes_bounded_member_pages(history_db):
++    clone_count = 20_000
++    history_db._execute_write(
++        lambda conn: conn.executemany(
++            "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) "
++            "VALUES ('history', 'user', 'same-clone', 1, ?, ?)",
++            [(0, 1)] * (clone_count - 1) + [(1, 0)],
++        )
++    )
++    epoch = None
++    prepared = None
++    for _ in range(20):
++        prepared = history_db.prepare_history_step(
++            "history",
++            owner_id="clone-reset",
++            activation_epoch=epoch,
++            max_pages=8,
++            max_rows_per_page=5_000,
++            deadline_ms=2_000,
++        )
++        epoch = prepared.get("activation_epoch") or epoch
++        if prepared["status"] == "ready":
++            break
++    assert prepared is not None and prepared["status"] == "ready"
++    assert prepared["canonical_count"] == 1
++
++    first_id = history_db._conn.execute(
++        "SELECT MIN(id) FROM messages WHERE session_id='history'"
++    ).fetchone()[0]
++    history_db._execute_write(
++        lambda conn: conn.execute(
++            "UPDATE messages SET content='changed-clone' WHERE id=?", (first_id,)
++        )
++    )
++    scheduled = history_db.prepare_history_step(
++        "history",
++        owner_id="clone-reset",
++        activation_epoch=epoch,
++        max_pages=1,
++        max_rows_per_page=256,
++        deadline_ms=1_000,
++    )
++    assert scheduled["status"] == "progress"
++    assert scheduled["phase"] == "resetting"
++    before = history_db._conn.execute(
++        "SELECT COUNT(*) FROM hermes_history_members WHERE domain_id='history'"
++    ).fetchone()[0]
++    page = history_db.prepare_history_step(
++        "history",
++        owner_id="clone-reset",
++        activation_epoch=epoch,
++        max_pages=1,
++        max_rows_per_page=256,
++        deadline_ms=1_000,
++    )
++    after = history_db._conn.execute(
++        "SELECT COUNT(*) FROM hermes_history_members WHERE domain_id='history'"
++    ).fetchone()[0]
++    assert page["status"] == "progress"
++    assert page["physical_rows_processed"] <= 256
++    assert before - after <= 256
++    assert before - after > 0
++
++
++def test_prefix_edit_during_suffix_reset_expands_invalidation(history_db):
++    for number in range(50):
++        history_db.append_message(
++            "history",
++            "user" if number % 2 == 0 else "assistant",
++            str(number),
++            timestamp=1_000 + number,
++        )
++    epoch = None
++    ready = None
++    for _ in range(100):
++        ready = history_db.prepare_history_step(
++            "history",
++            owner_id="reset-race",
++            activation_epoch=epoch,
++            max_pages=1,
++            max_rows_per_page=8,
++            deadline_ms=100,
++        )
++        epoch = ready.get("activation_epoch") or epoch
++        if ready["status"] == "ready":
++            break
++    assert ready is not None and ready["status"] == "ready"
++    second_anchor = history_db._conn.execute(
++        "SELECT anchor FROM hermes_history_buckets "
++        "WHERE domain_id='history' AND position=2"
++    ).fetchone()[0]
++    old = history_db.seal_history_prefix(
++        "history", activation_epoch=epoch, end_anchor=second_anchor
++    )["token"]
++
++    history_db._execute_write(
++        lambda conn: conn.execute(
++            "UPDATE messages SET content='suffix-changed' WHERE id=40"
++        )
++    )
++    resetting = history_db.prepare_history_step(
++        "history",
++        owner_id="reset-race",
++        activation_epoch=epoch,
++        max_pages=1,
++        max_rows_per_page=3,
++        deadline_ms=100,
++    )
++    assert resetting["phase"] == "resetting"
++    original_floor = history_db._conn.execute(
++        "SELECT scan_base_change_seq FROM hermes_history_domains "
++        "WHERE domain_id='history'"
++    ).fetchone()[0]
++
++    history_db._execute_write(
++        lambda conn: conn.execute(
++            "UPDATE messages SET content='PREFIX-CHANGED' WHERE id=1"
++        )
++    )
++    rebuilt = None
++    for _ in range(100):
++        rebuilt = history_db.prepare_history_step(
++            "history",
++            owner_id="reset-race",
++            activation_epoch=epoch,
++            max_pages=1,
++            max_rows_per_page=3,
++            deadline_ms=100,
++        )
++        if rebuilt["status"] == "ready":
++            break
++        while_resetting = history_db._conn.execute(
++            "SELECT phase, scan_base_change_seq, invalidated_from_position "
++            "FROM hermes_history_domains "
++            "WHERE domain_id='history'"
++        ).fetchone()
++        if (
++            while_resetting["phase"] == "resetting"
++            and while_resetting["invalidated_from_position"] == 40
++        ):
++            assert while_resetting["scan_base_change_seq"] == original_floor
++    assert rebuilt is not None and rebuilt["status"] == "ready"
++    validation = history_db.validate_history_prefix(old)
++    assert validation["status"] == "changed"
++
++
++def test_non_integer_lifecycle_value_is_rejected_like_existing_audit(history_db):
++    history_db._execute_write(
++        lambda conn: conn.execute(
++            "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) "
++            "VALUES ('history', 'user', 'bad-lifecycle', 1, 1.5, 0)"
++        )
++    )
++    result = _prepare(history_db)
++    assert result["status"] == "reverification_required"
++    assert result["reason"] == "source_lifecycle_invalid"
++
++
++def test_changed_trigger_is_detected_and_canonical_write_fails_open(history_db):
++    _append_turn(history_db, 1)
++    old = _prepare(history_db)["head_token"]
++    history_db._conn.executescript(
++        "DROP TRIGGER hermes_history_messages_insert;"
++        "CREATE TRIGGER hermes_history_messages_insert AFTER INSERT ON messages "
++        "BEGIN INSERT INTO broken_history_sink(value) VALUES (new.id); END;"
++    )
++
++    row_id = history_db.append_message("history", "user", "canonical-survives")
++    assert row_id > 0
++    assert history_db.get_messages("history")[-1]["content"] == "canonical-survives"
++    assert history_db.validate_history_prefix(old)["status"] == "incompatible"
++
++    recovered = _prepare(history_db)
++    assert recovered["status"] == "ready"
++    assert recovered["canonical_count"] == 3
++    assert recovered["activation_epoch"] != old["activation_epoch"]
++
++
++def test_journal_row_deletion_invalidates_proof_and_forces_reverification(history_db):
++    _append_turn(history_db, 1)
++    old = _prepare(history_db)["head_token"]
++    for number in range(3):
++        history_db.append_message("history", "user", f"pending-{number}")
++    floor = history_db._conn.execute(
++        "SELECT retained_floor FROM hermes_history_state WHERE singleton=1"
++    ).fetchone()[0]
++    retained = history_db._conn.execute(
++        "SELECT change_seq FROM hermes_history_changes WHERE change_seq>? "
++        "ORDER BY change_seq",
++        (floor,),
++    ).fetchall()
++    assert len(retained) >= 3
++    history_db._conn.execute(
++        "DELETE FROM hermes_history_changes WHERE change_seq=?",
++        (retained[1][0],),
++    )
++    assert history_db.validate_history_prefix(old)["status"] == "incompatible"
++    recovered = _prepare(history_db)
++    assert recovered["status"] == "ready"
++    assert recovered["activation_epoch"] != old["activation_epoch"]
++
++
++def test_gap_rebaseline_keeps_stale_journal_cleanup_bounded(history_db):
++    _append_turn(history_db, 1)
++    ready = _prepare(history_db)
++    history_db._execute_write(
++        lambda conn: conn.executemany(
++            "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) "
++            "VALUES ('history', 'user', ?, ?, 1, 0)",
++            [(f"pending-{number}", 100 + number) for number in range(1_000)],
++        )
++    )
++    floor = history_db._conn.execute(
++        "SELECT retained_floor FROM hermes_history_state WHERE singleton=1"
++    ).fetchone()[0]
++    retained = history_db._conn.execute(
++        "SELECT change_seq FROM hermes_history_changes WHERE change_seq>? "
++        "ORDER BY change_seq",
++        (floor,),
++    ).fetchall()
++    history_db._conn.execute(
++        "DELETE FROM hermes_history_changes WHERE change_seq=?",
++        (retained[len(retained) // 2][0],),
++    )
++    before = history_db._conn.execute(
++        "SELECT COUNT(*) FROM hermes_history_changes"
++    ).fetchone()[0]
++
++    recovery = history_db.prepare_history_step(
++        "history",
++        owner_id="gap-recovery",
++        activation_epoch=None,
++        max_pages=1,
++        max_rows_per_page=16,
++        max_changes=16,
++        deadline_ms=1_000,
++    )
++    after = history_db._conn.execute(
++        "SELECT COUNT(*) FROM hermes_history_changes"
++    ).fetchone()[0]
++    state = dict(
++        history_db._conn.execute(
++            "SELECT * FROM hermes_history_state WHERE singleton=1"
++        ).fetchone()
++    )
++
++    assert recovery["status"] == "progress"
++    assert before - after <= 16
++    assert state["retained_floor"] == state["journal_tail"]
++    assert state["retained_count"] == 0
++    assert history_db._history_journal_contiguous(history_db._conn, state)
++    assert recovery["activation_epoch"] != ready["activation_epoch"]
++
++
++def test_journal_pruning_is_bounded_and_retained_floor_is_valid(history_db):
++    for number in range(4):
++        _append_turn(history_db, number)
++
++    first = history_db.prepare_history_step(
++        "history",
++        owner_id="prune-owner",
++        max_pages=2,
++        max_rows_per_page=16,
++        max_changes=2,
++        deadline_ms=1_000,
++    )
++    state = history_db._conn.execute(
++        "SELECT retained_floor, journal_tail FROM hermes_history_state "
++        "WHERE singleton=1"
++    ).fetchone()
++    assert first["status"] == "ready"
++    assert state[0] == 2
++    assert state[1] > state[0]
++    retained_count = history_db._conn.execute(
++        "SELECT retained_count FROM hermes_history_state WHERE singleton=1"
++    ).fetchone()[0]
++    assert retained_count == state[1] - state[0]
++    assert history_db.validate_history_prefix(first["head_token"])["status"] == "valid"
++
++    second = history_db.prepare_history_step(
++        "history",
++        owner_id="prune-owner",
++        activation_epoch=first["activation_epoch"],
++        max_pages=1,
++        max_changes=2,
++    )
++    next_state = history_db._conn.execute(
++        "SELECT retained_floor, journal_tail FROM hermes_history_state "
++        "WHERE singleton=1"
++    ).fetchone()
++    assert second["status"] == "ready"
++    assert next_state[0] == state[0] + 2
++    assert next_state[1] == state[1]
++    next_count = history_db._conn.execute(
++        "SELECT retained_count FROM hermes_history_state WHERE singleton=1"
++    ).fetchone()[0]
++    assert next_count == next_state[1] - next_state[0]
++
++
++def test_other_domain_changes_advance_watermark_without_rebuilding_prefix(history_db):
++    _append_turn(history_db, 1)
++    original = _prepare(history_db)
++    history_db.create_session("other", source="cli")
++    history_db.append_message("other", "user", "unrelated")
++
++    refreshed = history_db.prepare_history_step(
++        "history",
++        owner_id="test-owner",
++        activation_epoch=original["activation_epoch"],
++    )
++
++    assert refreshed["status"] == "ready"
++    assert refreshed["pages_processed"] == 0
++    assert refreshed["prefix_hash"] == original["prefix_hash"]
++    assert (
++        refreshed["head_token"]["indexed_change_seq"]
++        > original["head_token"]["indexed_change_seq"]
++    )
++    assert history_db.validate_history_prefix(original["head_token"])["status"] == "valid"
++
++
++def test_rollback_invalidation_detaches_capture_for_legacy_writer(history_db):
++    _append_turn(history_db, 1)
++    original = _prepare(history_db)
++    journal_tail = history_db._conn.execute(
++        "SELECT journal_tail FROM hermes_history_state WHERE singleton=1"
++    ).fetchone()[0]
++
++    invalidated = history_db.invalidate_history_for_rollback()
++    repeated = history_db.invalidate_history_for_rollback()
++
++    assert invalidated["status"] == "invalidated"
++    assert repeated["activation_epoch"] == invalidated["activation_epoch"]
++    assert history_db.validate_history_prefix(original["head_token"])["status"] == "incompatible"
++    legacy = sqlite3.connect(history_db.db_path)
++    try:
++        legacy.execute(
++            "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) "
++            "VALUES ('history', 'user', 'legacy-write', 99, 1, 0)"
++        )
++        legacy.commit()
++    finally:
++        legacy.close()
++    state = history_db._conn.execute(
++        "SELECT capture_enabled, journal_tail FROM hermes_history_state "
++        "WHERE singleton=1"
++    ).fetchone()
++    assert tuple(state) == (0, journal_tail)
++    assert history_db.get_messages("history")[-1]["content"] == "legacy-write"
++
++
++def test_insert_or_replace_and_clear_messages_invalidate_without_mixed_prefix(history_db):
++    _append_turn(history_db, 1)
++    original = _prepare(history_db)["head_token"]
++    first = history_db.get_messages("history")[0]
++    history_db._execute_write(
++        lambda conn: conn.execute(
++            "INSERT OR REPLACE INTO messages "
++            "(id, session_id, role, content, timestamp, active, compacted) "
++            "VALUES (?, 'history', 'user', 'replaced', ?, 1, 0)",
++            (first["id"], first["timestamp"]),
++        )
++    )
++    replaced = _prepare(history_db)
++    assert replaced["status"] == "ready"
++    assert history_db.validate_history_prefix(original)["status"] == "changed"
++    page = history_db.read_history_page("history", target=replaced["head_token"])
++    assert page["rows"][0]["content"] == "replaced"
++
++    history_db.clear_messages("history")
++    cleared = _prepare(history_db)
++    assert cleared["status"] == "ready"
++    assert cleared["canonical_count"] == 0
++    assert history_db.validate_history_prefix(replaced["head_token"])["status"] == "changed"
++
++
++def test_edit_between_preparation_pages_restarts_at_affected_suffix(history_db):
++    for number in range(4):
++        _append_turn(history_db, number)
++    first = history_db.prepare_history_step(
++        "history",
++        owner_id="page-owner",
++        max_pages=1,
++        max_rows_per_page=2,
++    )
++    assert first["status"] == "progress"
++    first_id = history_db.get_messages("history")[0]["id"]
++    history_db._execute_write(
++        lambda conn: conn.execute(
++            "UPDATE messages SET content='page-one-edited' WHERE id=?", (first_id,)
++        )
++    )
++
++    ready = _prepare(history_db, owner="page-owner")
++    assert ready["status"] == "ready"
++    cursor = make_history_cursor(ready["head_token"])
++    contents = []
++    while cursor is not None:
++        page = history_db.read_history_page(
++            "history",
++            target=ready["head_token"],
++            cursor=cursor,
++            max_rows=2,
++        )
++        contents.extend(row["content"] for row in page["rows"])
++        cursor = page["next_cursor"]
++    assert contents[0] == "page-one-edited"
++    assert len(contents) == 8
++
++
++def test_compaction_clone_between_pages_revalidates_physical_audit(history_db):
++    for number in range(4):
++        _append_turn(history_db, number)
++    first = history_db.prepare_history_step(
++        "history",
++        owner_id="clone-owner",
++        max_pages=1,
++        max_rows_per_page=2,
++    )
++    assert first["status"] == "progress"
++
++    history_db.archive_and_compact("history", history_db.get_messages("history"))
++    ready = _prepare(history_db, owner="clone-owner")
++    assert ready["status"] == "ready"
++    assert ready["canonical_count"] == 8
++    page = history_db.read_history_page("history", target=ready["head_token"])
++    assert all(entry["physical_count"] == 2 for entry in page["entries"])
++
++
++def test_same_process_manager_reload_retains_activation_and_progress(history_db):
++    for number in range(3):
++        _append_turn(history_db, number)
++    first = _prepare(history_db, owner="manager-one")
++    assert first["status"] == "ready"
++
++    reloaded = _prepare(history_db, owner="manager-two")
++    assert reloaded["status"] == "ready"
++    assert reloaded["activation_epoch"] == first["activation_epoch"]
++    assert reloaded["head_token"] == first["head_token"]
++
++
++def test_copied_database_rotates_realm_and_invalidates_old_token(history_db):
++    _append_turn(history_db, 1)
++    original = _prepare(history_db, owner="original-manager")
++    copy_path = history_db.db_path.parent / "copied-profile" / "state.db"
++    copy_path.parent.mkdir()
++    destination = sqlite3.connect(copy_path)
++    try:
++        history_db._conn.backup(destination)
++    finally:
++        destination.close()
++
++    with SessionDB(copy_path) as copied:
++        copied_result = _prepare(copied, owner="copied-manager")
++        validation = copied.validate_history_prefix(original["head_token"])
++
++    assert copied_result["status"] == "ready"
++    assert copied_result["realm_id"] != original["realm_id"]
++    assert copied_result["incarnation"] != original["incarnation"]
++    assert copied_result["activation_epoch"] != original["activation_epoch"]
++    assert validation["status"] == "incompatible"
++    assert validation["reason"] == "history_identity_changed"
++
++
++def test_different_process_waits_for_lease_then_rotates_activation(
++    history_db, monkeypatch
++):
++    first = _prepare(history_db, owner="manager-one")
++    monkeypatch.setattr(hermes_state_history, "_PROCESS_NONCE", "hhp_otherprocess")
++
++    busy = history_db.prepare_history_step("history", owner_id="manager-two")
++    assert busy["status"] == "busy"
++    history_db._conn.execute(
++        "UPDATE hermes_history_state SET lease_expires_at=0 WHERE singleton=1"
++    )
++    taken_over = _prepare(history_db, owner="manager-two")
++    assert taken_over["status"] == "ready"
++    assert taken_over["activation_epoch"] != first["activation_epoch"]
++
++
++def test_canonical_page_query_uses_domain_position_keyset_index(history_db):
++    _append_turn(history_db, 1)
++    _prepare(history_db)
++    plan = history_db._conn.execute(
++        "EXPLAIN QUERY PLAN SELECT * FROM hermes_history_buckets "
++        "WHERE domain_id=? AND position>? AND position<=? "
++        "ORDER BY position LIMIT ?",
++        ("history", 0, 2, 257),
++    ).fetchall()
++    detail = " ".join(str(row[3]).lower() for row in plan)
++    assert "search hermes_history_buckets using index" in detail
++    assert "position>?" in detail
++
++
++def test_history_listener_observes_same_process_cross_instance_commit(history_db):
++    received = []
++    with SessionDB(history_db.db_path, read_only=True) as reader:
++        registration = reader.register_history_listener(
++            "history", lambda domain_id, tail: received.append((domain_id, tail))
++        )
++        try:
++            with SessionDB(history_db.db_path) as writer:
++                writer.append_message("history", "user", "cross-instance")
++        finally:
++            registration.close()
++
++    assert len(received) == 1
++    assert received[0][0] == "history"
++    assert type(received[0][1]) is int
++
++
++def test_history_listener_ignores_unrelated_domain(history_db):
++    received = []
++    registration = history_db.register_history_listener(
++        "history", lambda domain_id, tail: received.append((domain_id, tail))
++    )
++    try:
++        history_db.create_session("other-listener-domain", source="cli")
++        history_db.append_message("other-listener-domain", "user", "other")
++    finally:
++        registration.close()
++
++    assert received == []
++
++
++def test_history_listener_does_not_publish_rolled_back_write(history_db):
++    received = []
++    registration = history_db.register_history_listener(
++        "history", lambda domain_id, tail: received.append((domain_id, tail))
++    )
++
++    def _rolled_back(conn):
++        conn.execute(
++            "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) "
++            "VALUES ('history', 'user', 'rolled-back', 1, 1, 0)"
++        )
++        raise RuntimeError("rollback")
++
++    try:
++        with pytest.raises(RuntimeError, match="rollback"):
++            history_db._execute_write(_rolled_back)
++    finally:
++        registration.close()
++
++    assert received == []
++
++
++def test_history_listener_coalesces_multiple_rows_in_one_commit(history_db):
++    received = []
++    registration = history_db.register_history_listener(
++        "history", lambda domain_id, tail: received.append((domain_id, tail))
++    )
++    try:
++        history_db._execute_write(
++            lambda conn: conn.executemany(
++                "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) "
++                "VALUES ('history', 'user', ?, ?, 1, 0)",
++                [("one", 1), ("two", 2), ("three", 3)],
++            )
++        )
++    finally:
++        registration.close()
++
++    assert len(received) == 1
++    assert received[0][0] == "history"
++
++
++def test_history_listener_close_unregisters_identity(history_db):
++    received = []
++    registration = history_db.register_history_listener(
++        "history", lambda domain_id, tail: received.append((domain_id, tail))
++    )
++    registration.close()
++    registration.close()
++
++    history_db.append_message("history", "user", "after-close")
++
++    assert received == []
++
++
++def test_history_listener_exception_never_blocks_canonical_write(history_db):
++    def _broken(_domain_id, _tail):
++        raise RuntimeError("listener failure")
++
++    registration = history_db.register_history_listener("history", _broken)
++    try:
++        row_id = history_db.append_message("history", "user", "still-written")
++    finally:
++        registration.close()
++
++    assert row_id > 0
++    assert history_db.get_messages("history")[-1]["content"] == "still-written"
+-- 
+2.50.1 (Apple Git-155)
+

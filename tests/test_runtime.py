@@ -4,7 +4,9 @@ import asyncio
 import copy
 import importlib
 import json
+import sqlite3
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -23,6 +25,9 @@ if PACKAGE not in sys.modules:
     sys.modules[PACKAGE] = package
 
 runtime_module = importlib.import_module(f"{PACKAGE}.runtime")
+checkpoint_store_v3_module = importlib.import_module(
+    f"{PACKAGE}.checkpoint_store_v3"
+)
 ContinuityRuntime = runtime_module.ContinuityRuntime
 MARKER = runtime_module.CONTINUITY_MARKER
 
@@ -1556,6 +1561,90 @@ class ContinuityRuntimeTests(unittest.TestCase):
             [row["status"] for row in adapter.metadata_store.rows],
             ["delivered_checkpoint_conflict", "delivered_checkpoint_conflict"],
         )
+
+    def test_v3_retry_records_namespaced_unchanged_without_second_cas(self) -> None:
+        from test_checkpoint_v3 import checkpoint_fixture
+        from test_hermes_adapter import ContinuityMetadataStore
+
+        candidate = checkpoint_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "continuity.sqlite3"
+            store = ContinuityMetadataStore(path)
+            checkpoint_store_v3_module.initialize_checkpoint_store_v3(store)
+
+            class ValidHistoryIndex:
+                @staticmethod
+                def validate_checkpoint(value, **_kwargs):
+                    return copy.deepcopy(value)
+
+            class IndexedAdapter:
+                def __init__(self):
+                    self.metadata_store = store
+                    self.history_index = ValidHistoryIndex()
+                    self.cas_calls = []
+
+                @staticmethod
+                def read_bundle(_session_id, **_kwargs):
+                    return bundle()
+
+                def settle_checkpoint_delivery(self, session_id, **kwargs):
+                    self.cas_calls.append(copy.deepcopy(kwargs))
+                    return checkpoint_store_v3_module.settle_checkpoint_delivery_v3(
+                        self.metadata_store,
+                        session_id,
+                        expected_revision=kwargs["expected_revision"],
+                        checkpoint_candidate=kwargs["checkpoint_candidate"],
+                        receipt_id=kwargs["receipt_id"],
+                        validate_checkpoint_source=(
+                            self.history_index.validate_checkpoint
+                        ),
+                        source_ids=kwargs["source_ids"],
+                        hashes=kwargs["hashes"],
+                        counts=kwargs["counts"],
+                    )
+
+            adapter = IndexedAdapter()
+            runtime = make_runtime(adapter, FakeCompiler(candidate))
+            try:
+                original = request()
+                for api_request_id in ("a1", "a2"):
+                    projected = project(
+                        runtime, original, api=api_request_id
+                    )
+                    self.assertIsNotNone(projected)
+                    execute(
+                        runtime,
+                        projected["request"],
+                        original,
+                        api=api_request_id,
+                    )
+                    post(runtime, api=api_request_id)
+
+                with sqlite3.connect(path) as connection:
+                    receipts = connection.execute(
+                        "SELECT receipt_id,status FROM continuity_receipts "
+                        "ORDER BY rowid"
+                    ).fetchall()
+                    revision = connection.execute(
+                        "SELECT revision FROM continuity_checkpoints_v3"
+                    ).fetchone()[0]
+                self.assertEqual(len(adapter.cas_calls), 1)
+                self.assertEqual(revision, 1)
+                self.assertEqual(
+                    [status for _receipt_id, status in receipts],
+                    [
+                        "delivered_checkpoint_stored_unvalidated",
+                        "delivered_checkpoint_unchanged",
+                    ],
+                )
+                self.assertTrue(
+                    all(
+                        receipt_id.startswith("v3:")
+                        for receipt_id, _status in receipts
+                    )
+                )
+            finally:
+                runtime.clear()
 
     def test_non_conflict_cas_failure_is_persistently_reported_as_failed(self) -> None:
         adapter = FakeAdapter(

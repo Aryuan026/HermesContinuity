@@ -23,9 +23,9 @@ and retrievable through Hermes `state.db` and native `session_search`.
 
 For each supported request, the plugin:
 
-1. probes the physical session size through a bounded read-only `SessionDB`
-   query, then reads the canonical view only when that full-prefix audit fits
-   inside the configured row budget;
+1. on the optional Block 3 host, reads a bounded complete-group window over a
+   validated incremental prefix; on the twelve-patch host, retains the Block 1
+   row/byte-gated full-prefix reader;
 2. compiles a bounded checkpoint and recent bridge;
 3. projects that bridge into the current real user carrier;
 4. accepts only a host-resolved context window with explicit provenance,
@@ -55,6 +55,27 @@ physical rows is left on Hermes's native request path before Continuity asks
 `SessionDB` to decode the complete compacted history. This is a latency and
 memory guard, not a replacement for the compact prefix-proof design required
 to provide Continuity bridges for arbitrarily long sessions.
+
+### Block 3 long-history implementation candidate
+
+The additive `hermes-0.20.5-incremental-history.patch` enables body-free host
+change capture/canonical indexing and compact checkpoint v3. It applies after
+the original twelve patches, followed by `hermes-0.20.5-history-value-guard.patch`
+to bound SQLite value materialization during probes and reads. The original
+thirteen artifacts are unchanged. Without the indexed host seam the
+accepted Block 1/v2 protection remains active.
+
+One background worker validates history in finite pages without calling a
+model. The foreground reads only a bounded recent complete-group window;
+index completion does not summarize all history or grant retirement authority.
+V3 uses a separate table in the same plugin database, preserving v2 rows and
+receipts. Successful post-delivery CAS means `stored_unvalidated`, not reusable:
+each subsequent use verifies its compact proof against the canonical source.
+
+This is a **0.20.5 compatibility-lane source candidate**, not a deployed release
+or a requalification of the separate accepted 0.21.3 lane. Scope, test commands,
+resource measurements and rollback procedure are in
+[LONG_HISTORY_IMPLEMENTATION.md](LONG_HISTORY_IMPLEMENTATION.md).
 
 The full-prefix reader additionally caps encoded message-column bytes at
 `max_full_prefix_bytes` (default 4 MiB), before transferring rows or calling

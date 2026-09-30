@@ -57,3 +57,30 @@ jobs:
         with:
           name: resource-guard-${{ matrix.python-version }}
           path: ${{ runner.temp }}/resource-guard.jsonl
+      - name: Apply additive Block 3 host seam
+        run: |
+          mkdir "$RUNNER_TEMP/hermes-baseline-module"
+          cp "$RUNNER_TEMP/hermes/hermes_state.py" "$RUNNER_TEMP/hermes-baseline-module/hermes_state.py"
+          echo "HERMES_BASELINE_SOURCE_ROOT=$RUNNER_TEMP/hermes-baseline-module" >> "$GITHUB_ENV"
+          git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-incremental-history.patch"
+          git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-value-guard.patch"
+      - name: Verify bounded canonical-history host
+        run: |
+          cd "$RUNNER_TEMP/hermes"
+          HERMES_PYTHON="$(command -v python)" bash scripts/run_tests.sh --file-retries 0 tests/test_hermes_state_history.py
+      - name: Verify indexed plugin and real host entrypoint
+        run: python -B -m unittest discover -s tests -v
+      - name: Disposable indexed-history scale benchmark
+        shell: bash
+        run: python -B tests/benchmark_history_index.py | tee "$RUNNER_TEMP/history-index.jsonl"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: history-index-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/history-index.jsonl
+      - name: Disposable native SQLite value-guard benchmark
+        shell: bash
+        run: python -B tests/benchmark_history_value_guard.py | tee "$RUNNER_TEMP/history-value-guard.jsonl"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: history-value-guard-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/history-value-guard.jsonl

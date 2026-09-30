@@ -7,6 +7,14 @@ from collections.abc import Mapping as MappingABC
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Tuple
 
+from .checkpoint_v3 import (
+    THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA,
+    build_thread_continuity_checkpoint_v3,
+    normalize_thread_continuity_checkpoint_v3,
+    normalize_thread_continuity_compact_source,
+    validate_thread_continuity_checkpoint_v3_source,
+)
+
 
 _PHYSICAL_OWNER_SIDECAR_SCHEMA = "thread_continuity_physical_owner_sidecar.v1"
 _PHYSICAL_OWNER_SIDECAR_KEYS = {
@@ -184,6 +192,8 @@ def thread_continuity_retirement_source_group_ids(
     checkpoint: Mapping[str, Any] | None,
 ) -> List[str]:
     row = dict(checkpoint or {})
+    if str(row.get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA:
+        return list(dict(row.get("recent_bridge") or {}).get("source_group_ids") or [])
     if str(row.get("schema") or "") != THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
         return []
     cursor = row.get("retirement_cursor")
@@ -198,7 +208,10 @@ def thread_continuity_bridge_projection(
     checkpoint: Mapping[str, Any] | None,
 ) -> Dict[str, Any]:
     row = dict(checkpoint or {})
-    if str(row.get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
+    if str(row.get("schema") or "") in {
+        THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA,
+        THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA,
+    }:
         bridge = dict(row.get("recent_bridge") or {})
         return {
             "status": str(bridge.get("status") or ""),
@@ -1084,9 +1097,24 @@ def _normalize_thread_continuity_checkpoint_v2(
 def normalize_thread_continuity_checkpoint(
     state: Mapping[str, Any],
     *,
-    source_groups: List[Dict[str, Any]],
+    source_groups: List[Dict[str, Any]] | None = None,
     previous_state: Mapping[str, Any] | None = None,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    if str(dict(state or {}).get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA:
+        if compact_source is None:
+            return normalize_thread_continuity_checkpoint_v3(
+                state, previous_state=previous_state
+            )
+        return validate_thread_continuity_checkpoint_v3_source(
+            state,
+            compact_source=compact_source,
+            previous_state=previous_state,
+            checkpoint_validation=checkpoint_validation,
+        )
+    if source_groups is None:
+        raise ValueError("thread_continuity_source_incomplete")
     return _normalize_thread_continuity_checkpoint_v2(
         state, source_groups=source_groups, previous_state=previous_state
     )
@@ -1222,11 +1250,17 @@ def _thread_continuity_checkpoint_marker(
 
 
 def render_thread_continuity_checkpoint_message(
-    checkpoint: Mapping[str, Any], *, source_groups: List[Dict[str, Any]],
+    checkpoint: Mapping[str, Any], *, source_groups: List[Dict[str, Any]] | None = None,
     previous_state: Mapping[str, Any] | None = None,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, str]:
     row = normalize_thread_continuity_checkpoint(
-        checkpoint, source_groups=source_groups, previous_state=previous_state,
+        checkpoint,
+        source_groups=source_groups,
+        previous_state=previous_state,
+        compact_source=compact_source,
+        checkpoint_validation=checkpoint_validation,
     )
     bridge = thread_continuity_bridge_projection(row)
     if not bridge["body"]:
@@ -1351,6 +1385,328 @@ def _fold_plan_id(plan: Mapping[str, Any], groups: List[Dict[str, Any]]) -> str:
     return "tcfp_" + _content_hash(material)
 
 
+def _select_compact_recent_bridge(
+    eligible_groups: List[Dict[str, Any]],
+    *,
+    reference_at: Any,
+    recent_horizon_hours: Any,
+    source_token_limit: Any,
+    estimate_messages: MessageEstimator,
+) -> Dict[str, Any]:
+    if (
+        type(recent_horizon_hours) is not int
+        or not 1 <= recent_horizon_hours <= 24 * 365
+        or type(source_token_limit) is not int
+        or source_token_limit < 1
+    ):
+        raise ValueError("thread_continuity_bridge_policy_invalid")
+    reference = _parse_bridge_reference_at(reference_at)
+    if not eligible_groups:
+        return {
+            "groups": [],
+            "source_group_ids": [],
+            "source_group_fingerprints": [],
+            "source_slice_fingerprint": "",
+            "reference_at": reference.isoformat(),
+            "estimated_source_tokens": 0,
+            "excluded_by_currentness_count": 0,
+            "excluded_by_token_count": 0,
+        }
+    selected = select_thread_continuity_recent_bridge(
+        eligible_groups,
+        retired_source_group_ids=[
+            group["source_prefix_id"] for group in eligible_groups
+        ],
+        reference_at=reference,
+        recent_horizon_hours=recent_horizon_hours,
+        source_token_limit=source_token_limit,
+        estimate_messages=estimate_messages,
+    )
+    selected_ids = list(selected["source_group_ids"])
+    selected_id_set = set(selected_ids)
+    return {
+        "groups": [
+            group
+            for group in eligible_groups
+            if group["source_prefix_id"] in selected_id_set
+        ],
+        "source_group_ids": selected_ids,
+        "source_group_fingerprints": list(
+            selected["source_group_fingerprints"]
+        ),
+        "source_slice_fingerprint": selected["source_slice_fingerprint"],
+        "reference_at": selected["reference_at"],
+        "estimated_source_tokens": selected["estimated_source_tokens"],
+        "excluded_by_currentness_count": selected[
+            "excluded_by_currentness_count"
+        ],
+        "excluded_by_token_count": selected["excluded_by_token_count"],
+    }
+
+
+def _v3_fold_plan_id(plan: Mapping[str, Any]) -> str:
+    current = dict(plan.get("current_ephemeral") or {})
+    return "tcfp_" + _content_hash(
+        {
+            "schema": "thread_continuity_fold_plan.v2",
+            "source_snapshot": plan.get("source_snapshot"),
+            "source_proof": plan.get("source_proof"),
+            "retirement_prefix": plan.get("retirement_prefix"),
+            "bounded_inventory": [
+                [group["source_prefix_id"], _group_fingerprint(group)]
+                for group in list(plan.get("bounded_source_groups") or [])
+            ],
+            "continuity_mode": plan.get("continuity_mode"),
+            "predecessor_revision_id": plan.get("predecessor_revision_id"),
+            "bridge_source_group_ids": plan.get("bridge_source_group_ids"),
+            "raw_suffix_group_ids": plan.get("raw_suffix_group_ids"),
+            "current": [current.get("message_id"), current.get("content_hash")],
+            "fixed_prompt_fingerprint": plan.get("fixed_prompt_fingerprint"),
+            "post_current": [
+                [row.get("role"), row.get("name", ""), row.get("message_id"), row.get("content_hash")]
+                for row in list(plan.get("post_current_messages") or [])
+            ],
+            "context_window_tokens": plan.get("context_window_tokens"),
+            "reserved_output_tokens": plan.get("reserved_output_tokens"),
+            "fixed_non_message_tokens": plan.get("fixed_non_message_tokens"),
+            "bridge_reference_at": plan.get("bridge_reference_at"),
+            "bridge_recent_horizon_hours": plan.get("bridge_recent_horizon_hours"),
+            "bridge_source_token_limit": plan.get("bridge_source_token_limit"),
+            "bridge_output_token_limit": plan.get("bridge_output_token_limit"),
+        }
+    )
+
+
+def _build_thread_continuity_fold_plan_v3(
+    compact_source: Mapping[str, Any],
+    *,
+    current_ephemeral: Mapping[str, Any],
+    context_window_tokens: Any,
+    reserved_output_tokens: Any,
+    fixed_non_message_tokens: Any,
+    fixed_prompt_messages: Any,
+    estimate_messages: MessageEstimator,
+    previous_state: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
+    post_current_messages: Any = None,
+    bridge_reference_at: Any = None,
+    bridge_recent_horizon_hours: Any = 72,
+    bridge_source_token_limit: Any = 24_000,
+    bridge_output_token_limit: Any = 2_048,
+) -> Dict[str, Any]:
+    base: Dict[str, Any] = {
+        "schema": "thread_continuity_fold_plan.v2",
+        "status": "blocked",
+        "reason": "source_incomplete",
+        "source_complete": False,
+        "budget_status": "unknown",
+        "fold_groups": [],
+        "fold_source_group_ids": [],
+        "raw_suffix_groups": [],
+        "raw_suffix_group_ids": [],
+        "covered_source_group_ids": [],
+        "retired_source_group_ids": [],
+        "current_user_raw": True,
+        "rebuild_required": False,
+        "summary_call_feasibility": "not_applicable",
+    }
+    try:
+        source = normalize_thread_continuity_compact_source(compact_source)
+        normalized = normalize_complete_thread_groups(
+            source["groups"], current_ephemeral=current_ephemeral
+        )
+        if not normalized["complete"] or not normalized["current_ephemeral"]:
+            return base
+        groups = list(normalized["groups"])
+        prefixes = [source["prefix_before_groups"], *[
+            item["prefix"] for item in source["group_prefixes"]
+        ]]
+        eligibility_prefix = source["retirement_eligibility"]["prefix"]
+        eligible_count = prefixes.index(eligibility_prefix)
+        eligible_groups = groups[:eligible_count]
+        raw_suffix_groups = groups[eligible_count:]
+        if (
+            type(context_window_tokens) is not int
+            or context_window_tokens <= 0
+            or type(reserved_output_tokens) is not int
+            or reserved_output_tokens < 0
+            or reserved_output_tokens >= context_window_tokens
+            or type(fixed_non_message_tokens) is not int
+            or fixed_non_message_tokens < 0
+            or type(bridge_output_token_limit) is not int
+            or bridge_output_token_limit < 1
+        ):
+            return {**base, "reason": "budget_unknown"}
+        base_messages = _continuity_messages(fixed_prompt_messages)
+        if any(message["role"] not in {"system", "developer"} for message in base_messages):
+            raise ValueError("thread_continuity_fixed_prompt_contains_dialogue")
+        current = normalized["current_ephemeral"]
+        current_id = str(current.get("message_id") or "")
+        if not current_id or any(
+            current_id in group.get("message_ids", []) for group in groups
+        ):
+            return {**base, "reason": "identity_unresolved"}
+        trailing_owner = _normalize_post_current_messages(
+            post_current_messages,
+            unavailable_ids={
+                current_id,
+                *(message_id for group in groups for message_id in group.get("message_ids", [])),
+            },
+        )
+        trailing_messages = _post_current_provider_messages(trailing_owner)
+        effective_reference = bridge_reference_at or next(
+            (
+                str(group.get("effective_event_at") or "")
+                for group in reversed(groups)
+                if str(group.get("effective_event_at") or "")
+            ),
+            "",
+        )
+        selected = _select_compact_recent_bridge(
+            eligible_groups,
+            reference_at=effective_reference,
+            recent_horizon_hours=bridge_recent_horizon_hours,
+            source_token_limit=bridge_source_token_limit,
+            estimate_messages=estimate_messages,
+        )
+    except (TypeError, ValueError):
+        return {**base, "reason": "source_incomplete"}
+
+    previous: Dict[str, Any] = {}
+    previous_segment: List[Dict[str, Any]] = []
+    if previous_state and str(previous_state.get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA:
+        try:
+            previous = validate_thread_continuity_checkpoint_v3_source(
+                previous_state,
+                compact_source=source,
+                checkpoint_validation=checkpoint_validation,
+            )
+            rendered = render_thread_continuity_checkpoint_message(
+                previous,
+                compact_source=source,
+                checkpoint_validation=checkpoint_validation,
+            )
+            previous_segment = [rendered] if rendered else []
+        except (TypeError, ValueError):
+            previous = {}
+            previous_segment = []
+    selected_groups = list(selected["groups"])
+    selected_ids = list(selected["source_group_ids"])
+    selected_fingerprints = list(selected["source_group_fingerprints"])
+    previous_bridge = thread_continuity_bridge_projection(previous)
+    policy_matches = bool(previous) and (
+        previous_bridge["represented_source_group_ids"] == selected_ids
+        and previous_bridge["source_group_fingerprints"] == selected_fingerprints
+        and previous_bridge["recent_horizon_hours"] == bridge_recent_horizon_hours
+        and previous_bridge["source_token_limit"] == bridge_source_token_limit
+        and previous_bridge["output_token_limit"] == bridge_output_token_limit
+    )
+    raw_messages = [
+        {
+            "role": message["role"],
+            "content": message["content"],
+            **({"name": message["name"]} if message.get("name") else {}),
+        }
+        for group in raw_suffix_groups
+        for message in group["messages"]
+    ]
+    current_message = {
+        "role": "user",
+        "content": current["content"],
+        **({"name": current["name"]} if current.get("name") else {}),
+    }
+    available_input = context_window_tokens - reserved_output_tokens - fixed_non_message_tokens
+    marker = {
+        "role": "system",
+        "content": _thread_continuity_checkpoint_marker(
+            "tcr_" + "0" * 64,
+            int(previous.get("revision") or 0) + 1,
+            "0" * 64,
+        ) + "\n",
+    }
+    try:
+        raw_floor = _estimate(
+            estimate_messages,
+            [*base_messages, marker, *raw_messages, current_message, *trailing_messages],
+        )
+        previous_total = _estimate(
+            estimate_messages,
+            [*base_messages, *previous_segment, *raw_messages, current_message, *trailing_messages],
+        ) if previous else 0
+    except ValueError:
+        return {**base, "reason": "estimator_invalid"}
+    summary_output_limit = min(
+        reserved_output_tokens,
+        bridge_output_token_limit,
+        max(0, available_input - raw_floor),
+    )
+    base.update(
+        source_complete=True,
+        budget_status="known",
+        source_snapshot=source["source_snapshot"],
+        source_proof=source["source_proof"],
+        retirement_prefix=eligibility_prefix,
+        retirement_eligibility=source["retirement_eligibility"],
+        bounded_source_groups=groups,
+        context_window_tokens=context_window_tokens,
+        reserved_output_tokens=reserved_output_tokens,
+        fixed_non_message_tokens=fixed_non_message_tokens,
+        available_input_tokens=available_input,
+        base_messages=base_messages,
+        fixed_prompt_fingerprint=_content_hash(base_messages),
+        post_current_messages=trailing_owner,
+        current_ephemeral=current,
+        continuity_mode="incremental" if previous else "rebuild",
+        predecessor_revision_id=str(previous.get("revision_id") or ""),
+        previous_continuity_messages=previous_segment,
+        previous_bridge_status=previous_bridge["status"] if previous else "absent",
+        previous_bridge_source_group_ids=list(
+            previous_bridge.get("represented_source_group_ids") or []
+        ),
+        fold_groups=selected_groups,
+        fold_source_group_ids=selected_ids,
+        covered_source_group_ids=[group["source_prefix_id"] for group in eligible_groups],
+        retired_source_group_ids=[group["source_prefix_id"] for group in eligible_groups],
+        raw_suffix_groups=raw_suffix_groups,
+        raw_suffix_group_ids=[group["source_prefix_id"] for group in raw_suffix_groups],
+        bridge_status="ready" if selected_groups else "empty",
+        bridge_source_groups=selected_groups,
+        bridge_source_group_ids=selected_ids,
+        bridge_source_group_fingerprints=selected_fingerprints,
+        bridge_source_slice_fingerprint=selected["source_slice_fingerprint"],
+        bridge_reference_at=selected["reference_at"],
+        bridge_recent_horizon_hours=bridge_recent_horizon_hours,
+        bridge_source_token_limit=bridge_source_token_limit,
+        bridge_output_token_limit=bridge_output_token_limit,
+        bridge_estimated_source_tokens=selected["estimated_source_tokens"],
+        bridge_excluded_by_currentness_count=selected["excluded_by_currentness_count"],
+        bridge_excluded_by_token_count=selected["excluded_by_token_count"],
+        summary_output_token_limit=summary_output_limit if selected_groups else 0,
+        summary_call_feasibility="unverified" if selected_groups else "not_applicable",
+        reuse_bridge_body=(previous_bridge["body"] if policy_matches else ""),
+    )
+    if raw_floor > available_input or (selected_groups and summary_output_limit < 1):
+        return {**base, "reason": "foreground_exceeds_budget"}
+    if (
+        previous
+        and policy_matches
+        and previous["retirement_cursor"]
+        == {
+            "schema": "thread_continuity_retirement_cursor.v2",
+            "relation": "retired_from_foreground",
+            **{key: eligibility_prefix[key] for key in (
+                "through_anchor", "canonical_count", "group_count", "prefix_hash", "group_root"
+            )},
+        }
+        and previous_total <= available_input
+    ):
+        base.update(status="no_fold", reason="within_budget")
+        return base
+    base.update(status="fold_required", reason="compact_prefix_checkpoint")
+    base["fold_plan_id"] = _v3_fold_plan_id(base)
+    return base
+
+
 def normalize_thread_continuity_fold_plan(
     plan: Mapping[str, Any], *, source_groups: List[Dict[str, Any]],
     current_ephemeral: Mapping[str, Any], context_window_tokens: Any,
@@ -1364,7 +1720,38 @@ def normalize_thread_continuity_fold_plan(
     bridge_recent_horizon_hours: Any = 72,
     bridge_source_token_limit: Any = 24_000,
     bridge_output_token_limit: Any = 2_048,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    if compact_source is not None:
+        normalized_source = normalize_thread_continuity_compact_source(
+            compact_source
+        )
+        supplied = normalize_complete_thread_groups(source_groups)
+        if (
+            not supplied["complete"]
+            or supplied["groups"] != normalized_source["groups"]
+        ):
+            raise ValueError("thread_continuity_fold_plan_invalid")
+        expected = _build_thread_continuity_fold_plan_v3(
+            normalized_source,
+            current_ephemeral=current_ephemeral,
+            context_window_tokens=context_window_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            fixed_non_message_tokens=fixed_non_message_tokens,
+            fixed_prompt_messages=fixed_prompt_messages,
+            estimate_messages=estimate_messages,
+            previous_state=previous_state,
+            checkpoint_validation=checkpoint_validation,
+            post_current_messages=post_current_messages,
+            bridge_reference_at=bridge_reference_at,
+            bridge_recent_horizon_hours=bridge_recent_horizon_hours,
+            bridge_source_token_limit=bridge_source_token_limit,
+            bridge_output_token_limit=bridge_output_token_limit,
+        )
+        if expected.get("status") != "fold_required" or dict(plan or {}) != expected:
+            raise ValueError("thread_continuity_fold_plan_invalid")
+        return expected
     expected = _build_thread_continuity_fold_plan(
         source_groups,
         current_ephemeral=current_ephemeral,
@@ -1820,7 +2207,53 @@ def plan_thread_continuity_fold(
     bridge_recent_horizon_hours: Any = 72,
     bridge_source_token_limit: Any = 24_000,
     bridge_output_token_limit: Any = 2_048,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    if compact_source is not None:
+        try:
+            normalized_source = normalize_thread_continuity_compact_source(
+                compact_source
+            )
+            supplied = normalize_complete_thread_groups(groups)
+            if (
+                not supplied["complete"]
+                or supplied["groups"] != normalized_source["groups"]
+            ):
+                raise ValueError("thread_continuity_compact_groups_invalid")
+        except (TypeError, ValueError):
+            return {
+                "schema": "thread_continuity_fold_plan.v2",
+                "status": "blocked",
+                "reason": "source_incomplete",
+                "source_complete": False,
+                "fold_groups": [],
+                "fold_source_group_ids": [],
+                "raw_suffix_groups": [],
+                "raw_suffix_group_ids": [],
+                "covered_source_group_ids": [],
+                "retired_source_group_ids": [],
+                "current_user_raw": True,
+                "budget_status": "unknown",
+                "rebuild_required": False,
+                "summary_call_feasibility": "not_applicable",
+            }
+        return _build_thread_continuity_fold_plan_v3(
+            normalized_source,
+            current_ephemeral=current_ephemeral,
+            context_window_tokens=context_window_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            fixed_non_message_tokens=fixed_non_message_tokens,
+            fixed_prompt_messages=fixed_prompt_messages,
+            estimate_messages=estimate_messages,
+            previous_state=previous_state,
+            checkpoint_validation=checkpoint_validation,
+            post_current_messages=post_current_messages,
+            bridge_reference_at=bridge_reference_at,
+            bridge_recent_horizon_hours=bridge_recent_horizon_hours,
+            bridge_source_token_limit=bridge_source_token_limit,
+            bridge_output_token_limit=bridge_output_token_limit,
+        )
     return _build_thread_continuity_fold_plan(
         groups,
         current_ephemeral=current_ephemeral,
@@ -1994,6 +2427,45 @@ def _summary_prompt(carry: str, groups: List[Dict[str, Any]]) -> List[Dict[str, 
     return messages
 
 
+def _compact_summary_prompt(
+    carry: str, groups: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Keep v3 provider input bounded without serializing long opaque IDs."""
+
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": SUMMARY_INSTRUCTION}]
+    if carry:
+        messages.append({"role": "system", "name": "continuity_carry", "content": carry})
+    inventory = [
+        [group["source_prefix_id"], _group_fingerprint(group)] for group in groups
+    ]
+    messages.append(
+        {
+            "role": "system",
+            "name": "continuity_source_metadata",
+            "content": json.dumps(
+                {
+                    "ordered_group_count": len(groups),
+                    "ordered_inventory_sha256": _content_hash(inventory),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+    )
+    for group in groups:
+        for message in group["messages"]:
+            name = str(message.get("name") or "")
+            messages.append(
+                {
+                    "role": message["role"],
+                    "content": message["content"],
+                    **({"name": name} if name else {}),
+                }
+            )
+    return messages
+
+
 def _normalize_summary_receipt(
     receipt: Mapping[str, Any], *, attempt_descriptor: Mapping[str, Any], provider_result: Any,
 ) -> Dict[str, Any]:
@@ -2035,6 +2507,8 @@ def plan_next_summary_attempt(
     bridge_recent_horizon_hours: Any = 72,
     bridge_source_token_limit: Any = 24_000,
     bridge_output_token_limit: Any = 2_048,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     blocked = {"status": "blocked", "progress_source_group_count": 0}
     try:
@@ -2055,13 +2529,24 @@ def plan_next_summary_attempt(
             bridge_recent_horizon_hours=bridge_recent_horizon_hours,
             bridge_source_token_limit=bridge_source_token_limit,
             bridge_output_token_limit=bridge_output_token_limit,
+            compact_source=compact_source,
+            checkpoint_validation=checkpoint_validation,
         )
-        canonical = list(normalize_complete_thread_groups(groups)["groups"])
+        canonical = list(
+            normalize_thread_continuity_compact_source(compact_source)["groups"]
+            if compact_source is not None
+            else normalize_complete_thread_groups(groups)["groups"]
+        )
     except (TypeError, ValueError):
         return {**blocked, "reason": "fold_plan_invalid"}
     try:
         checkpoint = (
-            normalize_thread_continuity_checkpoint(previous_checkpoint, source_groups=canonical)
+            normalize_thread_continuity_checkpoint(
+                previous_checkpoint,
+                source_groups=canonical,
+                compact_source=compact_source,
+                checkpoint_validation=checkpoint_validation,
+            )
             if previous_checkpoint else {}
         )
     except (TypeError, ValueError):
@@ -2112,12 +2597,14 @@ def plan_next_summary_attempt(
             }
         )
 
+    summary_prompt = _compact_summary_prompt if compact_source is not None else _summary_prompt
+
     def fit_batch(start: int, summary: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         batch: List[Dict[str, Any]] = []
         prompt: List[Dict[str, Any]] = []
         for end in range(start + 1, len(target_groups) + 1):
             candidate = target_groups[start:end]
-            candidate_prompt = _summary_prompt(summary, candidate)
+            candidate_prompt = summary_prompt(summary, candidate)
             if (
                 _estimate(estimate_messages, candidate_prompt)
                 + summary_output_token_limit
@@ -2202,6 +2689,9 @@ def plan_next_summary_attempt(
 
     carry = ""
     processed: List[str] = []
+    if compact_source is not None and owner_plan.get("reuse_bridge_body"):
+        carry = str(owner_plan["reuse_bridge_body"])
+        processed = list(target_ids)
     chunk_completions = list(accepted_chunk_completions or [])
     chunk_index = 0
 
@@ -2347,6 +2837,8 @@ def accept_summary_attempt(
     bridge_recent_horizon_hours: Any = 72,
     bridge_source_token_limit: Any = 24_000,
     bridge_output_token_limit: Any = 2_048,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     rejected = {"status": "rejected", "progress_source_group_count": 0}
     expected = plan_next_summary_attempt(
@@ -2368,6 +2860,8 @@ def accept_summary_attempt(
         bridge_recent_horizon_hours=bridge_recent_horizon_hours,
         bridge_source_token_limit=bridge_source_token_limit,
         bridge_output_token_limit=bridge_output_token_limit,
+        compact_source=compact_source,
+        checkpoint_validation=checkpoint_validation,
     )
     row = dict(descriptor or {})
     if expected.get("status") != "ready" or row != expected.get("descriptor"):
@@ -2418,6 +2912,10 @@ def build_thread_continuity_checkpoint_from_attempts(
     bridge_recent_horizon_hours: Any = 72,
     bridge_source_token_limit: Any = 24_000,
     bridge_output_token_limit: Any = 2_048,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
+    stored_predecessor_revision: int | None = None,
+    stored_predecessor_revision_id: str | None = None,
 ) -> Dict[str, Any]:
     complete = plan_next_summary_attempt(
         source_groups, fold_plan=fold_plan, current_ephemeral=current_ephemeral,
@@ -2433,6 +2931,8 @@ def build_thread_continuity_checkpoint_from_attempts(
         bridge_recent_horizon_hours=bridge_recent_horizon_hours,
         bridge_source_token_limit=bridge_source_token_limit,
         bridge_output_token_limit=bridge_output_token_limit,
+        compact_source=compact_source,
+        checkpoint_validation=checkpoint_validation,
     )
     if complete.get("status") != "complete":
         raise ValueError("thread_continuity_summary_incomplete")
@@ -2455,6 +2955,45 @@ def build_thread_continuity_checkpoint_from_attempts(
         raise ValueError("thread_continuity_summary_completion_invalid")
     if completion != expected:
         raise ValueError("thread_continuity_summary_completion_invalid")
+    if compact_source is not None:
+        source = normalize_thread_continuity_compact_source(compact_source)
+        bridge_ids = set(bridge_source_ids)
+        bridge_groups = [
+            group for group in source["groups"]
+            if group["source_prefix_id"] in bridge_ids
+        ]
+        if [group["source_prefix_id"] for group in bridge_groups] != bridge_source_ids:
+            raise ValueError("thread_continuity_summary_completion_invalid")
+        previous_v3: Mapping[str, Any] | None = None
+        if (
+            previous_checkpoint
+            and str(previous_checkpoint.get("schema") or "")
+            == THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA
+        ):
+            try:
+                previous_v3 = validate_thread_continuity_checkpoint_v3_source(
+                    previous_checkpoint,
+                    compact_source=source,
+                    checkpoint_validation=checkpoint_validation,
+                )
+            except (TypeError, ValueError):
+                previous_v3 = None
+        return build_thread_continuity_checkpoint_v3(
+            previous_state=previous_checkpoint,
+            source_proof=source["source_proof"],
+            retirement_prefix=source["retirement_eligibility"]["prefix"],
+            bridge_source_groups=bridge_groups,
+            bridge_text=summary,
+            bridge_policy={
+                "reference_at": fold_plan.get("bridge_reference_at"),
+                "recent_horizon_hours": fold_plan.get("bridge_recent_horizon_hours"),
+                "source_token_limit": fold_plan.get("bridge_source_token_limit"),
+                "output_token_limit": fold_plan.get("bridge_output_token_limit"),
+            },
+            continue_lineage=previous_v3 is not None,
+            predecessor_revision=stored_predecessor_revision,
+            predecessor_revision_id=stored_predecessor_revision_id,
+        )
     return build_thread_continuity_checkpoint_v2(
         previous_state=previous_checkpoint,
         source_groups=source_groups,

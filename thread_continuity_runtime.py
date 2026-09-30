@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, List, Mapping
 
 from .context_compactor import (
     THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA,
+    THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA,
     SUMMARY_CONSTRUCTION_TOKEN_LIMIT,
     accept_summary_attempt,
     accept_summary_chunk_attempt,
@@ -17,6 +18,11 @@ from .context_compactor import (
     thread_continuity_bridge_projection,
     thread_continuity_retirement_source_group_ids,
     validate_thread_continuity_input,
+)
+from .checkpoint_v3 import (
+    THREAD_CONTINUITY_COMPACT_SOURCE_SCHEMA,
+    normalize_thread_continuity_compact_source,
+    normalize_thread_continuity_revision_id,
 )
 
 
@@ -163,7 +169,15 @@ async def compile_thread_continuity_turn(
             trace["plan_generations"][-1].update(final_disposition="fallback", failure_reason=reason)
         return _result(_public_trace(trace), "fallback", reason=reason, revision=revision, snapshot=snapshot)
 
-    if (
+    source_schema = str(source.get("schema") or "")
+    compact_v3 = source_schema == THREAD_CONTINUITY_COMPACT_SOURCE_SCHEMA
+    if compact_v3:
+        try:
+            source = normalize_thread_continuity_compact_source(source)
+            snapshot = source["source_snapshot"]
+        except (TypeError, ValueError):
+            return fail("source_unavailable")
+    elif (
         source.get("status") != "ready"
         or source.get("scan_complete") is not True
         or not isinstance(source.get("stats"), Mapping)
@@ -175,19 +189,78 @@ async def compile_thread_continuity_turn(
     groups = list(source["groups"])
     continuity_status = str(continuity.get("status") or "")
     previous: Mapping[str, Any] | None = None
-    if continuity_status == "ready":
+    checkpoint_validation: Mapping[str, Any] | None = None
+    stored_predecessor_revision: int | None = None
+    stored_predecessor_revision_id: str | None = None
+    identity_only_v3 = bool(
+        compact_v3
+        and continuity_status == "unavailable"
+        and continuity.get("error")
+        == "thread_continuity_checkpoint_source_invalid"
+    )
+    if continuity_status == "ready" or identity_only_v3:
         state = continuity.get("state") if isinstance(continuity.get("state"), Mapping) else {}
         previous = state.get("checkpoint") if isinstance(state.get("checkpoint"), Mapping) else None
-        if previous is None or type(state.get("revision")) is not int or state["revision"] < 1:
+        if type(state.get("revision")) is not int or state["revision"] < 1:
             return fail("continuity_state_unavailable")
         revision = state["revision"]
-        if str(previous.get("schema") or "") != THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
+        stored_predecessor_revision = revision
+        stored_predecessor_revision_id = str(
+            state.get("revision_id")
+            or dict(previous or {}).get("revision_id")
+            or ""
+        )
+        validation_row = state.get("checkpoint_validation")
+        if not isinstance(validation_row, Mapping):
+            validation_row = continuity.get("checkpoint_validation")
+        checkpoint_validation = (
+            dict(validation_row) if isinstance(validation_row, Mapping) else None
+        )
+        if compact_v3:
+            previous_schema = str(dict(previous or {}).get("schema") or "")
+            if identity_only_v3:
+                if previous is not None or checkpoint_validation is not None:
+                    return fail("continuity_state_unavailable")
+                try:
+                    stored_predecessor_revision_id = (
+                        normalize_thread_continuity_revision_id(
+                            stored_predecessor_revision_id
+                        )
+                    )
+                except ValueError:
+                    return fail("continuity_state_unavailable")
+                previous_schema = ""
+            elif previous is None:
+                return fail("continuity_state_unavailable")
+            if previous is not None and previous_schema not in {
+                THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA,
+                THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA,
+            }:
+                return fail("continuity_checkpoint_unsupported")
+            if previous_schema == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
+                # v2 and v3 have independent SQLite rows and revision chains.
+                # A source-validated v2 body can inform no v3 predecessor: the
+                # first v3 checkpoint is revision 1 rebuilt by contract.
+                revision = 0
+                stored_predecessor_revision = None
+                stored_predecessor_revision_id = None
+                checkpoint_validation = None
+            elif not stored_predecessor_revision_id:
+                return fail("continuity_state_unavailable")
+        elif previous is None or str(previous.get("schema") or "") != THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
             return fail("continuity_checkpoint_unsupported")
     elif continuity_status != "absent":
         return fail("continuity_state_unavailable")
     trace.update(
         continuity_revision=revision,
-        continuity_revision_id=str(dict(previous or {}).get("revision_id") or ""),
+        continuity_revision_id=(
+            stored_predecessor_revision_id
+            or (
+                str(dict(previous or {}).get("revision_id") or "")
+                if not compact_v3
+                else ""
+            )
+        ),
     )
     current_row = current_ephemeral if isinstance(current_ephemeral, Mapping) else {}
     current_id = str(current_row.get("message_id") or "")
@@ -197,12 +270,16 @@ async def compile_thread_continuity_turn(
     requested_minimum = [
         str(value or "") for value in list(minimum_fold_source_group_ids or [])
     ]
-    if requested_minimum != canonical_ids[: len(requested_minimum)]:
+    if not compact_v3 and requested_minimum != canonical_ids[: len(requested_minimum)]:
         return fail("minimum_fold_prefix_invalid")
-    previous_covered = thread_continuity_retirement_source_group_ids(previous)
-    minimum_fold_ids = canonical_ids[
-        : max(len(requested_minimum), len(previous_covered))
-    ]
+    previous_covered = (
+        [] if compact_v3 else thread_continuity_retirement_source_group_ids(previous)
+    )
+    minimum_fold_ids = (
+        []
+        if compact_v3
+        else canonical_ids[: max(len(requested_minimum), len(previous_covered))]
+    )
 
     prepared_fold_plan = plan_thread_continuity_fold(
         groups,
@@ -220,6 +297,8 @@ async def compile_thread_continuity_turn(
         bridge_recent_horizon_hours=bridge_recent_horizon_hours,
         bridge_source_token_limit=bridge_source_token_limit,
         bridge_output_token_limit=bridge_output_token_limit,
+        compact_source=source if compact_v3 else None,
+        checkpoint_validation=checkpoint_validation,
     )
 
     for generation in (1,):
@@ -276,6 +355,8 @@ async def compile_thread_continuity_turn(
             "bridge_recent_horizon_hours": bridge_recent_horizon_hours,
             "bridge_source_token_limit": bridge_source_token_limit,
             "bridge_output_token_limit": bridge_output_token_limit,
+            "compact_source": source if compact_v3 else None,
+            "checkpoint_validation": checkpoint_validation,
         }
         accepted: List[Mapping[str, Any]] = []
         chunk_completions: List[List[Mapping[str, Any]]] = []
@@ -372,10 +453,23 @@ async def compile_thread_continuity_turn(
             try:
                 checkpoint = build_thread_continuity_checkpoint_from_attempts(
                     source_groups=groups, accepted_summary_attempts=accepted,
-                    accepted_chunk_completions=chunk_completions, **attempt_owner,
+                    accepted_chunk_completions=chunk_completions,
+                    stored_predecessor_revision=stored_predecessor_revision,
+                    stored_predecessor_revision_id=stored_predecessor_revision_id,
+                    **attempt_owner,
                 )
                 segment = render_thread_continuity_checkpoint_message(
-                    checkpoint, source_groups=groups, previous_state=previous,
+                    checkpoint,
+                    source_groups=groups,
+                    previous_state=(
+                        previous
+                        if previous
+                        and str(previous.get("schema") or "")
+                        == str(checkpoint.get("schema") or "")
+                        and checkpoint.get("lineage_status") == "continued"
+                        else None
+                    ),
+                    compact_source=source if compact_v3 else None,
                 )
             except (TypeError, ValueError):
                 return fail("checkpoint_invalid")

@@ -133,3 +133,65 @@
 - Only documentation changes in this block. Block 3 remains unopened pending
   protocol review. Accepted 0.21.3 work, Global Hot and all production code stay
   unchanged; no host upgrade, real database access or server operation occurred.
+
+## Block 2 accepted / Block 3 implementation
+
+- The owner accepted the protocol at `e54472f2f64863c00cf75aa17c29da1b3f969e84`
+  and opened Block 3. The preceding "unopened" statement is the historical
+  Block 2 receipt, not the current phase.
+- Implementation adds a host-owned transactional journal/canonical index,
+  bounded plugin group preparation and checkpoint v3. The original twelve
+  patches, checkpoint v2 and the separate canonical-window service remain.
+  Donor recent selection, chunk summary/acceptance and budget policy are reused.
+- Read the current code map, recovery procedure and evidence limits in
+  [LONG_HISTORY_IMPLEMENTATION.md](LONG_HISTORY_IMPLEMENTATION.md).
+- A genuine >2,048-row production AIAgent path has exercised final provider
+  body, post settlement and manager unload/reload readback with a synthetic
+  provider. Repeat testing exposed needless metadata-triggered prefix rebuild;
+  independent review also exposed unbounded suffix reset and continuous-append
+  starvation. The fixes also preserve changes arriving during a bounded suffix
+  reset; an independent real-SessionDB reproduction now rejects the old prefix.
+  Those reported findings are closed. The exported host has 40/40 targeted
+  tests passing; an earlier individual passing run was not used as acceptance.
+- V2 nonempty checkpoint and receipt fields are checked unchanged after v3
+  creation. Current tests keep source validity, delivered outcome and conditional
+  storage separate; runtime failure does not resend the provider.
+- Local candidate verification: 293 plugin cases, 292 pass and one existing
+  paired-Global-Hot conditional skip; exported host history 40/40; five indexed
+  scale cases each retain two projections/two receipts/one summary; original
+  twelve-patch resource-guard benchmark 7/7. Full figures and evidence scope are
+  in LONG_HISTORY_IMPLEMENTATION.md. Public exact-head CI is reported on the PR,
+  independently of these local results.
+- Protocol acceptance is exercised through actual replacement/sidecar/reaction,
+  compression-child, deletion/pruning, session, import/branch/API/A2A/recovery
+  write owners. Three real subprocess exits cover uncommitted host pages,
+  host-committed/plugin-not-published and uncommitted plugin staging. Lease expiry
+  is controlled in tests; restore explicitly requires stopped writers and the
+  existing invalidation handoff. These are disposable storage/handler tests,
+  not complete frontend or live provider tests.
+- This remains source-only work on the named 0.20.5 compatibility lane. No
+  Global Hot change, 0.21.3/0.21.5 rewrite, target installation, merge, real data
+  access, deployment or observation has occurred. Assembly selected pins remain
+  unchanged. External implementation review is still required.
+
+## Block 3 external-review correction candidate
+
+- External review held `2cfb512c` for two confirmed defects: SQLite may
+  materialize a large value during the size probe; cancelled compilation
+  retained process-wide workset admission before plan installation.
+- Shared SQLite value guards cover preparation probes and foreground reads,
+  with typed overflow and borrowed limit/transaction restoration. The exported
+  host correction is patch 14, at `a488b6ebf46765a7323bb3e862bcbb77bccbd172`;
+  original thirteen artifacts remain unchanged. Runtime admission now has a
+  compile-owned `finally` until successful plan transfer; cancellation still
+  propagates and other profile leases remain intact.
+- Local Python 3.12: host 42/42; plugin 296 total, 295 pass, one existing paired
+  skip; scale 5/5 and original resource benchmark 7/7. Actual-host native value
+  benchmark 3/3, with external process deadlines. Real async summary
+  cancellation plus manager unload/reload preserves the positive AIAgent
+  projection/settlement/reuse path with a synthetic provider.
+- Full measurements, prior-source controls and limitations are in
+  LONG_HISTORY_IMPLEMENTATION.md. CI now executes and uploads the native
+  benchmark on both declared Python versions, using Bash pipefail.
+- Next checkpoint is external correction review of PR #5. No merge, target
+  mutation, real-data access or promotion to accepted/deployed status.
