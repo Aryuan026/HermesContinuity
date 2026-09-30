@@ -251,3 +251,25 @@
   write occurred. Gateway PID/restart count are unchanged, Global Hot and
   0.21.x lanes untouched, selected Assembly pins unchanged. Observation has
   not started. Preferred source rollback remains accepted Block 1 `1d6f502f`.
+
+## 2026-09-30 — Block 4 external-review test correction
+
+- Prior push CI `36703797331` at `a692914` remains recorded as failure: 3.11
+  passed; 3.12 retained host 45/45 but had two plugin failures and skipped later
+  indexed/value benchmarks. This successor does not relabel that evidence.
+- Only test fixtures/diagnostics and the existing evidence docs change. Crash
+  children force real multi-quantum progress via the existing host API, retain
+  exact 74/75 exits and recovery readback, and stop at finite quantum/process
+  bounds instead of assuming one call reaches the fault boundary.
+- Real-host reload now separates legitimate pending/native with no new receipt
+  from ready/prepared exact-once bridge, summary reuse and settlement. Positive
+  synchronization happens after actual user persistence; no production wait or
+  budget changes. Body-free source/checkpoint/cursor/admission diagnostics are
+  retained. The controlled pending reproduction is not claimed as the proven
+  reason for the earlier undiagnosed CI failure.
+- Local unchanged host 45/45; plugin 296 / 294 pass / two conditional skips;
+  focused legacy-writer/recovery 7/7; indexed scale 5/5, native value guard 3/3,
+  pre-index resource guard 7/7. Public successor results are pending at commit
+  time. See BLOCK4_TARGET_VALIDATION.md for the test-only evidence boundary.
+- PR #6 remains reviewable/unmerged; no Assembly pin or target mutation. The
+  owner-history conflict and deployment/observation qualification remain open.

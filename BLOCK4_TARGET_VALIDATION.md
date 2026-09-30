@@ -126,3 +126,62 @@ copy check; no count-only compatibility claim is used. No production install,
 enablement, source change, restart or
 database mutation was performed. Gateway main PID and zero restart count
 remain unchanged. No pytest dependency was installed on the target.
+
+## External-review integration correction (test-only)
+
+The prior public push run `36703797331`, bound to `a69291477404bb3ab145d4e55869438b7340b7f6`,
+is retained as **failure**, not superseded into historical Green. Python 3.11
+passed; Python 3.12 passed the 45 host cases but reported 296 plugin cases /
+293 passed / two failed / one conditional skip. Its indexed scale and native
+value benchmarks were skipped. This correction changes only the two affected
+test files and this evidence; patch 15, the original fourteen artifacts and
+all production code remain unchanged.
+
+The crash child previously assumed one preparation call must reach its fault
+boundary. It now uses the existing host API to force one-row/one-page quanta,
+continues only on `progress` within 2,000 quanta and retains the external
+30-second child deadline. The real `os._exit(74)` / `os._exit(75)` hooks and
+parent return-code, rollback and recovery assertions are unchanged. No ready
+result, hook or recovery consumer is mocked into success.
+
+The prior reload failure logged no source/checkpoint reason, so its exact CI
+cause is not retrospectively claimed. A controlled run of the previous fixture
+through real discovery, persistence and `AIAgent.run_conversation` reproduces
+the same missing bridge when the existing preparation lock holds the worker:
+the bundle reports `pending / history_source_pending`, checkpoint revision 1
+remains stored, and the native response produces no new receipt. The host
+persists the new user before request middleware; preparing only before calling
+the agent therefore does not establish readiness for that new journal entry.
+
+The corrected single real-host scenario explicitly tests that pending turn:
+no bridge, normal provider response, one existing receipt and no extra summary.
+After releasing the lock, real bounded preparation completes. Positive turns
+prepare at the existing test provider-kwargs boundary, after actual user
+persistence and before middleware; they retain exact-once final-body bridge,
+one summary, a second settled receipt and checkpoint reuse after manager reload.
+Cancellation and provider-error no-receipt controls remain. This synchronization
+is a **test prerequisite**, not proof that the automatic worker always finishes
+within the production foreground wait. No sleep, production wait extension,
+retry-until-projected turn, artificial provider block or checkpoint is added.
+
+On assertion failure, body-free diagnostics now include source/checkpoint
+status, validation reasons, preparation result, host cursor/phase/counts and
+process-wide preparation/active/cold admission counts and bytes. They do not
+emit the checkpoint body or canonical transcript.
+
+Local Python 3.12 on the unchanged exported host: 45/45 host cases; 296 plugin
+cases / 294 passed / two conditional skips. The seven recovery cases also pass
+with the legacy writer module supplied, including all three exact crash exits.
+Retained indexed scale 5/5, native value guard 3/3 and original resource guard
+7/7 all complete. The scale cases each retain two receipts and one summary.
+The resource-guard run uses the preserved pre-index SessionDB module; public
+CI independently materializes the complete twelve-patch host before that step.
+Successor public dual-version CI must finish all later benchmarks before this
+candidate is returned for external acceptance.
+
+Recovery-truth gate: no selected source, artifact, dependency, managed path,
+unit, secret, runtime capability or rollback procedure changes in this test-only
+increment. Selected Assembly pins remain unchanged; no Assembly landing is
+performed. Owner-history `display_kind` conflict, ready source, live settlement
+and the 48–72h target observation remain unproven and outside this correction.
+No merge, target access, install, enablement, restart or database mutation.

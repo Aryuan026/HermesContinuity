@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import os
 import re
 import sqlite3
@@ -118,6 +119,8 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
         self.agents = []
         self.summary_calls = 0
         self.validation_errors: list[str] = []
+        self.last_bundle = {}
+        self.last_prepared = {}
         self.session_db = SessionDB(self.home / "state.db")
         self.session_db.create_session("long-mouth", "cli")
         now = time.time() - 1_800
@@ -175,7 +178,7 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             finish_reason="stop",
         )
 
-    def _agent(self) -> AIAgent:
+    def _agent(self, *, prepare_before_request: bool = True) -> AIAgent:
         agent = AIAgent(
             api_key="test-key",
             base_url="http://127.0.0.1:1/v1",
@@ -193,11 +196,15 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             session_db=self.session_db,
         )
         agent._api_max_retries = 1
-        agent._build_api_kwargs = lambda messages: {
-            "model": agent.model,
-            "messages": messages,
-            "max_tokens": 256,
-        }
+        def build_kwargs(messages):
+            # The host persists this turn's user before request middleware.
+            # Positive reuse requires that new journal entry to be prepared;
+            # preparing only before run_conversation races the bounded worker.
+            if prepare_before_request:
+                self._prepare_index()
+            return {"model": agent.model, "messages": messages, "max_tokens": 256}
+
+        agent._build_api_kwargs = build_kwargs
         agent._try_recover_primary_transport = lambda *_args, **_kwargs: False
         agent._try_activate_fallback = lambda *_args, **_kwargs: False
         agent._has_pending_fallback = lambda: False
@@ -232,13 +239,17 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
         self.assertIsNotNone(service)
         index = service.adapter.history_index
         self.assertIsNotNone(index)
-        for _ in range(2_000):
-            result = index.prepare_step("long-mouth")
-            if result.get("status") == "ready":
-                break
-            self.assertEqual(result.get("status"), "progress", result)
-        else:
-            self.fail("history preparation did not finish within bounded work steps")
+        preparation = importlib.import_module(type(index).__module__)
+        with preparation.PREPARATION_LOCK:
+            for _ in range(2_000):
+                result = index.prepare_step("long-mouth")
+                self.last_prepared = {key: result.get(key) for key in (
+                    "status", "reason", "phase", "canonical_count", "pages_processed")}
+                if result.get("status") == "ready":
+                    break
+                self.assertEqual(result.get("status"), "progress", result)
+            else:
+                self.fail("history preparation did not finish within bounded work steps")
         if not getattr(index, "_continuity_test_validation_probe", False):
             original_validate = index.validate_checkpoint
 
@@ -250,6 +261,17 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
                     raise
 
             index.validate_checkpoint = validate_with_reason
+            original_bundle = service.adapter.read_bundle
+
+            def observe_bundle(*args, **kwargs):
+                bundle = original_bundle(*args, **kwargs)
+                self.last_bundle = {
+                    section: {key: bundle.get(section, {}).get(key)
+                              for key in ("status", "error", "reasons", "scan_complete")}
+                    for section in ("source", "continuity")}
+                return bundle
+
+            service.adapter.read_bundle = observe_bundle
             index._continuity_test_validation_probe = True
 
     def _continuity_status(self) -> str:
@@ -259,6 +281,24 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             if runtime is not None and type(runtime).__name__ == "ContinuityRuntime":
                 return runtime.status_command("long-mouth")
         return "continuity runtime middleware unavailable"
+
+    def _diagnostics(self) -> str:
+        manager = plugins.get_plugin_manager()
+        service = manager._get_plugin_service("hermes-continuity:canonical-source.v2")
+        with self.session_db._read_ctx() as connection:
+            domain = connection.execute(
+                "SELECT phase,cursor_message_id,canonical_count,physical_cursor_position "
+                "FROM hermes_history_domains WHERE domain_id='long-mouth'").fetchone()
+        package = type(service.adapter.history_index).__module__.rsplit(".", 1)[0]
+        budget = importlib.import_module(package + ".resource_budget")
+        leases = {name: {"leases": len(getattr(budget, name)._leases),
+                         "bytes": sum(getattr(budget, name)._leases.values())}
+                  for name in ("PREPARATION_WORKSETS", "ACTIVE_WORKSETS", "COLD_PLANS")}
+        return json.dumps({"runtime": json.loads(self._continuity_status()),
+                           "validation_errors": self.validation_errors,
+                           "last_bundle": self.last_bundle, "last_prepared": self.last_prepared,
+                           "host_domain": dict(domain) if domain else None,
+                           "admission": leases}, sort_keys=True)
 
     def test_real_host_v3_settlement_reload_reuse_and_error(self) -> None:
         provider_bodies: list[dict] = []
@@ -366,6 +406,26 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             hermes_config._config_cache = None
             plugins.discover_plugins()
             self._prepare_index()
+            service = plugins.get_plugin_manager()._get_plugin_service(
+                "hermes-continuity:canonical-source.v2")
+            preparation = importlib.import_module(type(service.adapter.history_index).__module__)
+            pending_agent = self._agent(prepare_before_request=False)
+            self.agents.append(pending_agent)
+            pending_agent._interruptible_streaming_api_call = provider
+            # Deterministically keep preparation pending after real user
+            # persistence. Do not enlarge the foreground wait or retry it.
+            with preparation.PREPARATION_LOCK:
+                pending = pending_agent.run_conversation(
+                    "Native turn while reload preparation is busy",
+                    conversation_history=[], task_id="pending-reload")
+                self.assertEqual(pending["final_response"], "long-history answer")
+                self.assertEqual(repr(provider_bodies[-1]).count(CONTINUITY_MARKER), 0)
+                self.assertEqual(self.last_bundle["source"]["status"], "pending",
+                                 self._diagnostics())
+                self.assertEqual(self.last_bundle["source"]["error"], "history_source_pending")
+                self.assertEqual(_sqlite_count(continuity_db, "continuity_receipts"), 1)
+                self.assertEqual(self.summary_calls, 1)
+            self._prepare_index()
             restarted_agent = self._agent()
             self.agents.append(restarted_agent)
             restarted_agent._interruptible_streaming_api_call = provider
@@ -376,7 +436,8 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             )
             self.assertEqual(second["final_response"], "long-history answer")
             self.assertEqual(self.summary_calls, 1)
-            self.assertEqual(repr(provider_bodies[1]).count(CONTINUITY_MARKER), 1)
+            self.assertEqual(repr(provider_bodies[-1]).count(CONTINUITY_MARKER), 1,
+                             self._diagnostics())
             self.assertEqual(
                 _sqlite_count(continuity_db, "continuity_receipts"), 2
             )

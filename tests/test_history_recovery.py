@@ -217,6 +217,15 @@ hermes_adapter = importlib.import_module(f"{package_name}.hermes_adapter")
 reader = SessionDB(db_path=state_path, read_only=True)
 store = hermes_adapter.ContinuityMetadataStore(metadata_path)
 
+# Exercise a genuinely multi-quantum host, rather than relying on CI speed.
+# The production deadline is unchanged; only this fixture's row/page ceilings
+# are reduced through the existing host API.
+prepare = reader.prepare_history_step
+def one_row_quantum(*args, **kwargs):
+    kwargs.update(max_pages=1, max_rows_per_page=1)
+    return prepare(*args, **kwargs)
+reader.prepare_history_step = one_row_quantum
+
 if scenario == "plugin_transaction":
     connect = store._connect
 
@@ -246,8 +255,12 @@ if scenario == "host_ready_group_absent":
 
     adapter.history_index._page = crash_before_group_page
 
-adapter.history_index.prepare_step("session-1")
-raise AssertionError("plugin crash boundary was not reached")
+for quantum in range(2_000):
+    result = adapter.history_index.prepare_step("session-1")
+    if result.get("status") != "progress":
+        raise AssertionError({"boundary_not_reached": scenario, "quantum": quantum,
+                              "status": result.get("status"), "reason": result.get("reason")})
+raise AssertionError("plugin crash boundary was not reached within bounded quanta")
 """
 
 
