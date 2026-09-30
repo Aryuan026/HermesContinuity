@@ -185,3 +185,40 @@ increment. Selected Assembly pins remain unchanged; no Assembly landing is
 performed. Owner-history `display_kind` conflict, ready source, live settlement
 and the 48–72h target observation remain unproven and outside this correction.
 No merge, target access, install, enablement, restart or database mutation.
+
+## Accepted preparation correction; owner-copy provenance diagnosis
+
+The owner relayed external acceptance of PR #6's preparation/test correction
+at `ce3fb0e10c8e7447d86423ff3e8b478d239e5d77`. Its two reviewed blockers are
+closed. Block 4 now continues target-copy qualification; this acceptance does
+not establish source readiness for the owner's history or start observation.
+
+A subsequent read-only probe of the retained disposable copy confirms that
+the first conflicting row's exact stored-key query finds 39 physical members: one archived
+`internal_notification`, 37 archived members with no display kind, and one
+active member with no display kind. The bounded earlier/incoming comparison
+still differs only in `id` and `display_kind`. These are provenance-affecting
+values, not an empty-string/NULL presentation equivalence. No message body or
+private locator is published, and the canonical rows were not rewritten.
+The count is scoped to that stored-key query, not a census of every semantic
+encoding or every conflicting group in the domain.
+
+Current writer tracing finds that Gateway synthetic input supplies the tag,
+the conversation reader restores it, compaction message copies retain it, and
+the concurrent-tail SQL copy preserves columns. This does not identify which
+historical writer lost the tag. The observed missing values cannot by
+themselves grant verified human authority.
+
+The frozen clone audit therefore continues to reject this domain. Ignoring
+`display_kind` is not a permitted target adaptation. A proposed next step is
+complete-group local conflict handling, retaining every physical obligation
+while excluding ambiguous material from the bridge and allowing independently
+verified history to progress. That changes the accepted source-compatibility
+semantics and awaits an explicit owner decision; no such implementation or
+original-data repair has been performed.
+
+The target gateway remains active/running with the same main PID and zero
+automatic restarts at this readback. No install, enablement, restart, source
+switch, merge or natural provider/QQ traffic occurred. Selected recovery pins
+and procedures remain unchanged; no Assembly update is required for this
+diagnostic/evidence-only increment.

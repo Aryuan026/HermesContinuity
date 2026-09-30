@@ -273,3 +273,20 @@
   time. See BLOCK4_TARGET_VALIDATION.md for the test-only evidence boundary.
 - PR #6 remains reviewable/unmerged; no Assembly pin or target mutation. The
   owner-history conflict and deployment/observation qualification remain open.
+
+## 2026-09-30 — accepted PR #6; Block 4 owner-copy qualification continues
+
+- Owner relayed external PASS at `ce3fb0e`; the preparation/test correction's
+  two blockers are closed. Blocks 1–3 remain accepted.
+- Read-only bounded diagnosis on the retained owner copy identifies 39
+  exact stored-key physical members: one archived `internal_notification`, 37 archived
+  untyped copies and one active untyped copy. This is a real provenance
+  mismatch, not a NULL/empty-string representation difference. No body,
+  private locator or canonical-row modification is part of this receipt.
+- Existing reader/compaction paths preserve the field; the original historical
+  loss is not attributed to an unproven writer. Ignoring the field is rejected.
+  Complete-group local conflict handling is proposed for owner confirmation,
+  not silently implemented under the frozen strict clone-audit contract.
+- Target remains active/running with unchanged PID and zero restarts. No
+  deployment or observation starts; no Global Hot, upstream, original DB or
+  selected recovery change. See BLOCK4_TARGET_VALIDATION.md.
