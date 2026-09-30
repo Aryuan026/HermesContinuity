@@ -195,3 +195,28 @@
   benchmark on both declared Python versions, using Bash pipefail.
 - Next checkpoint is external correction review of PR #5. No merge, target
   mutation, real-data access or promotion to accepted/deployed status.
+
+## 2026-09-30 — Block 3 accepted; Block 4 target validation opened
+
+- Owner relayed external acceptance of correction source `191853bf`; Blocks
+  1 and 2 remain accepted. The preceding candidate-only entries are historical.
+  PR #5 remains unmerged; acceptance does not imply deployment.
+- Existing deployment/observation authorization now applies to Block 4. The
+  target still runs the twelve-patch 0.20.5 host and Continuity `34780f0`.
+  Target-copy replay matches the three changed host files byte-for-byte.
+- Real owner databases were consistently backed up to a protected disposable
+  workbench. The copied metadata has one nonempty v2 checkpoint and 94 receipts.
+  No original database, runtime source/config or gateway lifecycle was changed.
+- Target validation found a preparation-progress blocker: the 256-row page
+  repeatedly exhausts the 50ms transaction budget before its first commit.
+  A 180-second copy-only run never creates a committed domain progress row.
+  Five diagnostic 32-row quanta with the unchanged 50ms budget commit 529
+  canonical records. This is a diagnostic parameter control, not a production
+  fix or completed target replay.
+- Target plugin suite: 296 total, 293 pass, two conditional skips, one failure
+  in real-host history preparation convergence. Target pytest is absent; the
+  pytest host suite was not executed and no dependency was installed.
+- See BLOCK4_TARGET_VALIDATION.md. Next work is the bounded preparation-page
+  target adaptation and its regression/review, then the same copy validation
+  and authorized deployment. No macro-plan reopening, Global Hot change or
+  newer Hermes baseline. The 48–72h observation clock has not started.
