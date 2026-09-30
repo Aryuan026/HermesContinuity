@@ -150,6 +150,25 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
                 "WHERE session_id='long-mouth'"
             )
         )
+        self.image_meanings = (
+            "Recorded sticker intent: playful irony, not the literal scene",
+            "Recorded chart interpretation: value 12, unreadable labels unknown",
+            "Synthetic successful save receipt: PIC-007, design reference",
+        )
+        for offset, meaning in enumerate(self.image_meanings):
+            content = [
+                {"type": "text", "text": meaning},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ]
+            self.session_db.append_message("long-mouth", "user", content,
+                                           timestamp=now + 2400 + offset * 2)
+            self.session_db.append_message("long-mouth", "assistant", "Recorded dialogue response",
+                                           timestamp=now + 2401 + offset * 2)
+        self.session_db._execute_write(lambda connection: connection.execute(
+            "UPDATE messages SET active=0,compacted=1 WHERE session_id='long-mouth'"))
+        self.image_source_rows = [tuple(row) for row in self.session_db._conn.execute(
+            "SELECT * FROM messages ORDER BY id DESC LIMIT 6")]
+        self.image_row_ids = [row[0] for row in self.image_source_rows]
 
     def tearDown(self) -> None:
         for agent in self.agents:
@@ -171,11 +190,15 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
     async def _summary_complete(self, _plugin_llm, messages, **_kwargs):
         self.summary_calls += 1
         rendered = "\n".join(str(row.get("content") or "") for row in messages)
+        self.assertNotIn("data:image/", rendered)
+        self.assertNotIn("'image_url'", rendered)
+        for meaning in self.image_meanings:
+            self.assertIn(meaning, rendered)
         marker = SUMMARY_MARKER.search(rendered)
         if marker is None:
             raise AssertionError("Continuity summary marker missing from host LLM call")
         return PluginLlmCompleteResult(
-            text="bounded long-history bridge\n" + marker.group(0),
+            text="bounded long-history bridge\n" + "\n".join(self.image_meanings) + "\n" + marker.group(0),
             provider="long-history-provider",
             model="long-history-summary-model",
             agent_id="default",
@@ -399,6 +422,7 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             self.assertEqual(first["final_response"], "long-history answer")
             self.assertEqual(self.summary_calls, 1, provider_bodies[0])
             self.assertEqual(repr(provider_bodies[0]).count(CONTINUITY_MARKER), 1)
+            self.assertIn("PIC-007", repr(provider_bodies[0]))
 
             continuity_paths = list(
                 (self.home / "plugin-data").glob("*/continuity.sqlite3")
@@ -450,6 +474,7 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             self.assertEqual(self.summary_calls, 1)
             self.assertEqual(repr(provider_bodies[-1]).count(CONTINUITY_MARKER), 1,
                              self._diagnostics())
+            self.assertIn("PIC-007", repr(provider_bodies[-1]))
             self.assertEqual(
                 _sqlite_count(continuity_db, "continuity_receipts"), 2
             )
@@ -479,6 +504,10 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             )
         self.assertEqual([tuple(row) for row in self.session_db._conn.execute(
             f"SELECT * FROM messages WHERE id IN ({placeholders}) ORDER BY id", self.legacy_row_ids)], before)
+        image_placeholders = ",".join("?" for _ in self.image_row_ids)
+        self.assertEqual([tuple(row) for row in self.session_db._conn.execute(
+            f"SELECT * FROM messages WHERE id IN ({image_placeholders}) ORDER BY id DESC",
+            self.image_row_ids)], self.image_source_rows)
 
 
 if __name__ == "__main__":

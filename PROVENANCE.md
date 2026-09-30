@@ -137,3 +137,18 @@ bounded request carrier.
 
 The compatibility patches retain the upstream Hermes/Nous MIT notice in
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+## Owner-authorized historical image representation trial
+
+The donor summary prompt forwards multimodal source parts. This trial deliberately
+adapts that provider-input representation at the owner's request: historical
+pixels are omitted before summary/chunk estimation, copying and request hashing;
+recorded dialogue and interpretations remain text. Canonical content, identities,
+fingerprints, checkpoint/CAS ownership and current-turn attachments are unchanged.
+All three retained prompt paths use the same projection rather than separate
+image policies. The extraction lineage and notices above remain in force.
+
+This is not a new vision, image-storage or numbering implementation. A recorded
+save number is retained as dialogue, not promoted to a verified file receipt.
+Missing interpretations stay missing; the actual folder-based save consumer and
+bounded giant-value source/index path still require integration and validation.

@@ -29,7 +29,7 @@ from hermes_cli.request_overlay import (
     request_messages,
 )
 
-from .context_compactor import thread_continuity_bridge_projection
+from .context_compactor import _summary_source_content, thread_continuity_bridge_projection
 from .thread_continuity_runtime import compile_thread_continuity_turn
 from .resource_budget import ACTIVE_WORKSETS, COLD_PLANS
 
@@ -561,11 +561,14 @@ class ContinuityRuntime:
             getattr(self.plugin_llm, "acomplete", None)
         ):
             raise RuntimeError("plugin_llm_unavailable")
+        summary_messages = copy.deepcopy([
+            {**row, "content": _summary_source_content(row.get("content"))}
+            for row in messages
+        ])
         marker = (
             f"{_SUMMARY_END_PREFIX}"
-            f"{canonical_request_sha256({'descriptor': dict(descriptor), 'messages': messages})}]"
+            f"{canonical_request_sha256({'descriptor': dict(descriptor), 'messages': summary_messages})}]"
         )
-        summary_messages = copy.deepcopy(messages)
         terminal_instruction = (
             "End the response with this exact completion marker, exactly once, "
             "as the final non-whitespace text. Do not quote or explain it:\n"

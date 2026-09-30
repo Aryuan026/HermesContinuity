@@ -2406,6 +2406,26 @@ Do not reconstruct older history and do not treat any previous bridge or summary
 Source IDs are structural metadata only and need not appear in the prose. Return only the visible summary text."""
 
 
+def _summary_source_content(content: Any) -> Any:
+    """Keep recorded dialogue/interpretation, not recurrent historical pixels.
+
+    This is provider input only: canonical content, identities and fingerprints
+    remain untouched. No image category or saved-asset number is inferred.
+    """
+    if not isinstance(content, list):
+        return content
+    omitted = "[Image pixels omitted; use recorded dialogue, not unseen details.]"
+    parts = []
+    for part in content:
+        if isinstance(part, Mapping) and part.get("type") in {"image_url", "input_image"}:
+            parts.append({"type": "text", "text": omitted})
+        elif isinstance(part, Mapping) and "image" in part and not part.get("type"):
+            parts.append({"text": omitted})
+        else:
+            parts.append(part)
+    return parts
+
+
 def _summary_prompt(carry: str, groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     messages: List[Dict[str, Any]] = [{"role": "system", "content": SUMMARY_INSTRUCTION}]
     if carry:
@@ -2422,7 +2442,7 @@ def _summary_prompt(carry: str, groups: List[Dict[str, Any]]) -> List[Dict[str, 
         for message in group["messages"]:
             name = str(message.get("name") or "")
             messages.append(
-                {"role": message["role"], "content": message["content"], **({"name": name} if name else {})}
+                {"role": message["role"], "content": _summary_source_content(message["content"]), **({"name": name} if name else {})}
             )
     return messages
 
@@ -2459,7 +2479,7 @@ def _compact_summary_prompt(
             messages.append(
                 {
                     "role": message["role"],
-                    "content": message["content"],
+                    "content": _summary_source_content(message["content"]),
                     **({"name": name} if name else {}),
                 }
             )
@@ -3089,7 +3109,11 @@ def _chunk_prompt(
             "content": json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         }
     )
-    return [*messages, *_chunk_fragment_messages(group, atoms, start, end)]
+    fragments = _chunk_fragment_messages(group, atoms, start, end)
+    return [*messages, *[
+        {**message, "content": _summary_source_content(message["content"])}
+        for message in fragments
+    ]]
 
 
 def _chunk_receipt(descriptor: Mapping[str, Any], provider_result: Any) -> Tuple[str, Dict[str, Any]]:

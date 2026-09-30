@@ -1308,6 +1308,63 @@ class ContinuityRuntimeTests(unittest.TestCase):
                 self.assertEqual(result["content"], "summary")
                 self.assertEqual(messages, original)
 
+    def test_summary_omits_pixels_before_hash_copy_and_provider_call(self) -> None:
+        class Pixels:
+            def __deepcopy__(self, memo):
+                raise AssertionError("historical pixels copied")
+
+        class InspectLlm(FakeLlm):
+            async def acomplete(self, messages, **kwargs):
+                serialized = json.dumps(messages, ensure_ascii=False)
+                self_test.assertNotIn("image_url", serialized)
+                self_test.assertNotIn("input_image", serialized)
+                self_test.assertIn("not unseen details", serialized)
+                self_test.assertIn(expected, serialized)
+                return await super().acomplete(messages, **kwargs)
+
+        self_test = self
+        for expected in (
+            "这次用表情表达反讽，不是画面描述",
+            "已识别信息：图表标注为 12；模糊数字未知",
+            "已保藏：pic_007；语义：用户指定保留的设计参考",
+        ):
+            for kind in ("image_url", "input_image", "bedrock"):
+                with self.subTest(meaning=expected, kind=kind):
+                    pixels = Pixels()
+                    image = ({"image": {"source": {"bytes": pixels}}}
+                             if kind == "bedrock" else
+                             {"type": kind, "image_url": {"url": pixels}})
+                    content = [{"type": "text", "text": expected}, image]
+                    messages = [{"role": "user", "content": content}]
+                    runtime = make_runtime(FakeAdapter(bundle()), FakeCompiler(None), llm=InspectLlm())
+                    result = asyncio.run(runtime._summary_call({"max_output_tokens": 128}, messages))
+                    self.assertNotIn("status", result)
+                    self.assertIs(messages[0]["content"], content)
+                    self.assertIs(content[1], image)
+                    self.assertEqual(runtime.plugin_llm.calls, 1)
+
+    def test_image_omission_does_not_invent_semantics_or_saved_numbers(self) -> None:
+        image = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+        projected = runtime_module._summary_source_content(image)
+        self.assertNotIn("AAAA", json.dumps(projected))
+        self.assertIn("not unseen details", projected[0]["text"])
+        self.assertNotIn("pic_", json.dumps(projected))
+        self.assertNotIn("description", projected[0])
+
+    def test_summary_image_policy_does_not_remove_current_turn_attachment(self) -> None:
+        runtime = make_runtime(FakeAdapter(bundle()), FakeCompiler(checkpoint("bridge")))
+        wire = request()
+        content = [{"type": "text", "text": "current image"},
+                   {"type": "image_url", "image_url": {"url": "data:image/png;base64,CURRENT"}}]
+        wire["messages"][-1]["content"] = content
+        original = copy.deepcopy(wire)
+        projected = project(runtime, wire)
+        projected_content = projected["request"]["messages"][-1]["content"]
+        self.assertEqual(projected_content[1:], content)
+        self.assertEqual(len(projected_content), len(content) + 1)
+        self.assertIn(MARKER.split(" marker=", 1)[0], projected_content[0]["text"])
+        self.assertEqual(wire, original)
+
     def test_missing_post_error_or_execution_drift_never_publishes(self) -> None:
         adapter = FakeAdapter(bundle())
         compiler = FakeCompiler(checkpoint("bridge"))

@@ -286,3 +286,95 @@ restart, merge, upstream upgrade, Global Hot change or observation start.
 Public successor CI and external review must be recorded separately. Handling
 the giant row without losing memory or returning to unbounded reads remains
 the next qualification problem, not an implemented product change here.
+
+## Giant-value implementation work, not accepted/selected
+
+- owner_goal: finish the actual owner-history chain without dropping or
+  quarantining complete groups and without increasing the established worksets.
+- current_phase: Block 4 giant-value correction; Blocks 1–3 remain closed.
+- accepted_checkpoint: origin correction `64074b89ec37e32558fa15be63f6254365d46dbc`;
+  preferred code rollback remains Block 1 `1d6f502f`.
+- proposed_product_delta: native bounded value reads and complete raw/semantic
+  identity validation through preparation, grouping and compiler consumers.
+- real_consumer: existing host preparation → group index → recent bridge →
+  final provider-body settlement → next-turn reuse, not a separate memory pool.
+- forbidden_surfaces: original database writes, quarantine/exclusion, larger
+  budgets, Global Hot changes, upstream upgrade, merge/deployment or observation.
+- stop_condition: positive/negative local and disposable-copy evidence plus a
+  reviewable ordinary PR update; no source/runtime selection by this work alone.
+
+A read-only structural probe identifies the over-budget record as an archived
+user message with JSON-encoded multimodal content. Two data-URI string leaves
+account for approximately 5.1 and 17.5 MB. Neither raw bodies nor private
+locators are emitted. A native 64 KiB blob reader completes 345 chunks with
+approximately 0.9 MiB measured RSS high-water increment; this is read-only I/O
+evidence, not complete-source or compiler evidence.
+
+A separate bounded JSON/hash probe on that same copy completes parsing and
+both full canonical ASCII/UTF-8 JSON hashes in about 3.5 seconds, in 345
+scheduling boundaries. Largest measured parser boundary is about 5.1 ms;
+process peak is about 20 MiB. It retains 245 small-string bytes and 12 parsed
+value nodes, not the giant leaves. The source host/plugin and production
+remain unchanged. These isolated measurements do not establish hard timing
+bounds, snapshot/publication validity or end-to-end memory safety.
+
+The implementation draft keeps unfinished byte/hash state private to the
+existing worker; a byte boundary cannot advance a complete physical/group
+cursor. Restart must discard unfinished state and reverify canonical bytes.
+Sparse character/byte positions support bounded text fragments without
+joining the complete value. The initial seven local primitive regressions
+pass, including exact old JSON hashes, Unicode/escape boundaries, restart
+without a partial proof, malformed input, and late giant-text fragments.
+This is not yet integrated into the accepted host APIs or plugin consumers.
+
+The real sample does not remove the giant-text positive contract. The owner
+subsequently selected and authorized a pixel-free continuity representation:
+stickers are not repeatedly collected into the bucket (their conversational
+meaning remains dialogue); informational images retain recorded semantic
+interpretation, without thumbnails or default saving; deliberately saved
+images additionally retain their actual successful-save index. These are uses,
+not a classifier based on filenames or visual appearance. No historical original
+is deleted or rewritten, no asset pool is created, and no historical bulk vision
+job is authorized. A cache path or invented number is not a save receipt.
+
+The shared summary/chunk prompt boundary now omits historical image parts before
+prompt estimation and input hashing, while retaining all supplied text and
+canonical source identities/fingerprints. The runtime repeats the same idempotent
+projection before copying/hashing or invoking PluginLlm. This does not generate
+missing image interpretations: omitted pixels are explicitly unavailable, and
+recorded assistant statements remain dialogue, not independently verified vision
+results. The actual folder-based save consumer and giant-value read/index chain
+are still being connected; this small projection alone is not whole-owner-history
+readiness or complete three-category implementation.
+
+Local working-diff validation uses the clean accepted host `ff67db0d` (tree
+`d9553785cda565b177b077f7784309bd116264cf`), not the unfinished giant-value
+host draft. The plugin suite completes 300 tests: 298 pass and two existing
+conditional skips. The retained host history/replay/overlay/middleware selection
+completes 108 tests and 15 subtests. The history-index, value-guard and original
+full-chain resource benchmarks complete five, three and seven cases respectively.
+Oversized value-guard cases remain explicit rejection, not giant-history success.
+
+The real discovery/`AIAgent.run_conversation` regression retains recorded image
+meaning in the settled bridge and next-turn manager-unload/reload reuse. It
+checks original SQLite image rows remain exact; its provider and image meanings,
+including `PIC-007`, are synthetic. This is not independent image recognition,
+real saved-file/number validation, real network delivery or natural QQ evidence.
+The current-turn attachment control retains the legitimate bridge prefix and
+the original text/image parts. An initial assertion incorrectly omitted that
+prefix and failed; after correcting the assertion, the full 300-test rerun passes.
+
+The owner clarified that deliberate saving was requested conversationally and
+Hermes moved files into a server folder. Bounded read-only tool-record/path
+checks have not established that actual save folder or numbering consumer.
+No candidate private locator or conversation body is published here, and no
+cache/test image is adopted as a saved asset. Semantic generation and verified
+saved-index linkage remain pending rather than being replaced with a new pool.
+
+Recovery truth: this changes candidate plugin source and summary representation,
+not the selected Assembly artifact. Dependencies, managed runtime paths, units,
+secrets, canonical data and selected rollback remain unchanged. No host patch
+is exported from the giant-value draft. Ordinary PR delivery of this partial
+trial does not select it for runtime, reopen accepted Blocks 1–3, or authorize
+merge, deployment, restart or observation. Successor public CI and external
+acceptance must be recorded separately before any selected-artifact reconciliation.
