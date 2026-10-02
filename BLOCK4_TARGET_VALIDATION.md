@@ -419,3 +419,85 @@ rollback preference remain unchanged. The real 22,596,510-byte source value,
 whole-owner-history readiness, query-driven relevance recall and 0.21.5
 adaptation remain open. This correction neither makes chronological continuity
 semantic retrieval nor qualifies the unfinished streaming draft for runtime.
+
+## Integrated giant-value source candidate, 2026-10-02
+
+- owner_goal: complete the actual long-history/recall repair, not stop after a
+  one-line selector correction.
+- current_phase: Block 4 target-copy qualification of the integrated source.
+- accepted_checkpoint: accepted image representation `b7bc7bb...`, selector
+  successor `f8b2778...`, unchanged first sixteen host artifacts.
+- proposed_product_delta: additive streamed-value host seam and consumer
+  adaptation; retained budgets and canonical data remain unchanged.
+- real_consumer: host preparation/page -> group index -> compiler -> final
+  transport -> post-settlement -> next-turn and manager unload/reload.
+- forbidden_surfaces: canonical edits/exclusion, increased budgets, production
+  install/enable/restart, Global Hot algorithm or .21.x changes.
+- stop_condition: replayable reviewed source plus a precise target result;
+  changing retirement/recall ownership requires an explicit owner decision.
+
+Patch 17 is now integrated, not merely a byte-read probe. Complete raw and
+decoded hashes cover every stored byte before a record can enter the index.
+Checksummed range descriptors contain no transcript; bounded deferred reads
+validate the fixed source token. A byte-work step closes its SQLite blob and
+connection before yielding. Same-row captured edits restart work; unrelated
+appends do not. Completed proofs survive a quantum that cannot yet commit.
+Body-free native shape caching avoids repeatedly walking a giant SQLite
+record. No larger window, dependency or alternative transcript store is added.
+
+Continuity no longer rejects an entire unclassified dialogue merely because
+consecutive user rows have different display provenance: that unused check is
+limited to the separate typed window. The strict Global Hot classifier still
+rejects the same mixed group. No notification becomes verified human, no row
+or group is removed, and no provenance field is rewritten.
+
+The exported host commit is `e654daaa11d5f960b26edc40cabc58f44e7b53fc`, tree
+`dadd41d44e0418d601c7d9c4bdf8267ca667fb7d`. Its parent materializes the
+accepted sixteen-patch tree `d9553785...`. A fresh baseline archive plus patch
+17 reconstructs the complete final tree exactly. Its local 67 history/stream
+tests pass; retained overlay/middleware/Gateway cases are 53 passed plus
+15 subtests. The exact compatible-host plugin suite is 303/303 with the
+preserved legacy module and exact Global Hot `af605282...`, including actual
+discovery/AIAgent entry, indexed dual overlay, giant-image settlement, next-turn
+reuse, manager unload/reload and failure/cancellation controls. A later
+live-hole regression is recorded separately rather than folded into 303.
+The final index selection passes 23/23, including that live-hole regression;
+the fresh exported-host replay passes 67/67 and its paired entrypoint 1/1.
+
+Final isolated Python 3.12 streamed benchmarks both pass with 24 complete
+groups, 48 foreground rows, two receipts and one summary. 16 MiB: preparation
+1.715s, peak 59,360 KiB, measurement high-water delta 12,832 KiB. 64 MiB:
+preparation 7.771s, peak 60,080 KiB, delta 13,808 KiB. These are synthetic
+SQLite/plugin/provider chains, not service RSS or natural QQ timings. Earlier
+64-MiB drafts timed out at 180s and are retained as failed drafts; caching
+verified native shape fixed the reproduced progress bottleneck. A 50ms SQL
+quantum is not a strict native-I/O/commit wall-clock guarantee.
+
+### Actual owner copy: ready index, remaining foreground barrier
+
+The protected consistent copy contains 67,447 physical records. The integrated
+source now reaches **ready** after 5,223 bounded quanta / 255.553s, peak process
+RSS 122,836 KiB. It does not call a model during preparation. This passes the
+real 22,596,510-byte record instead of dropping it or returning permanent
+overflow at that row. Foreground read nevertheless returns overflow: the
+existing continuous-retirement gate requires the whole suffix after the first
+uncompacted group to fit the foreground workset.
+
+Body-free index diagnosis: 6,264 complete groups; first uncompacted group at
+ordinal 2,973. Its suffix contains 3,292 groups / 4,225 canonical rows /
+27,455,617 admitted bytes: only 139 groups are uncompacted, while 3,153 later
+groups are compacted. The newest recorded group is about 45 hours old. Thus
+this is not simply a stale 72-hour window, and relabeling those old groups or
+raising 2,048-row/4-MiB limits would manufacture retirement authority.
+A second fresh-process run reaches the same result in 5,134 quanta / 240.628s
+with peak 120,896 KiB and explicitly reports `foreground_group_limit_exceeded`.
+
+This target result is **not** owner-history bridge, settlement or reuse. The
+proposed next narrow product decision is independent bounded query recall
+without moving the continuous retirement cursor; it can use verified later
+compacted groups without pretending the earlier live holes were retired.
+Owner approval of that ownership separation is pending. Canonical history is
+not quarantined, deleted or silently relabeled. Public successor CI and
+external review remain separate from local evidence. No production deployment,
+natural provider/QQ call, merge or observation start is claimed; selected
+Assembly/rollback identities remain unchanged.

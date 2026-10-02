@@ -7,6 +7,12 @@ from collections.abc import Mapping as MappingABC
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Tuple
 
+try:
+    from hermes_history_content import HistoryValue, HistoryString
+except ImportError:
+    # The accepted non-indexed and sixteen-patch hosts remain supported.
+    HistoryValue = HistoryString = ()
+
 from .checkpoint_v3 import (
     THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA,
     build_thread_continuity_checkpoint_v3,
@@ -96,6 +102,10 @@ class _ThreadContinuityPhysicalOwnerSidecar(MappingABC):
 
 
 def _content_to_text(content: Any) -> str:
+    if isinstance(content, HistoryValue):
+        content = content.root
+    if isinstance(content, HistoryString):
+        return "[verified text; bounded fragment required]" if content.nonblank else ""
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
@@ -107,6 +117,9 @@ def _content_to_text(content: Any) -> str:
             item_type = str(item.get("type", "")).strip()
             if item_type in {"text", "input_text"}:
                 text = item.get("text")
+                if isinstance(text, HistoryString):
+                    parts.append("[verified text; bounded fragment required]" if text.nonblank else "")
+                    continue
                 if not isinstance(text, str):
                     return ""
                 parts.append(text.strip())
@@ -115,6 +128,7 @@ def _content_to_text(content: Any) -> str:
                 image_url = image.get("url") if isinstance(image, Mapping) else image
                 if not (
                     isinstance(image_url, str) and image_url.strip()
+                    or isinstance(image_url, HistoryString) and image_url.nonblank
                     or isinstance(item.get("file_id"), str) and item["file_id"].strip()
                 ):
                     return ""
@@ -163,6 +177,8 @@ def _group_fingerprint(group: Mapping[str, Any]) -> str:
 
 
 def _content_hash(value: Any) -> str:
+    if isinstance(value, HistoryValue):
+        return value.utf8_sha256
     try:
         serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     except (TypeError, ValueError) as exc:
@@ -2412,6 +2428,10 @@ def _summary_source_content(content: Any) -> Any:
     This is provider input only: canonical content, identities and fingerprints
     remain untouched. No image category or saved-asset number is inferred.
     """
+    if isinstance(content, HistoryValue):
+        content = content.root
+    if isinstance(content, HistoryString):
+        return content.slice(0,len(content))
     if not isinstance(content, list):
         return content
     omitted = "[Image pixels omitted; use recorded dialogue, not unseen details.]"
@@ -2422,6 +2442,8 @@ def _summary_source_content(content: Any) -> Any:
         elif isinstance(part, Mapping) and "image" in part and not part.get("type"):
             parts.append({"text": omitted})
         else:
+            if isinstance(part, Mapping) and isinstance(part.get("text"), HistoryString):
+                part = {**part,"text":part["text"].slice(0,len(part["text"]))}
             parts.append(part)
     return parts
 

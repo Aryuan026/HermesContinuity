@@ -70,6 +70,7 @@ def _sqlite_count(path: Path, table: str) -> int:
     "set HERMES_SOURCE_ROOT to a Block 3 compatible Hermes tree",
 )
 class RealHostLongHistoryV3Tests(unittest.TestCase):
+    historical_image_bytes = 65536
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.home = Path(self.tempdir.name) / ".hermes"
@@ -162,7 +163,8 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
         for offset, meaning in enumerate(self.image_meanings):
             content = [
                 {"type": "text", "text": meaning},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 65536}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * (
+                    self.historical_image_bytes if offset == 0 else 65536)}},
             ]
             self.session_db.append_message("long-mouth", "user", content,
                                            timestamp=now + 2400 + offset * 2)
@@ -425,7 +427,7 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             )
             self.assertEqual(first["final_response"], "long-history answer")
             self.assertEqual(self.summary_calls, 1, provider_bodies[0])
-            self.assertEqual(repr(provider_bodies[0]).count(CONTINUITY_MARKER), 1)
+            self.assertEqual(repr(provider_bodies[0]).count(CONTINUITY_MARKER), 1, self._diagnostics())
             self.assertIn("PIC-007", repr(provider_bodies[0]))
 
             continuity_paths = list(
@@ -512,6 +514,12 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
         self.assertEqual([tuple(row) for row in self.session_db._conn.execute(
             f"SELECT * FROM messages WHERE id IN ({image_placeholders}) ORDER BY id DESC",
             self.image_row_ids)], self.image_source_rows)
+
+
+@unittest.skipUnless(HOST_AVAILABLE and (HERMES_ROOT / "hermes_history_content.py").is_file(),
+                     "requires the streamed canonical-history seam")
+class RealHostGiantHistoryV3Tests(RealHostLongHistoryV3Tests):
+    historical_image_bytes = 16 * 1024 * 1024
 
 
 if __name__ == "__main__":

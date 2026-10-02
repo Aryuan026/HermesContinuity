@@ -314,3 +314,22 @@
   merge, upstream upgrade, Global Hot change or observation start. Public
   successor CI and external review remain pending; selected Assembly pins
   remain unchanged. See BLOCK4_TARGET_VALIDATION.md for evidence boundaries.
+
+## 2026-10-02 — integrated streamed-value candidate, target recall barrier
+
+- Additive patch 17 carries bounded giant-value verification through the real
+  source/index/compiler consumers. First sixteen artifacts are unchanged.
+  Local host 67/67 plus retained 53 tests/15 subtests pass; complete compatible
+  plugin suite 303/303 includes giant real-host and exact paired entrypoints.
+  Independent fresh patch replay matches host tree `dadd41d4...` exactly.
+- 16/64-MiB full-chain benchmarks pass: two receipts, one summary, next-turn
+  reuse, about 12.5/13.5 MiB measurement-peak increments, not service totals.
+- Owner copy now prepares all 67,447 physical records to ready; its foreground
+  still rejects 4,225 rows after an early uncompacted group. There are 139
+  uncompacted groups interspersed before 3,153 later compacted groups. This
+  exposes a retirement/recall ownership barrier, not another giant-value read
+  failure. No memory is removed or marked retired to make it pass.
+- Independent query recall without retirement authority is proposed, pending
+  owner agreement. Source-candidate PR/public CI, target qualification,
+  deployment and 48–72h observation remain distinct. No live change, Global Hot
+  algorithm change or .21.x adaptation occurs in this candidate.

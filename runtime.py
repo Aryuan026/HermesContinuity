@@ -32,6 +32,7 @@ from hermes_cli.request_overlay import (
 from .context_compactor import _summary_source_content, thread_continuity_bridge_projection
 from .thread_continuity_runtime import compile_thread_continuity_turn
 from .resource_budget import ACTIVE_WORKSETS, COLD_PLANS
+from .hermes_adapter import _json_text
 
 
 _request_sha256 = canonical_request_sha256
@@ -801,7 +802,7 @@ class ContinuityRuntime:
             reserved_output_tokens=reserve,
             provider_key=(model, provider, base_url),
             source_checkpoint=(dict(selected) if indexed and selected else None),
-            workset_bytes=(len(json.dumps(bundle, ensure_ascii=False).encode("utf-8"))
+            workset_bytes=(len(_json_text(bundle).encode("utf-8"))
                            if indexed else 0),
         )
 

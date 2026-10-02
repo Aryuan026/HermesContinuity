@@ -53,6 +53,7 @@ The exported patch SHA-256 values, in application order, are:
 14. `b7e388fcf5ffefbe4b3665974d0fa1ab6a2b4a425986df2a6de0254d4dde91f3`
 15. `77aa8db643df87618413ec3c86333790ef53dc219fa8d70b82d2b797c880f0c5`
 16. `a6c726f18cd7fdb49b95c2a843e6d2e90f0ea383f324be897a6aca00f7eb46cc`
+17. `60a6332287346b4ef217efd76fc16a297e3267a6bac2fcfbed605009d7e6f41e`
 
 Patch 13 (`hermes-0.20.5-incremental-history.patch`) is the additive Block 3
 canonical journal/index seam. It is exported from compatibility-host commit
@@ -93,6 +94,21 @@ invalidates old proofs and rebuilds their derived index with the existing
 bounded worker; no checkpoint or database schema is changed. The first fifteen
 artifacts, plugin compiler and Global Hot remain unchanged. This source
 candidate is not deployed and does not establish whole-owner-history readiness.
+
+Patch 17 (`hermes-0.20.5-history-streamed-values.patch`) is exported from
+`e654daaa11d5f960b26edc40cabc58f44e7b53fc`, tree
+`dadd41d44e0418d601c7d9c4bdf8267ca667fb7d`. Its direct parent is a local
+materialization of the unchanged sixteen-patch tree `d9553785...`, not a claim
+to reconstruct the original `ff67db0d` commit history. It adds cooperative
+64-KiB SQLite value work, complete raw/semantic identity hashes, checksummed
+body-free range descriptors and snapshot-validated deferred reads. No SQLite
+connection or blob survives a preparation quantum. Only completed values
+advance record proofs; captured same-row edits restart unfinished work, while
+unrelated tail appends do not. Rule v3 invalidates older derived proofs.
+The first sixteen exported artifacts remain byte-identical. Plugin adaptation
+uses actual complete content hashes for identity and private descriptor sizes
+only for admission; historical image pixels remain excluded only from summary
+input. This is not a port to 0.21.x or a selected production artifact.
 
 ## Extraction matrix
 

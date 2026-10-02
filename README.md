@@ -75,6 +75,16 @@ infer human origin from text. All other signature conflicts remain errors;
 old index proofs are revalidated under canonical rule v2. This indexed repair
 does not relax the separate legacy/recent-window reader used by Global Hot.
 
+The additional `hermes-0.20.5-history-streamed-values.patch` permits giant
+stored values to be verified in 64-KiB chunks without loading their full
+body. Complete identity hashes and checksummed range descriptors stay private;
+foreground fragments revalidate their source before reading. The 4-MiB page
+and complete-group limits remain. Recorded image meanings enter the bridge,
+not historical pixels. Giant text still requires bounded fragments and may
+explicitly exceed the current summary workset; this is not unlimited decoding.
+Canonical rule v3 rebuilds derived proofs, not canonical messages. This source
+candidate still requires target qualification and review before deployment.
+
 One background worker validates history in finite pages without calling a
 model. The foreground reads only a bounded recent complete-group window;
 index completion does not summarize all history or grant retirement authority.

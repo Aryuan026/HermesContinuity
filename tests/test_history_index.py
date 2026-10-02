@@ -69,6 +69,25 @@ class HistoryIndexTests(unittest.TestCase):
                          ["notification", "reply"])
         self.assertEqual([tuple(row) for row in self.writer._conn.execute("SELECT * FROM messages ORDER BY id")], before)
 
+    def test_mixed_user_provenance_retains_dialogue_without_granting_hot_authority(self):
+        self.writer.append_message("session-1", "user", "system notice", timestamp=1787961600,
+                                   display_kind="internal_notification")
+        self.writer.append_message("session-1", "user", "human reply", timestamp=1787961601)
+        self.writer.append_message("session-1", "assistant", "answer", timestamp=1787961602)
+        before = [tuple(row) for row in self.writer._conn.execute("SELECT * FROM messages ORDER BY id")]
+        self.prepare()
+        source = self.adapter.read_source("session-1", reference_at="2026-08-30T00:00:00+00:00")
+        self.assertEqual(source["status"], "ready", source)
+        self.assertEqual(source["groups"][0]["messages"][0]["content"], "system notice\n\nhuman reply")
+        from test_hermes_adapter import PACKAGE
+        import importlib
+        adapter = importlib.import_module(f"{PACKAGE}.hermes_adapter")
+        classified = adapter._project_canonical_source(
+            "session-1", self.writer.get_messages("session-1"), full_prefix=True,
+            include_lineage_proofs=True)
+        self.assertEqual(classified["error"], "source_evidence_ambiguous")
+        self.assertEqual([tuple(row) for row in self.writer._conn.execute("SELECT * FROM messages ORDER BY id")], before)
+
     def test_more_than_2048_rows_has_compact_proof_and_bounded_suffix(self):
         self.seed(1200)
         self.prepare()
@@ -86,6 +105,20 @@ class HistoryIndexTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM continuity_group_index").fetchone()[0], 1200)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(continuity_group_index)")}
             self.assertFalse(columns & {"content", "body", "messages", "transcript"})
+
+    def test_old_live_hole_cannot_silently_grant_retirement_to_later_compacted_groups(self):
+        self.seed(1200)
+        self.writer._execute_write(lambda connection: connection.execute(
+            "UPDATE messages SET active=1,compacted=0 WHERE id IN "
+            "(SELECT id FROM messages ORDER BY id LIMIT 2 OFFSET 20)"))
+        self.prepare()
+        source = self.adapter.read_source("session-1", reference_at="2026-08-30T00:00:00+00:00")
+        self.assertEqual(source["status"], "overflow")
+        self.assertEqual(source["error"], "foreground_group_limit_exceeded")
+        with closing(self.store._connect()) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM continuity_group_index").fetchone()[0], 1200)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM continuity_checkpoints_v3").fetchone()[0], 0)
+        self.assertEqual(self.writer._conn.execute("SELECT COUNT(*) FROM messages WHERE active=1").fetchone()[0], 2)
 
     def test_pending_user_then_assistant_preserves_full_group(self):
         self.seed(2)
