@@ -573,3 +573,57 @@ artifacts. Whole product and successor public CI results are recorded
 separately in PROGRESS / the PR receipt; old exact-head Green is not substituted.
 No owner database or service was accessed in this correction. The earlier
 owner-copy recall results remain evidence at their original scope and identity.
+
+### Accepted `d549c95a`: target qualification and interrupted maintenance
+
+The owner accepted the exact source increment and authorized continuation of
+the existing conditional Block 4 deployment. No product algorithm is changed
+in this target pass, and source acceptance is not promoted to live acceptance.
+
+The actual target workbench materializes patches 13–19 over its clean retained
+twelve-patch host. Corrected environment locators execute 314 tests without
+skips; real native joint Doctor succeeds using the current Global Hot companion.
+The earlier run against the old workbench locator has eleven skips and remains
+separate. No target pytest or other dependency is installed.
+
+Controlled copy qualification reuses the previously prepared 67,447-row owner
+history and revalidates its source token. Recall returns 24 complete groups,
+80 rows and 365,198 bytes in 0.139s; process peak reaches 50,444 KiB across two
+fresh synthetic projection/execution/post chains. All fields of the existing
+v2 checkpoint and 98 receipts remain equal; only the copy receives two new
+body-free recall receipts. Rolling retirement remains explicitly unavailable
+across the old live hole. Neither that limitation nor synthetic model/provider
+results are relabeled as whole-history retirement or natural QQ accuracy.
+
+Two preceding copy attempts return `native_search_sqlite_interrupt` and remain
+failed evidence. A standalone phase probe after the target suite completes
+reports 0.5–1.7ms prefix validation and 1–4ms successful searches. The existing
+posting-first, rowid-ordered plan is retained, along with the 50ms deadline;
+the older rank-sort diagnostic remains interrupted. The controlled positive
+does not prove latency under simultaneous pressure.
+
+Before promotion, the old gateway is stopped and the original three database
+paths have zero open handles. The current systemd unit reaches its stop timeout.
+SQLite's backup API produces a consistent 2.8-GiB canonical preimage, but its
+integrity check is non-OK. The maintenance exception path restarts the unchanged
+control. Runtime status confirms QQ and LightClawBot connected with the new
+control process as writer. No source switch, plugin install/enable, original
+database repair, snapshot restoration or PR merge occurs.
+
+The failed preimage is retained privately for diagnosis, not declared a complete
+validated estate rollback pack. A 16-MiB-cache, bounded read-only check reports
+`malformed inverted index for FTS5 table main.messages_fts_trigram`; it does not
+establish missing or damaged canonical messages. A second disposable copy tests
+the existing native FTS rebuild statement, with TEMP guards forbidding all
+messages/sessions writes, a 512-MiB process limit, a 16-MiB SQLite page cache
+and a 300s SQLite deadline (360s outer process limit). The rebuild statement
+returns `sqlite3.OperationalError: interrupted` at the SQLite deadline; no
+repaired-copy integrity or canonical-count success is claimed. Owner
+authorization has been requested before any original-index repair. The old
+gateway is checked again after this failed probe and remains active/running.
+
+Selected runtime source and Assembly pins remain unchanged. The observation
+clock has not started. The accepted source rollback preference stays Block 1
+`1d6f502f`; the source bundle also stages that exact guard rollback. The next
+action is narrow native-index qualification and authorized repair, then the
+same reversible deployment and real canary, not a new continuity design phase.

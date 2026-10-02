@@ -401,3 +401,43 @@
   server, Global Hot, donor, .21.x, selected Assembly/rollback pin, merge,
   install, enable, restart or observation is changed. Source/artifact candidate
   identity changes only; selected runtime recovery truth is not promoted.
+
+## 2026-10-02 — accepted source target qualification; native FTS obstruction
+
+- The owner relayed external acceptance of `d549c95a`, including successful
+  Python 3.11/3.12 CI and synthetic merge-tree identity. Blocks 1–3 and recall
+  positives remain closed; PR #6 is still open and unmerged.
+- The target workbench reconstructs all seven additive patches over the actual
+  clean twelve-patch host. The accepted history/content files match their
+  source digests. With corrected host locators, the existing target interpreter
+  passes 314/314 plugin tests with no skips; native joint Doctor also passes.
+  The initial old-locator run's eleven skips are retained, not counted as new
+  capability evidence. No dependency was installed.
+- On the authorized prepared owner copy, controlled recall admits 24 groups /
+  80 rows / 365,198 bytes in 0.139s. Two fresh synthetic runtime chains settle;
+  every field of the existing nonempty v2 checkpoint and 98 receipts is
+  preserved, and two recall receipts are appended only to the disposable copy.
+  Retirement is unchanged. This is not natural relevance or real QQ delivery.
+- Two preceding copy attempts hit the unchanged 50ms native-search deadline
+  during load and remain failed results. Standalone diagnosis finds prefix
+  validation at 0.5–1.7ms and successful complete searches at 1–4ms. No budget
+  increase or production search change was used to obtain the controlled pass.
+- The authorized maintenance attempt stops the old gateway and verifies zero
+  open handles for the three databases. The existing unit reaches its stop
+  timeout; a consistent 2.8-GiB state preimage then fails integrity validation.
+  Source/config/install/enablement never change. The failure path starts the
+  old gateway; both QQ and LightClawBot report connected under its current
+  process. This is a restored control, not candidate deployment.
+- Bounded examination of the frozen copy reports a malformed inverted index
+  in Hermes-owned `messages_fts_trigram`. Canonical-message damage is not
+  established. The host's existing native rebuild command is attempted on a
+  separate byte-identical disposable copy with canonical-write guards, a
+  512-MiB process limit and a 300s SQLite deadline. Rebuild reaches that deadline
+  and returns `sqlite3.OperationalError: interrupted`; repair is not proven.
+  Original-index repair requires the requested owner authorization. No
+  original canonical row, checkpoint or receipt is rewritten.
+- Independent intent audit: PASS. Selected Assembly pins remain unchanged;
+  Assembly reconciliation authorization was requested separately. The 48–72h
+  observation clock and post-deployment donor Markdown remain unstarted. The
+  next checkpoint is native-index qualification/authorization, then resume the
+  existing reversible deployment; no new architecture, Global Hot or .21.x work.
