@@ -441,3 +441,52 @@
   observation clock and post-deployment donor Markdown remain unstarted. The
   next checkpoint is native-index qualification/authorization, then resume the
   existing reversible deployment; no new architecture, Global Hot or .21.x work.
+
+## 2026-10-02 — reviewed candidate deployed; observation started
+
+- The owner's correction supersedes the preceding premature stop. The existing
+  Block 4 maintenance proceeds through native-index qualification, original
+  derived-index repair, exact disabled installation, Doctor, enable and start;
+  no algorithm, PR merge or .21.x upgrade is introduced.
+- Copy qualification retains the earlier failed deadlines. A longer bounded
+  native rebuild completes; a separate verification-only pass reports full
+  SQLite integrity `ok`, unchanged canonical counts, 199.072s elapsed and
+  107,904 KiB process peak. This is repair qualification, not recall latency.
+- Stopped-writer maintenance creates current backups of all three stores,
+  config, installation metadata and the old plugin source. It rebuilds only
+  Hermes' native `messages_fts_trigram`. TEMP guards prohibit canonical
+  messages/sessions writes. Full original integrity is `ok`; canonical counts
+  and all pre-existing checkpoint/receipt fields remain unchanged. No history
+  is deleted or replaced with a pre-upgrade snapshot.
+- Actual installed host: `34cccb142642d1035538ca998b3fdce154ad9e3b`, tree
+  `70515f3669d8df2b4318af89e4158023af6707a1`, retaining upstream 0.20.5 and
+  the existing QQ overlay. The three deployed history/content production files
+  match the qualified target artifact. Target-base identity is not advertised
+  as equality with the separately exported patch-replay commit/tree.
+- Actual installed Continuity: `d549c95adc967672e642f69951860079b99a3e7f`,
+  tree `2363d06e8496548412c192d60938602a13fd37f1`, version 0.4.2. Official
+  exact-ref `--no-enable` installation and native joint Doctor succeed, then
+  the plugin is enabled. The installer honestly records a retained task-local
+  Git mirror; its exact objects must remain available for recovery.
+- Global Hot stays `af605282d3b221e705d1ee47b886f2d054cc3598`. No dependency,
+  unit definition, secret contract or other product algorithm is changed.
+- Deployment receipt is written at 2026-10-02 08:26:34 UTC. Fresh readback
+  confirms the new gateway process uses the selected host, is active/running,
+  and both QQ and LightClawBot are connected under its current PID/start-time
+  writer identity. Automatic restart count is zero; service memory is
+  613,732,352 bytes at that readback, not a measured improvement or stability
+  conclusion. Maintenance includes an explicit stop/start.
+- A six-hourly read-only heartbeat covers the next 72 hours. It observes
+  connection, restart/memory/disk trends and bounded preparation/receipt
+  evidence without sending traffic or scanning all history. Missing samples
+  remain missing; initial connectivity does not prove natural recall quality,
+  real post-enable provider settlement or three-day stability. The old live
+  hole still blocks rolling retirement; accepted independent recall is not
+  whole-history retirement. Upgrade work remains deferred during observation.
+- Preferred guard-only source rollback remains `1d6f502f`; preserve current
+  canonical data, invalidate incompatible history proofs on host rollback,
+  and never overwrite candidate-window messages from a preimage. The previous
+  FTS-broken preimage and failed probes remain private forensic evidence.
+- `DONOR_RECALL_REPAIR_NOTES.md` now provides the requested mother-repository
+  reference. It does not modify the donor. PR #6 remains open/unmerged;
+  selected Assembly reconciliation is tracked separately, not presumed done.
