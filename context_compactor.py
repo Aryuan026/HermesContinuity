@@ -293,7 +293,7 @@ def select_thread_continuity_recent_bridge(
         provider_messages = [
             {
                 "role": message["role"],
-                "content": message["content"],
+                "content": _summary_source_content(message["content"]),
                 **({"name": message["name"]} if message.get("name") else {}),
             }
             for message in group["messages"]

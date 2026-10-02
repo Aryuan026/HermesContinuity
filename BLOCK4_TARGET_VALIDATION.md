@@ -378,3 +378,44 @@ is exported from the giant-value draft. Ordinary PR delivery of this partial
 trial does not select it for runtime, reopen accepted Blocks 1–3, or authorize
 merge, deployment, restart or observation. Successor public CI and external
 acceptance must be recorded separately before any selected-artifact reconciliation.
+
+## Recent-bridge selection representation correction, 2026-10-02
+
+The owner authorized recall repair, conditional target deployment after
+qualification, and a donor-facing Markdown explanation after deployment. This
+increment closes one reproduced shared-selector defect, not that whole task.
+
+The retained donor selector estimated original multimodal content before its
+token admission. The accepted historical-image policy removes pixels only at
+the later summary boundary. The selector can therefore reject a recent group
+that fits its actual summary representation, leaving an empty bridge. It now
+uses the existing `_summary_source_content` for estimation as well. Both v2
+and compact v3 reach this selector; source groups, fingerprints, retirement
+contiguity, time horizon and genuine text limits remain unchanged. No budget
+increase, new estimator, dependency or query/search store is introduced.
+
+The new six-test selector selection first failed on the old implementation
+(expected two complete groups, received none), then passed. The real-host
+regression uses actual plugin settings of 1,000 source tokens and three
+64-KiB synthetic image payloads. It preserves their recorded interpretation,
+one summary, settlement, next-turn reuse, manager unload/reload and original
+SQLite rows; provider and save-number text remain synthetic.
+
+The public baseline was fetched at `fcbd1076a93841fa88855acce810e342a5b78101`
+and the existing sixteen artifacts replayed without modification. The staged
+host source tree equals accepted `d9553785cda565b177b077f7784309bd116264cf`;
+this is tree-identity evidence, not a claim that Git HEAD was `ff67db0d`.
+Local Python 3.12.13: 301 plugin tests / 299 passed / two pre-existing
+conditional skips; retained host history/replay/overlay/middleware 108 passed;
+indexed scale five cases passed, each with two receipts and one summary.
+The skips require the preserved legacy writer and paired Global Hot checkout;
+neither is silently counted as passed. Resource measurements were run locally
+alongside other regressions, not as a controlled latency comparison.
+
+Independent read-only intent audit: this is a source-candidate budget
+consistency correction only. No production install, enablement, source/DB
+change, restart, merge or observation occurred. Selected Assembly pins and
+rollback preference remain unchanged. The real 22,596,510-byte source value,
+whole-owner-history readiness, query-driven relevance recall and 0.21.5
+adaptation remain open. This correction neither makes chronological continuity
+semantic retrieval nor qualifies the unfinished streaming draft for runtime.

@@ -82,6 +82,10 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             "plugins:\n"
             "  enabled:\n"
             "    - hermes-continuity\n"
+            "  entries:\n"
+            "    hermes-continuity:\n"
+            "      settings:\n"
+            "        source_token_limit: 1000\n"
             "auxiliary:\n"
             "  title_generation:\n"
             "    enabled: false\n",
@@ -158,7 +162,7 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
         for offset, meaning in enumerate(self.image_meanings):
             content = [
                 {"type": "text", "text": meaning},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 65536}},
             ]
             self.session_db.append_message("long-mouth", "user", content,
                                            timestamp=now + 2400 + offset * 2)
