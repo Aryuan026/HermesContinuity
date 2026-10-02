@@ -93,6 +93,31 @@ bounded suffix growth and detects prefix rewrite. The existing bounded
 time-window API is sufficient for the cross-mouth window service, but cannot
 honestly replace this full-prefix contract.
 
+## Owner-approved independent recall repair
+
+The owner approved separating bounded question-driven recall from the continuous
+retirement cursor on 2026-10-02. The current source checkpoint is `c0a0d607`;
+the primary worktree is HermesContinuity's existing Block 4 review branch.
+The actual owner copy reaches index-ready but 139 live groups block 3,153 later
+compacted groups behind the retirement prefix. The new request-only path may
+select verified complete groups across those holes. It must not retire, relabel,
+quarantine or copy them into another transcript/search store.
+
+Reuse Hermes's native FTS routing for body-free bounded candidate locators,
+the existing host canonical page/proof seam for hydration, and this runtime's
+overlay, final-body budget and post-settled receipt. A bounded host auxiliary
+call extracts search terms; a bounded second call selects relevant groups and
+summarizes only that admitted workset. No embedding runtime or memory-provider
+slot is added. Checkpoint v2/v3 and their CAS remain the rolling path's property.
+Recall output is ephemeral and cannot update their retirement cursor.
+
+Acceptance must cover complete-group relevance, unrelated/empty queries,
+source rewrite, shared token/byte budgets, final provider delivery, post/error,
+next-turn and manager reload, and the protected real copy. Stop at a published
+source candidate with these evidence layers distinct; deployment still requires
+the existing review/target qualification conditions. Global Hot, donor source,
+0.21.x migration, original databases and production configuration are untouched.
+
 ## Release gates
 
 1. Keep the full standard-library suite Green and pass the opt-in real-host

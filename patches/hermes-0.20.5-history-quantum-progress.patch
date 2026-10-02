@@ -1,0 +1,259 @@
+From 9364e363b0d57a17399972e0a094d55369e8fd41 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 18:31:08 +0800
+Subject: [PATCH] fix(history): close bounded preparation pages before deadline
+
+---
+ hermes_state_history.py            | 53 +++++++++++-------
+ tests/test_hermes_state_history.py | 90 ++++++++++++++++++++++++++++++
+ 2 files changed, 123 insertions(+), 20 deletions(-)
+
+diff --git a/hermes_state_history.py b/hermes_state_history.py
+index 03b82d4..cf811ce 100644
+--- a/hermes_state_history.py
++++ b/hermes_state_history.py
+@@ -1482,6 +1482,7 @@ class SessionHistoryMixin:
+         domain: Dict[str, Any],
+         *,
+         max_rows: int,
++        work_deadline: float,
+     ) -> tuple[int, bool]:
+         """Delete one bounded suffix page and persist reset progress."""
+ 
+@@ -1491,7 +1492,7 @@ class SessionHistoryMixin:
+         domain_id = domain["domain_id"]
+         processed = 0
+         restart = 1
+-        while processed < max_rows:
++        while processed < max_rows and time.monotonic() < work_deadline:
+             bucket = conn.execute(
+                 "SELECT anchor, position, earliest_message_id "
+                 "FROM hermes_history_buckets WHERE domain_id=? AND position>=? "
+@@ -1508,12 +1509,15 @@ class SessionHistoryMixin:
+                 (domain_id, bucket["anchor"], remaining),
+             ).fetchall()
+             if members:
+-                conn.executemany(
+-                    "DELETE FROM hermes_history_members "
+-                    "WHERE domain_id=? AND message_id=?",
+-                    ((domain_id, int(row["message_id"])) for row in members),
+-                )
+-                processed += len(members)
++                for row in members:
++                    if time.monotonic() >= work_deadline:
++                        return processed, False
++                    conn.execute(
++                        "DELETE FROM hermes_history_members "
++                        "WHERE domain_id=? AND message_id=?",
++                        (domain_id, int(row["message_id"])),
++                    )
++                    processed += 1
+                 if processed >= max_rows:
+                     return processed, False
+             restart = int(bucket["earliest_message_id"])
+@@ -1656,6 +1660,7 @@ class SessionHistoryMixin:
+         domain: Dict[str, Any],
+         *,
+         max_rows: int,
++        work_deadline: float,
+     ) -> tuple[int, bool]:
+         """Advance one bounded prefix-max page over finalized buckets."""
+ 
+@@ -1678,26 +1683,27 @@ class SessionHistoryMixin:
+         ).fetchall()
+         selected = rows[:max_rows]
+         expected = cursor + 1
+-        updates = []
++        processed = 0
+         for row in selected:
++            if time.monotonic() >= work_deadline:
++                break
+             position = int(row["position"])
+             if position != expected:
+                 raise sqlite3.DatabaseError("history physical prefix contains a gap")
+             previous = max(previous, int(row["last_physical_change_seq"]))
+-            updates.append((previous, domain["domain_id"], position))
+-            expected += 1
+-        if updates:
+-            conn.executemany(
++            conn.execute(
+                 "UPDATE hermes_history_buckets SET physical_prefix_max_seq=? "
+                 "WHERE domain_id=? AND position=?",
+-                updates,
++                (previous, domain["domain_id"], position),
+             )
+-            domain["physical_cursor_position"] = updates[-1][2]
++            domain["physical_cursor_position"] = position
++            processed += 1
++            expected += 1
+         complete = (
+             len(rows) <= max_rows
+             and int(domain["physical_cursor_position"]) == int(domain["canonical_count"])
+         )
+-        return len(selected), complete
++        return processed, complete
+ 
+     @staticmethod
+     def _history_save_domain(conn: sqlite3.Connection, domain: Mapping[str, Any]) -> None:
+@@ -1777,7 +1783,12 @@ class SessionHistoryMixin:
+             with self._lock:
+                 self._init_history_schema()
+ 
+-        deadline = time.monotonic() + deadline_ms / 1000.0
++        started = time.monotonic()
++        deadline = started + deadline_ms / 1000.0
++        # Stop between complete rows with time left to save the legal cursor.
++        # The original SQL deadline still interrupts genuinely expensive work;
++        # the reserve avoids rolling back every full page on a slower CPU.
++        work_deadline = started + deadline_ms / 2000.0
+ 
+         def _do_body(conn: sqlite3.Connection) -> Dict[str, Any]:
+             state, claim_error = self._history_claim(
+@@ -1858,7 +1869,7 @@ class SessionHistoryMixin:
+                 domain["failure_reason"] = ""
+             if domain["phase"] == "resetting":
+                 reset_rows, _complete = self._history_reset_suffix_page(
+-                    conn, domain, max_rows=max_rows_per_page
++                    conn, domain, max_rows=max_rows_per_page, work_deadline=work_deadline
+                 )
+                 self._history_save_domain(conn, domain)
+                 return self._history_result(
+@@ -1919,7 +1930,7 @@ class SessionHistoryMixin:
+                     domain["failure_reason"] = ""
+                 if domain["phase"] == "physicalizing":
+                     finalized, complete = self._history_finalize_physical_page(
+-                        conn, domain, max_rows=max_rows_per_page
++                        conn, domain, max_rows=max_rows_per_page, work_deadline=work_deadline
+                     )
+                     if complete:
+                         domain["phase"] = "ready"
+@@ -2009,7 +2020,7 @@ class SessionHistoryMixin:
+             # One page per BEGIN IMMEDIATE.  The public quantum loops outside
+             # the transaction, so canonical writers get a scheduling point
+             # between pages instead of waiting behind an eight-page lock.
+-            while pages < 1 and time.monotonic() < deadline:
++            while pages < 1 and time.monotonic() < work_deadline:
+                 (
+                     payload,
+                     probed_sizes,
+@@ -2032,6 +2043,8 @@ class SessionHistoryMixin:
+                     domain["cursor_message_id"] = domain["target_max_message_id"]
+                     break
+                 for row in payload:
++                    if time.monotonic() >= work_deadline:
++                        break
+                     failure = self._history_index_row(
+                         conn, domain, row, int(probed_sizes[int(row["id"])])
+                     )
+@@ -2201,7 +2214,7 @@ class SessionHistoryMixin:
+                 latest["stored_bytes_processed"] = total_bytes
+                 if latest["status"] != "progress" or not latest["more"]:
+                     return latest
+-                if time.monotonic() >= deadline:
++                if time.monotonic() >= work_deadline:
+                     return latest
+         assert latest is not None
+         return latest
+diff --git a/tests/test_hermes_state_history.py b/tests/test_hermes_state_history.py
+index 51142c0..f77a4f0 100644
+--- a/tests/test_hermes_state_history.py
++++ b/tests/test_hermes_state_history.py
+@@ -241,6 +241,96 @@ def test_prepare_interrupts_expensive_sql_and_restores_worker_pragmas(
+     assert history_db._conn.execute("PRAGMA temp_store").fetchone()[0] == 2
+ 
+ 
++def test_prepare_commits_complete_rows_before_quantum_expires(history_db, monkeypatch):
++    for number in range(128):
++        _append_turn(history_db, number)
++    clock = [0.0]
++    monkeypatch.setattr(hermes_state_history.time, "monotonic", lambda: clock[0])
++    original = history_db._history_index_row
++
++    def slow_row(*args):
++        result = original(*args)
++        clock[0] += 0.006
++        return result
++
++    monkeypatch.setattr(history_db, "_history_index_row", slow_row)
++    epoch = None
++    previous = 0
++    for _ in range(100):
++        result = history_db.prepare_history_step(
++            "history", owner_id="slow-cpu", activation_epoch=epoch, deadline_ms=50)
++        epoch = result["activation_epoch"]
++        domain = history_db._conn.execute(
++            "SELECT * FROM hermes_history_domains WHERE domain_id='history'").fetchone()
++        assert domain is not None, "expired full page discarded the first durable cursor"
++        count = history_db._conn.execute(
++            "SELECT count(*) FROM hermes_history_members WHERE domain_id='history'").fetchone()[0]
++        assert count == domain["cursor_message_id"] == domain["canonical_count"]
++        if result["phase"] == "building":
++            assert previous < count <= previous + 8
++            assert result["head_token"] is None
++        previous = count
++        if result["status"] == "ready":
++            break
++    else:
++        pytest.fail("bounded default preparation did not converge on a slow CPU")
++    assert previous == 256
++    page = history_db.read_history_page("history", target=result["head_token"])
++    assert page["status"] == "ready"
++    assert len(page["rows"]) == 256
++
++
++@pytest.mark.parametrize("phase", ["resetting", "physicalizing"])
++def test_prepare_closes_slow_reset_and_physical_prefix_pages(history_db, monkeypatch, phase):
++    for number in range(128):
++        _append_turn(history_db, number)
++    ready = history_db.prepare_history_step("history", owner_id="slow-cpu", deadline_ms=10_000)
++    assert ready["status"] == "ready"
++
++    def rewind(conn):
++        domain = dict(conn.execute("SELECT * FROM hermes_history_domains").fetchone())
++        if phase == "resetting":
++            history_db._history_reset_suffix(conn, domain, 1)
++        else:
++            domain["phase"] = "physicalizing"
++            domain["physical_cursor_position"] = 0
++        history_db._history_save_domain(conn, domain)
++
++    history_db._execute_write(rewind)
++    clock = [0.0]
++    monkeypatch.setattr(hermes_state_history.time, "monotonic", lambda: clock[0])
++    prefix = ("DELETE FROM hermes_history_members" if phase == "resetting"
++              else "UPDATE hermes_history_buckets SET physical_prefix_max_seq=")
++
++    def slow_statement(sql):
++        if sql.startswith(prefix):
++            clock[0] += 0.006
++
++    history_db._conn.set_trace_callback(slow_statement)
++    try:
++        first = history_db.prepare_history_step(
++            "history", owner_id="slow-cpu", activation_epoch=ready["activation_epoch"], deadline_ms=50)
++        assert first["status"] == "progress" and first["phase"] == phase
++        assert first["head_token"] is None
++        domain = history_db._conn.execute("SELECT * FROM hermes_history_domains").fetchone()
++        if phase == "resetting":
++            remaining = history_db._conn.execute("SELECT count(*) FROM hermes_history_members").fetchone()[0]
++            assert 248 <= remaining < 256
++        else:
++            assert 0 < domain["physical_cursor_position"] <= 8
++        for _ in range(120):
++            result = history_db.prepare_history_step(
++                "history", owner_id="slow-cpu", activation_epoch=ready["activation_epoch"], deadline_ms=50)
++            if result["status"] == "ready":
++                break
++        else:
++            pytest.fail("slow preparation phase did not converge")
++        assert result["head_token"]["canonical_count"] == 256
++        assert history_db.read_history_page("history", target=result["head_token"])["status"] == "ready"
++    finally:
++        history_db._conn.set_trace_callback(None)
++
++
+ def test_seal_partial_prefix_and_validate_after_append(history_db):
+     _append_turn(history_db, 1)
+     prepared = _prepare(history_db)
+-- 
+2.50.1 (Apple Git-155)

@@ -9,6 +9,7 @@ settlement oracle.
 from __future__ import annotations
 
 import os
+import importlib
 import re
 import sqlite3
 import sys
@@ -140,6 +141,27 @@ class RealHostEntrypointTests(unittest.TestCase):
                 f"durable history answer {index}: " + ("a" * 3_000),
                 timestamp=now - 9_999 + index * 2,
             )
+        self.indexed = callable(getattr(self.session_db, "prepare_history_step", None))
+        if self.indexed:
+            # v3 bridges the physically compacted prefix, not arbitrary live
+            # messages merely because a small provider window was selected.
+            self.session_db._execute_write(lambda connection: connection.execute(
+                "UPDATE messages SET active=0,compacted=1 WHERE session_id='mouth-b'"))
+
+    def _prepare_index(self):
+        if not self.indexed:
+            return
+        service = plugins.get_plugin_manager()._get_plugin_service(
+            "hermes-continuity:canonical-source.v2")
+        index = service.adapter.history_index
+        preparation = importlib.import_module(type(index).__module__)
+        with preparation.PREPARATION_LOCK:
+            for _ in range(2_000):
+                result = index.prepare_step("mouth-b")
+                if result.get("status") == "ready":
+                    return
+                self.assertEqual(result.get("status"), "progress", result)
+        self.fail("bounded preparation did not finish")
 
     def tearDown(self) -> None:
         for agent in self.agents:
@@ -190,11 +212,11 @@ class RealHostEntrypointTests(unittest.TestCase):
             session_db=self.session_db,
         )
         agent._api_max_retries = 1
-        agent._build_api_kwargs = lambda messages: {
-            "model": agent.model,
-            "messages": messages,
-            "max_tokens": 256,
-        }
+        def build_kwargs(messages):
+            # Include the production-persisted current user in preparation.
+            self._prepare_index()
+            return {"model": agent.model, "messages": messages, "max_tokens": 256}
+        agent._build_api_kwargs = build_kwargs
         agent._try_recover_primary_transport = lambda *_args, **_kwargs: False
         agent._try_activate_fallback = lambda *_args, **_kwargs: False
         agent._has_pending_fallback = lambda: False
@@ -300,13 +322,15 @@ class RealHostEntrypointTests(unittest.TestCase):
             self.assertEqual(len(hot_paths), 1)
             continuity_db = continuity_paths[0]
             hot_db = hot_paths[0]
-            self.assertEqual(_sqlite_count(continuity_db, "continuity_checkpoints"), 1)
+            checkpoint_table = ("continuity_checkpoints_v3" if self.indexed
+                                else "continuity_checkpoints")
+            self.assertEqual(_sqlite_count(continuity_db, checkpoint_table), 1)
             self.assertEqual(_sqlite_count(continuity_db, "continuity_receipts"), 1)
             self.assertEqual(_sqlite_count(hot_db, "global_hot_delivery_receipts"), 1)
             with sqlite3.connect(continuity_db) as connection:
                 first_revision = int(
                     connection.execute(
-                        "SELECT revision FROM continuity_checkpoints "
+                        f"SELECT revision FROM {checkpoint_table} "
                         "WHERE session_id = ?",
                         ("mouth-b",),
                     ).fetchone()[0]
@@ -347,7 +371,7 @@ class RealHostEntrypointTests(unittest.TestCase):
             )
             with sqlite3.connect(continuity_db) as connection:
                 revision = connection.execute(
-                    "SELECT revision FROM continuity_checkpoints WHERE session_id = ?",
+                    f"SELECT revision FROM {checkpoint_table} WHERE session_id = ?",
                     ("mouth-b",),
                 ).fetchone()
             self.assertIsNotNone(revision)

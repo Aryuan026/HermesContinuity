@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import os
 import re
 import sqlite3
@@ -69,6 +70,7 @@ def _sqlite_count(path: Path, table: str) -> int:
     "set HERMES_SOURCE_ROOT to a Block 3 compatible Hermes tree",
 )
 class RealHostLongHistoryV3Tests(unittest.TestCase):
+    historical_image_bytes = 65536
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.home = Path(self.tempdir.name) / ".hermes"
@@ -81,6 +83,10 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             "plugins:\n"
             "  enabled:\n"
             "    - hermes-continuity\n"
+            "  entries:\n"
+            "    hermes-continuity:\n"
+            "      settings:\n"
+            "        source_token_limit: 1000\n"
             "auxiliary:\n"
             "  title_generation:\n"
             "    enabled: false\n",
@@ -118,9 +124,18 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
         self.agents = []
         self.summary_calls = 0
         self.validation_errors: list[str] = []
+        self.last_bundle = {}
+        self.last_prepared = {}
         self.session_db = SessionDB(self.home / "state.db")
         self.session_db.create_session("long-mouth", "cli")
         now = time.time() - 1_800
+        self.session_db.append_message("long-mouth", "user", "legacy notification",
+                                       timestamp=now-2, display_kind="internal_notification")
+        missing = dict(self.session_db.get_messages("long-mouth")[0], display_kind=None)
+        self.session_db.archive_and_compact("long-mouth", [missing])
+        self.session_db.archive_and_compact("long-mouth", [missing])
+        self.session_db.append_message("long-mouth", "assistant", "legacy reply", timestamp=now-1)
+        self.legacy_row_ids = [row[0] for row in self.session_db._conn.execute("SELECT id FROM messages")]
         for start in range(0, 1_200, 100):
             self.session_db.append_messages_batch(
                 "long-mouth",
@@ -140,6 +155,26 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
                 "WHERE session_id='long-mouth'"
             )
         )
+        self.image_meanings = (
+            "Recorded sticker intent: playful irony, not the literal scene",
+            "Recorded chart interpretation: value 12, unreadable labels unknown",
+            "Synthetic successful save receipt: PIC-007, design reference",
+        )
+        for offset, meaning in enumerate(self.image_meanings):
+            content = [
+                {"type": "text", "text": meaning},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * (
+                    self.historical_image_bytes if offset == 0 else 65536)}},
+            ]
+            self.session_db.append_message("long-mouth", "user", content,
+                                           timestamp=now + 2400 + offset * 2)
+            self.session_db.append_message("long-mouth", "assistant", "Recorded dialogue response",
+                                           timestamp=now + 2401 + offset * 2)
+        self.session_db._execute_write(lambda connection: connection.execute(
+            "UPDATE messages SET active=0,compacted=1 WHERE session_id='long-mouth'"))
+        self.image_source_rows = [tuple(row) for row in self.session_db._conn.execute(
+            "SELECT * FROM messages ORDER BY id DESC LIMIT 6")]
+        self.image_row_ids = [row[0] for row in self.image_source_rows]
 
     def tearDown(self) -> None:
         for agent in self.agents:
@@ -159,13 +194,23 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
         self.tempdir.cleanup()
 
     async def _summary_complete(self, _plugin_llm, messages, **_kwargs):
+        if _kwargs.get("purpose") == "thread_continuity_recall_query":
+            marker = SUMMARY_MARKER.search(repr(messages)).group(0)
+            return PluginLlmCompleteResult(
+                text=json.dumps({"queries": [], "start_at": None, "end_at": None})+"\n"+marker,
+                provider="long-history-provider", model="long-history-summary-model",
+                agent_id="default", usage=None, finish_reason="stop")
         self.summary_calls += 1
         rendered = "\n".join(str(row.get("content") or "") for row in messages)
+        self.assertNotIn("data:image/", rendered)
+        self.assertNotIn("'image_url'", rendered)
+        for meaning in self.image_meanings:
+            self.assertIn(meaning, rendered)
         marker = SUMMARY_MARKER.search(rendered)
         if marker is None:
             raise AssertionError("Continuity summary marker missing from host LLM call")
         return PluginLlmCompleteResult(
-            text="bounded long-history bridge\n" + marker.group(0),
+            text="bounded long-history bridge\n" + "\n".join(self.image_meanings) + "\n" + marker.group(0),
             provider="long-history-provider",
             model="long-history-summary-model",
             agent_id="default",
@@ -175,7 +220,7 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             finish_reason="stop",
         )
 
-    def _agent(self) -> AIAgent:
+    def _agent(self, *, prepare_before_request: bool = True) -> AIAgent:
         agent = AIAgent(
             api_key="test-key",
             base_url="http://127.0.0.1:1/v1",
@@ -193,11 +238,15 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             session_db=self.session_db,
         )
         agent._api_max_retries = 1
-        agent._build_api_kwargs = lambda messages: {
-            "model": agent.model,
-            "messages": messages,
-            "max_tokens": 256,
-        }
+        def build_kwargs(messages):
+            # The host persists this turn's user before request middleware.
+            # Positive reuse requires that new journal entry to be prepared;
+            # preparing only before run_conversation races the bounded worker.
+            if prepare_before_request:
+                self._prepare_index()
+            return {"model": agent.model, "messages": messages, "max_tokens": 256}
+
+        agent._build_api_kwargs = build_kwargs
         agent._try_recover_primary_transport = lambda *_args, **_kwargs: False
         agent._try_activate_fallback = lambda *_args, **_kwargs: False
         agent._has_pending_fallback = lambda: False
@@ -232,13 +281,17 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
         self.assertIsNotNone(service)
         index = service.adapter.history_index
         self.assertIsNotNone(index)
-        for _ in range(2_000):
-            result = index.prepare_step("long-mouth")
-            if result.get("status") == "ready":
-                break
-            self.assertEqual(result.get("status"), "progress", result)
-        else:
-            self.fail("history preparation did not finish within bounded work steps")
+        preparation = importlib.import_module(type(index).__module__)
+        with preparation.PREPARATION_LOCK:
+            for _ in range(2_000):
+                result = index.prepare_step("long-mouth")
+                self.last_prepared = {key: result.get(key) for key in (
+                    "status", "reason", "phase", "canonical_count", "pages_processed")}
+                if result.get("status") == "ready":
+                    break
+                self.assertEqual(result.get("status"), "progress", result)
+            else:
+                self.fail("history preparation did not finish within bounded work steps")
         if not getattr(index, "_continuity_test_validation_probe", False):
             original_validate = index.validate_checkpoint
 
@@ -250,6 +303,17 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
                     raise
 
             index.validate_checkpoint = validate_with_reason
+            original_bundle = service.adapter.read_bundle
+
+            def observe_bundle(*args, **kwargs):
+                bundle = original_bundle(*args, **kwargs)
+                self.last_bundle = {
+                    section: {key: bundle.get(section, {}).get(key)
+                              for key in ("status", "error", "reasons", "scan_complete")}
+                    for section in ("source", "continuity")}
+                return bundle
+
+            service.adapter.read_bundle = observe_bundle
             index._continuity_test_validation_probe = True
 
     def _continuity_status(self) -> str:
@@ -260,7 +324,30 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
                 return runtime.status_command("long-mouth")
         return "continuity runtime middleware unavailable"
 
+    def _diagnostics(self) -> str:
+        manager = plugins.get_plugin_manager()
+        service = manager._get_plugin_service("hermes-continuity:canonical-source.v2")
+        with self.session_db._read_ctx() as connection:
+            domain = connection.execute(
+                "SELECT phase,cursor_message_id,canonical_count,physical_cursor_position "
+                "FROM hermes_history_domains WHERE domain_id='long-mouth'").fetchone()
+        package = type(service.adapter.history_index).__module__.rsplit(".", 1)[0]
+        budget = importlib.import_module(package + ".resource_budget")
+        leases = {name: {"leases": len(getattr(budget, name)._leases),
+                         "bytes": sum(getattr(budget, name)._leases.values())}
+                  for name in ("PREPARATION_WORKSETS", "ACTIVE_WORKSETS", "COLD_PLANS")}
+        return json.dumps({"runtime": json.loads(self._continuity_status()),
+                           "validation_errors": self.validation_errors,
+                           "last_bundle": self.last_bundle, "last_prepared": self.last_prepared,
+                           "host_domain": dict(domain) if domain else None,
+                           "admission": leases}, sort_keys=True)
+
     def test_real_host_v3_settlement_reload_reuse_and_error(self) -> None:
+        # The old Gateway replay lost producer tags before compaction. Keep
+        # those physical rows unchanged and exercise the normal host entry.
+        placeholders = ",".join("?" for _ in self.legacy_row_ids)
+        before = [tuple(row) for row in self.session_db._conn.execute(
+            f"SELECT * FROM messages WHERE id IN ({placeholders}) ORDER BY id", self.legacy_row_ids)]
         provider_bodies: list[dict] = []
 
         def provider(request, *, on_first_delta=None):
@@ -346,7 +433,8 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             )
             self.assertEqual(first["final_response"], "long-history answer")
             self.assertEqual(self.summary_calls, 1, provider_bodies[0])
-            self.assertEqual(repr(provider_bodies[0]).count(CONTINUITY_MARKER), 1)
+            self.assertEqual(repr(provider_bodies[0]).count(CONTINUITY_MARKER), 1, self._diagnostics())
+            self.assertIn("PIC-007", repr(provider_bodies[0]))
 
             continuity_paths = list(
                 (self.home / "plugin-data").glob("*/continuity.sqlite3")
@@ -366,6 +454,26 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             hermes_config._config_cache = None
             plugins.discover_plugins()
             self._prepare_index()
+            service = plugins.get_plugin_manager()._get_plugin_service(
+                "hermes-continuity:canonical-source.v2")
+            preparation = importlib.import_module(type(service.adapter.history_index).__module__)
+            pending_agent = self._agent(prepare_before_request=False)
+            self.agents.append(pending_agent)
+            pending_agent._interruptible_streaming_api_call = provider
+            # Deterministically keep preparation pending after real user
+            # persistence. Do not enlarge the foreground wait or retry it.
+            with preparation.PREPARATION_LOCK:
+                pending = pending_agent.run_conversation(
+                    "Native turn while reload preparation is busy",
+                    conversation_history=[], task_id="pending-reload")
+                self.assertEqual(pending["final_response"], "long-history answer")
+                self.assertEqual(repr(provider_bodies[-1]).count(CONTINUITY_MARKER), 0)
+                self.assertEqual(self.last_bundle["source"]["status"], "pending",
+                                 self._diagnostics())
+                self.assertEqual(self.last_bundle["source"]["error"], "history_source_pending")
+                self.assertEqual(_sqlite_count(continuity_db, "continuity_receipts"), 1)
+                self.assertEqual(self.summary_calls, 1)
+            self._prepare_index()
             restarted_agent = self._agent()
             self.agents.append(restarted_agent)
             restarted_agent._interruptible_streaming_api_call = provider
@@ -376,7 +484,9 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             )
             self.assertEqual(second["final_response"], "long-history answer")
             self.assertEqual(self.summary_calls, 1)
-            self.assertEqual(repr(provider_bodies[1]).count(CONTINUITY_MARKER), 1)
+            self.assertEqual(repr(provider_bodies[-1]).count(CONTINUITY_MARKER), 1,
+                             self._diagnostics())
+            self.assertIn("PIC-007", repr(provider_bodies[-1]))
             self.assertEqual(
                 _sqlite_count(continuity_db, "continuity_receipts"), 2
             )
@@ -404,6 +514,18 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
                 _sqlite_count(continuity_db, "continuity_receipts"),
                 receipts_before_error,
             )
+        self.assertEqual([tuple(row) for row in self.session_db._conn.execute(
+            f"SELECT * FROM messages WHERE id IN ({placeholders}) ORDER BY id", self.legacy_row_ids)], before)
+        image_placeholders = ",".join("?" for _ in self.image_row_ids)
+        self.assertEqual([tuple(row) for row in self.session_db._conn.execute(
+            f"SELECT * FROM messages WHERE id IN ({image_placeholders}) ORDER BY id DESC",
+            self.image_row_ids)], self.image_source_rows)
+
+
+@unittest.skipUnless(HOST_AVAILABLE and (HERMES_ROOT / "hermes_history_content.py").is_file(),
+                     "requires the streamed canonical-history seam")
+class RealHostGiantHistoryV3Tests(RealHostLongHistoryV3Tests):
+    historical_image_bytes = 16 * 1024 * 1024
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1210 @@
+From e654daaa11d5f960b26edc40cabc58f44e7b53fc Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 11:54:36 +0800
+Subject: [PATCH] fix(history): stream verified giant values across bounded
+ preparation quanta
+
+---
+ hermes_history_content.py           | 518 ++++++++++++++++++++++++++++
+ hermes_state_history.py             | 283 +++++++++++++--
+ tests/test_history_stream_values.py | 233 +++++++++++++
+ 3 files changed, 997 insertions(+), 37 deletions(-)
+ create mode 100644 hermes_history_content.py
+ create mode 100644 tests/test_history_stream_values.py
+
+diff --git a/hermes_history_content.py b/hermes_history_content.py
+new file mode 100644
+index 00000000..ddb64026
+--- /dev/null
++++ b/hermes_history_content.py
+@@ -0,0 +1,518 @@
++"""Cooperative bounded SQLite value decoding for canonical-history preparation.
++
++Ranges, counts and hashes can be retained; canonical bodies stay in SQLite.
++Each yield is an unfinished byte-work boundary, never a record/group proof.
++"""
++import codecs
++import bisect
++import hashlib
++import json
++import re
++import time
++
++CHUNK = 65536
++SPECIAL = re.compile(rb'["\\\x00-\x1f]')
++SPACE = b' \t\r\n'
++
++
++class StringRange:
++    def __init__(self, start, end, chars, nonblank, ascii_sha, utf8_sha):
++        self.start, self.end, self.chars = start, end, chars
++        self.nonblank = nonblank
++        self.ascii_sha, self.utf8_sha = ascii_sha, utf8_sha
++        self.points = []
++
++    def descriptor(self):
++        return {'kind': 'string', 'start': self.start, 'end': self.end,
++                'characters': self.chars, 'nonblank': self.nonblank,
++                'ascii_sha256': self.ascii_sha, 'utf8_sha256': self.utf8_sha,
++                'points':self.points}
++
++
++class Parser:
++    def __init__(self, read, size, offset=0, on_text=None):
++        self.read, self.size = read, size
++        self.offset, self.buffer = offset, b''
++        self.nodes = self.small_bytes = 0
++        self.complete = False
++        self.on_text = on_text
++        self.ranges = {}
++        self.literals = {}
++
++    def fill(self):
++        if not self.buffer and self.offset < self.size:
++            self.buffer = self.read(self.offset, min(CHUNK, self.size-self.offset))
++            if not self.buffer:
++                raise ValueError('short_read')
++            yield len(self.buffer)
++
++    def take(self, count):
++        value = self.buffer[:count]
++        self.buffer = self.buffer[count:]
++        self.offset += count
++        return value
++
++    def peek(self):
++        yield from self.fill()
++        return self.buffer[:1]
++
++    def skip(self):
++        while (yield from self.peek()) in [bytes([c]) for c in SPACE]:
++            self.take(1)
++
++    def string(self, *, key=False, inside=False):
++        yield from self.fill()
++        if not inside:
++            assert self.take(1) == b'"'
++        start = self.offset
++        small = []
++        small_size = chars = 0
++        ascii_hash, utf8_hash = hashlib.sha256(), hashlib.sha256()
++        ascii_hash.update(b'"')
++        utf8_hash.update(b'"')
++        decoder = codecs.getincrementaldecoder('utf-8')('strict')
++        pending_surrogate = ''
++        nonblank = False
++        points = [(0, start)]
++
++        def feed(text):
++            nonlocal small, small_size, chars, pending_surrogate, nonblank
++            if pending_surrogate:
++                text = pending_surrogate + text
++                pending_surrogate = ''
++            if text and 0xD800 <= ord(text[-1]) <= 0xDBFF:
++                pending_surrogate, text = text[-1], text[:-1]
++            # json.loads combines adjacent escaped UTF-16 surrogate pairs.
++            text = re.sub(r'[\ud800-\udbff][\udc00-\udfff]',
++                          lambda m: chr(0x10000 + (ord(m[0][0])-0xD800)*1024 + ord(m[0][1])-0xDC00), text)
++            chars += len(text)
++            if self.on_text is not None:
++                self.on_text(text)
++            nonblank = nonblank or bool(text.strip())
++            ascii_hash.update(json.dumps(text, ensure_ascii=True)[1:-1].encode('ascii'))
++            utf8_hash.update(json.dumps(text, ensure_ascii=False)[1:-1].encode('utf-8'))
++            if small is not None:
++                small_size += len(text.encode('utf-8', 'surrogatepass'))
++                if small_size > CHUNK:
++                    if key:
++                        raise ValueError('object_key_budget_exceeded')
++                    small = None
++                else:
++                    small.append(text)
++            if (chars-points[-1][0] >= CHUNK and not pending_surrogate
++                    and not decoder.getstate()[0]):
++                points.append((chars, self.offset))
++
++        while True:
++            yield from self.fill()
++            if not self.buffer:
++                raise ValueError('unterminated_string')
++            match = SPECIAL.search(self.buffer)
++            count = match.start() if match else len(self.buffer)
++            if count:
++                feed(decoder.decode(self.take(count)))
++            if not match:
++                continue
++            byte = self.take(1)
++            if byte == b'"':
++                feed(decoder.decode(b'', final=True))
++                if pending_surrogate:
++                    # json.loads permits lone surrogate escapes. Hashing as
++                    # UTF-8 is intentionally rejected by the real consumer.
++                    raise ValueError('lone_surrogate')
++                break
++            if byte != b'\\':
++                raise ValueError('invalid_control_character')
++            if decoder.getstate()[0]:
++                raise ValueError('incomplete_utf8_before_escape')
++            escape = byte
++            yield from self.fill()
++            if not self.buffer:
++                raise ValueError('unterminated_escape')
++            escape += self.take(1)
++            if escape[-1:] == b'u':
++                for _ in range(4):
++                    yield from self.fill()
++                    if not self.buffer:
++                        raise ValueError('unterminated_unicode_escape')
++                    escape += self.take(1)
++            feed(json.loads(b'"'+escape+b'"'))
++        ascii_hash.update(b'"')
++        utf8_hash.update(b'"')
++        reference = StringRange(start, self.offset-1, chars, nonblank,
++                                ascii_hash.hexdigest(), utf8_hash.hexdigest())
++        reference.points = points
++        if small is not None:
++            self.small_bytes += small_size
++            if self.small_bytes > 1024*1024:
++                raise ValueError('structure_byte_budget_exceeded')
++            result = ''.join(small)
++            self.ranges[id(result)] = reference
++            return result
++        return reference
++
++    def value(self, depth=0):
++        self.nodes += 1
++        if depth > 64 or self.nodes > 16384:
++            raise ValueError('structure_budget_exceeded')
++        yield from self.skip()
++        start = self.offset
++        token = yield from self.peek()
++        if token == b'"':
++            return (yield from self.string())
++        if token in (b'[', b'{'):
++            opening = self.take(1)
++            close = b']' if opening == b'[' else b'}'
++            result = [] if opening == b'[' else {}
++            yield from self.skip()
++            if (yield from self.peek()) == close:
++                self.take(1)
++                return result
++            while True:
++                if opening == b'{':
++                    if (yield from self.peek()) != b'"':
++                        raise ValueError('object_key_expected')
++                    key = yield from self.string(key=True)
++                    yield from self.skip()
++                    if self.take(1) != b':':
++                        raise ValueError('colon_expected')
++                item = yield from self.value(depth+1)
++                if opening == b'[':
++                    result.append(item)
++                else:
++                    result[key] = item
++                yield from self.skip()
++                separator = self.take(1)
++                if separator == close:
++                    return result
++                if separator != b',':
++                    raise ValueError('separator_expected')
++                yield from self.skip()
++        literal = bytearray()
++        while (yield from self.peek()) not in (b'', b',', b']', b'}', b' ', b'\t', b'\r', b'\n'):
++            literal += self.take(1)
++            if len(literal) > 256:
++                raise ValueError('number_budget_exceeded')
++        value = json.loads(literal)
++        if not isinstance(value, (int, float, bool, type(None))):
++            raise ValueError('invalid_literal')
++        self.literals[id(value)] = (start, self.offset)
++        return value
++
++    def descriptor(self, value):
++        if isinstance(value, StringRange):
++            return value.descriptor()
++        if isinstance(value, str):
++            return self.ranges[id(value)].descriptor()
++        if isinstance(value, dict):
++            return {'kind':'object', 'members':[
++                [self.descriptor(key), self.descriptor(item)] for key, item in value.items()]}
++        if isinstance(value, list):
++            return {'kind':'array', 'items':[self.descriptor(item) for item in value]}
++        start, end = self.literals[id(value)]
++        return {'kind':'literal', 'start':start, 'end':end}
++
++    def parse(self):
++        value = yield from self.value()
++        yield from self.skip()
++        if (yield from self.peek()) != b'':
++            raise ValueError('trailing_data')
++        self.complete = True
++        return value
++
++
++def run(read, size, offset=0):
++    parser = Parser(read, size, offset)
++    steps = parser.parse()
++    consumed = 0
++    while True:
++        try:
++            consumed += next(steps)
++            assert not parser.complete
++        except StopIteration as done:
++            return done.value, consumed, parser.nodes
++
++
++def text_chunks(reference, read):
++    pieces = []
++    parser = Parser(read, reference.end+1, reference.start-1, pieces.append)
++    task = parser.string()
++    while True:
++        try:
++            next(task)
++        except StopIteration:
++            if pieces:
++                yield ''.join(pieces)
++            return
++        if pieces:
++            yield ''.join(pieces)
++            pieces.clear()
++
++
++class HistoryString:
++    """Private verified range; never implicitly converts a giant value to str."""
++
++    def __init__(self, descriptor, read):
++        self._descriptor, self._read = descriptor, read
++
++    def __len__(self):
++        return self._descriptor['characters']
++
++    @property
++    def nonblank(self):
++        return self._descriptor['nonblank']
++
++    def __repr__(self):
++        return '<verified history string; body deferred>'
++
++    def chunks(self, start=0, end=None):
++        end = len(self) if end is None else end
++        if not 0 <= start <= end <= len(self):
++            raise ValueError('history string character range invalid')
++        if start == end:
++            return
++        descriptor = self._descriptor
++        points = [tuple(point) for point in descriptor.get('points') or [(0,descriptor['start'])]]
++        point = points[max(0, bisect.bisect_right(points, (start,2**63))-1)]
++        at, offset = point
++        if descriptor['kind'] == 'raw_string':
++            decoder = codecs.getincrementaldecoder('utf-8')('strict')
++            while offset < descriptor['end'] and at < end:
++                limit = min(CHUNK, descriptor['end']-offset)
++                text = decoder.decode(self._read(offset,limit))
++                offset += limit
++                left, right = max(0,start-at), min(len(text),end-at)
++                if left < right:
++                    yield text[left:right]
++                at += len(text)
++            return
++        pieces = []
++        parser = Parser(self._read, descriptor['end']+1, offset, pieces.append)
++        task = parser.string(inside=True)
++        try:
++            while at < end:
++                finished = False
++                try:
++                    next(task)
++                except StopIteration:
++                    finished = True
++                if pieces:
++                    text = ''.join(pieces)
++                    pieces.clear()
++                    left, right = max(0,start-at), min(len(text),end-at)
++                    if left < right:
++                        yield text[left:right]
++                    at += len(text)
++                if finished:
++                    break
++        finally:
++            task.close()
++        if at < end:
++            raise ValueError('history string range ended early')
++
++    def slice(self, start, end, *, max_bytes=CHUNK):
++        pieces, size = [], 0
++        for text in self.chunks(start,end):
++            size += len(text.encode('utf-8'))
++            if size > max_bytes:
++                raise ValueError('history fragment byte limit exceeded')
++            pieces.append(text)
++        return ''.join(pieces)
++
++
++def hydrate_tree(descriptor, read):
++    """Resolve only bounded structural/scalar leaves; keep giant strings lazy."""
++    kind = descriptor['kind']
++    if kind in {'string','raw_string'}:
++        value = HistoryString(descriptor,read)
++        return value.slice(0,len(value)) if len(value) <= CHUNK//4 else value
++    if kind == 'array':
++        return [hydrate_tree(item,read) for item in descriptor['items']]
++    if kind == 'object':
++        values = [(hydrate_tree(key,read),hydrate_tree(value,read))
++                  for key,value in descriptor['members']]
++        if any(not isinstance(key,str) for key,_ in values):
++            raise ValueError('history object key is not bounded')
++        return dict(values)
++    if kind == 'literal':
++        length = descriptor['end']-descriptor['start']
++        if not 0 < length <= 256:
++            raise ValueError('history scalar range invalid')
++        return json.loads(read(descriptor['start'],length))
++    raise ValueError('history value descriptor kind invalid')
++
++
++class HistoryValue:
++    """Host-owned complete value identity plus its lazy canonical read capability."""
++
++    def __init__(self, proof, read, *, decoded=False):
++        self._proof, self._read, self._decoded = proof, read, decoded
++        self._root = None
++
++    @property
++    def ascii_sha256(self):
++        return self._proof['semantic_ascii_sha256' if self._decoded else 'raw_ascii_sha256']
++
++    @property
++    def utf8_sha256(self):
++        if not self._decoded:
++            raise ValueError('raw history capability cannot supply semantic identity')
++        return self._proof['semantic_utf8_sha256']
++
++    @property
++    def root(self):
++        if not self._decoded:
++            raise ValueError('raw history capability cannot supply decoded content')
++        if self._root is None:
++            self._root = hydrate_tree(self._proof['tree'],self._read)
++        return self._root
++
++    def footprint(self):
++        # Locators/capabilities remain private; this is sizing, NOT JSON identity.
++        return {'schema':'hermes.history_value_footprint.v1',
++                'content_sha256':self.ascii_sha256, 'descriptor':self._proof['tree']}
++
++    def __repr__(self):
++        return '<complete verified history value; body deferred>'
++
++    def __eq__(self, other):
++        return isinstance(other,HistoryValue) and self.ascii_sha256 == other.ascii_sha256
++
++    def __deepcopy__(self, memo):
++        # The reader is an identity-bound capability, not a SQLite connection.
++        return self
++
++
++def canonical_chunks(value, read, *, ascii_only=False):
++    if isinstance(value, StringRange):
++        yield b'"'
++        for part in text_chunks(value, read):
++            yield json.dumps(part, ensure_ascii=ascii_only)[1:-1].encode('ascii' if ascii_only else 'utf-8')
++        yield b'"'
++    elif isinstance(value, dict):
++        yield b'{'
++        for index, key in enumerate(sorted(value)):
++            if index:
++                yield b','
++            yield json.dumps(key, ensure_ascii=ascii_only).encode('ascii' if ascii_only else 'utf-8')
++            yield b':'
++            yield from canonical_chunks(value[key], read, ascii_only=ascii_only)
++        yield b'}'
++    elif isinstance(value, list):
++        yield b'['
++        for index, item in enumerate(value):
++            if index:
++                yield b','
++            yield from canonical_chunks(item, read, ascii_only=ascii_only)
++        yield b']'
++    else:
++        yield json.dumps(value, ensure_ascii=ascii_only, separators=(',',':')).encode('ascii' if ascii_only else 'utf-8')
++
++
++class ValueWork:
++    """One unfinished value owned by the existing preparation worker.
++
++No SQLite connection or blob survives a step. The host must bind a fresh,
++validated row snapshot on every step and revalidate before publication. On
++restart this disposable hash/parser state is discarded, not trusted/resumed.
++"""
++
++    def __init__(self, size, *, storage_type='text', json_offset=None):
++        self.size, self.storage_type, self.json_offset = size, storage_type, json_offset
++        self.complete = False
++        self.proof = None
++        self.read_bytes = self.steps = 0
++        self._reader = None
++        self._task = self._run()
++
++    def _read(self, offset, limit):
++        if self._reader is None:
++            raise RuntimeError('history value has no active read snapshot')
++        if not 0 <= offset <= self.size or not 0 < limit <= CHUNK:
++            raise ValueError('history value read range invalid')
++        limit = min(limit, self.size-offset)
++        data = self._reader(offset, limit)
++        if len(data) != limit:
++            raise ValueError('history value short read')
++        self.read_bytes += len(data)
++        return data
++
++    def step(self, read, *, deadline, max_bytes):
++        if self.complete:
++            return True
++        self._reader = read
++        before = self.read_bytes
++        try:
++            while time.monotonic() < deadline and self.read_bytes-before < max_bytes:
++                try:
++                    next(self._task)
++                except StopIteration as finished:
++                    self.proof = finished.value
++                    self.complete = True
++                    return True
++                self.steps += 1
++            return False
++        finally:
++            self._reader = None
++
++    def _run(self):
++        raw_ascii, raw_utf8 = hashlib.sha256(), hashlib.sha256()
++        if self.storage_type == 'blob':
++            # Match the host's existing _json_value(bytes) canonical shape.
++            raw_ascii.update(b'{"$bytes":"')
++            for offset in range(0, self.size, CHUNK):
++                raw_ascii.update(self._read(offset, min(CHUNK, self.size-offset)).hex().encode('ascii'))
++                yield
++            raw_ascii.update(b'"}')
++            return {'kind':'blob', 'bytes':self.size,
++                    'raw_ascii_sha256':raw_ascii.hexdigest(),
++                    'semantic_ascii_sha256':raw_ascii.hexdigest(),
++                    'semantic_utf8_sha256':None, 'tree':None}
++        if self.storage_type != 'text':
++            raise ValueError('unsupported streamed storage type')
++        decoder = codecs.getincrementaldecoder('utf-8')('strict')
++        chars, nonblank = 0, False
++        points = [(0,0)]
++        raw_ascii.update(b'"')
++        raw_utf8.update(b'"')
++        for offset in range(0, self.size, CHUNK):
++            text = decoder.decode(self._read(offset, min(CHUNK, self.size-offset)))
++            chars += len(text)
++            nonblank = nonblank or bool(text.strip())
++            raw_ascii.update(json.dumps(text, ensure_ascii=True)[1:-1].encode('ascii'))
++            raw_utf8.update(json.dumps(text, ensure_ascii=False)[1:-1].encode('utf-8'))
++            if chars-points[-1][0] >= CHUNK and not decoder.getstate()[0]:
++                points.append((chars,offset+min(CHUNK,self.size-offset)))
++            yield
++        assert decoder.decode(b'', final=True) == ''
++        raw_ascii.update(b'"')
++        raw_utf8.update(b'"')
++        proof = {'kind':'text', 'bytes':self.size,
++                 'raw_ascii_sha256':raw_ascii.hexdigest(),
++                 'semantic_ascii_sha256':raw_ascii.hexdigest(),
++                 'semantic_utf8_sha256':raw_utf8.hexdigest(),
++                 'tree':{'kind':'raw_string', 'start':0, 'end':self.size,
++                         'characters':chars, 'nonblank':nonblank,
++                         'ascii_sha256':raw_ascii.hexdigest(),
++                         'utf8_sha256':raw_utf8.hexdigest(), 'points':points}}
++        if self.json_offset is None:
++            return proof
++        parser = Parser(self._read, self.size, self.json_offset)
++        try:
++            root = yield from parser.parse()
++        except (ValueError, UnicodeError):
++            # The host's content decoder returns the raw string for malformed
++            # encoded JSON. Resource-limit exceptions must NOT use this path.
++            raise
++        proof['tree'] = parser.descriptor(root)
++        for ascii_only, key in ((True, 'semantic_ascii_sha256'), (False, 'semantic_utf8_sha256')):
++            digest = hashlib.sha256()
++            for piece in canonical_chunks(root, self._read, ascii_only=ascii_only):
++                if len(piece) > 6*CHUNK+2:
++                    raise ValueError('canonical_piece_budget_exceeded')
++                digest.update(piece)
++                yield
++            proof[key] = digest.hexdigest()
++        if len(json.dumps(proof, separators=(',',':')).encode()) > 1024*1024:
++            raise ValueError('descriptor_budget_exceeded')
++        return proof
+diff --git a/hermes_state_history.py b/hermes_state_history.py
+index 4d3cd1db..662ad715 100644
+--- a/hermes_state_history.py
++++ b/hermes_state_history.py
+@@ -19,9 +19,10 @@ import time
+ import uuid
+ from contextlib import contextmanager
+ from typing import Any, Callable, Dict, Mapping, Optional, Sequence
++from hermes_history_content import CHUNK, ValueWork, HistoryValue
+ 
+ 
+-HISTORY_RULE_VERSION = "hermes.canonical_history_rule.v2"
++HISTORY_RULE_VERSION = "hermes.canonical_history_rule.v3"
+ HISTORY_PREFIX_SCHEMA = "hermes.canonical_history_prefix.v1"
+ HISTORY_CURSOR_SCHEMA = "hermes.canonical_history_cursor.v1"
+ HISTORY_PREPARE_SCHEMA = "hermes.canonical_history_prepare.v1"
+@@ -182,6 +183,7 @@ _TABLE_COLUMNS = {
+         "active",
+         "compacted",
+     },
++    "hermes_history_values": {"domain_id", "message_id", "proof_json"},
+ }
+ 
+ _HISTORY_SCHEMA_SQL = """
+@@ -214,6 +216,10 @@ CREATE INDEX IF NOT EXISTS idx_hermes_history_changes_old
+     ON hermes_history_changes(old_session_id, change_seq);
+ CREATE INDEX IF NOT EXISTS idx_hermes_history_changes_new
+     ON hermes_history_changes(new_session_id, change_seq);
++CREATE INDEX IF NOT EXISTS idx_hermes_history_changes_old_row
++    ON hermes_history_changes(old_row_id, change_seq);
++CREATE INDEX IF NOT EXISTS idx_hermes_history_changes_new_row
++    ON hermes_history_changes(new_row_id, change_seq);
+ 
+ CREATE TABLE IF NOT EXISTS hermes_history_domains (
+     domain_id TEXT PRIMARY KEY,
+@@ -277,6 +283,14 @@ CREATE TABLE IF NOT EXISTS hermes_history_members (
+ );
+ CREATE INDEX IF NOT EXISTS idx_hermes_history_members_anchor
+     ON hermes_history_members(domain_id, anchor, message_id);
++CREATE TABLE IF NOT EXISTS hermes_history_values (
++    domain_id TEXT NOT NULL,
++    message_id INTEGER NOT NULL,
++    proof_json TEXT NOT NULL,
++    PRIMARY KEY (domain_id, message_id),
++    FOREIGN KEY (domain_id, message_id)
++      REFERENCES hermes_history_members(domain_id, message_id) ON DELETE CASCADE
++);
+ """
+ 
+ _HISTORY_TRIGGER_SQL = """
+@@ -376,6 +390,8 @@ _EXPECTED_TABLE_SHAPES = _expected_table_shapes()
+ _HISTORY_INDEX_COLUMNS = {
+     "idx_hermes_history_changes_old": ("old_session_id", "change_seq"),
+     "idx_hermes_history_changes_new": ("new_session_id", "change_seq"),
++    "idx_hermes_history_changes_old_row": ("old_row_id", "change_seq"),
++    "idx_hermes_history_changes_new_row": ("new_row_id", "change_seq"),
+     "idx_hermes_history_domains_watermark": ("indexed_change_seq",),
+     "idx_hermes_history_buckets_winner": ("domain_id", "winner_message_id"),
+     "idx_hermes_history_members_anchor": ("domain_id", "anchor", "message_id"),
+@@ -708,6 +724,7 @@ class SessionHistoryMixin:
+             "hermes_history_domains",
+             "hermes_history_buckets",
+             "hermes_history_members",
++            "hermes_history_values",
+         }
+         tables = {
+             str(row[0])
+@@ -910,7 +927,16 @@ class SessionHistoryMixin:
+         # The caller keeps a SELECT-only handle.  This private host-owned
+         # delegate exposes only the narrow history methods, never the writer.
+         with type(self)(db_path=self.db_path, read_only=False) as writer:
+-            return getattr(writer, method)(*args, **kwargs)
++            # Carry only unfinished hash/parser state, never an open connection
++            # or blob. The existing reader/worker owns its lifetime and every
++            # step rebinds and validates the actual canonical row snapshot.
++            for name in ("_history_stream_pending", "_history_native_probe"):
++                setattr(writer, name, getattr(self, name, None))
++            try:
++                return getattr(writer, method)(*args, **kwargs)
++            finally:
++                for name in ("_history_stream_pending", "_history_native_probe"):
++                    setattr(self, name, getattr(writer, name, None))
+ 
+     @staticmethod
+     def _history_journal_contiguous(
+@@ -1225,9 +1251,14 @@ class SessionHistoryMixin:
+         *,
+         max_rows: int,
+         max_bytes: int,
++        work_deadline: Optional[float] = None,
+     ) -> tuple[list[sqlite3.Row], Dict[int, int], int, bool, Optional[str]]:
+         columns = self._history_message_columns(conn)
+         expression = self._history_probe_expression(columns)
++        native_key = (domain['domain_id'],domain['target_max_message_id'],domain.get('activation_epoch'))
++        if work_deadline is not None and getattr(self, '_history_native_probe', None) == native_key:
++            return self._history_probe_native_page(conn, domain, max_rows=1,
++                max_bytes=max_bytes, work_deadline=work_deadline)
+         with self._history_value_limit(conn, max_bytes):
+             try:
+                 probes = conn.execute(
+@@ -1265,13 +1296,196 @@ class SessionHistoryMixin:
+                 more = len(probes) > len(selected)
+                 return payload, selected_sizes, total, more, None
+             except sqlite3.DataError:
+-                return [], {}, 0, True, "history_row_byte_limit_exceeded"
++                if work_deadline is None:
++                    return [], {}, 0, True, "history_row_byte_limit_exceeded"
++                self._history_native_probe = native_key
++                return self._history_probe_native_page(
++                    conn, domain, max_rows=1, max_bytes=max_bytes,
++                    work_deadline=work_deadline or time.monotonic())
++
++    def _history_native_shape(self, conn, message_id):
++        """Only SQLite serial types/scalars plus native blob lengths, no CAST."""
++        columns = self._history_message_columns(conn)
++        types = conn.execute(
++            'SELECT '+','.join(f'typeof("{column}")' for column in columns)+
++            ' FROM messages WHERE id=?', (message_id,)).fetchone()
++        if types is None:
++            raise ValueError('history winner disappeared')
++        sizes, values = {}, {}
++        for column, storage in zip(columns,types):
++            if storage in {'text','blob'}:
++                with conn.blobopen('messages',column,message_id,readonly=True) as blob:
++                    sizes[column] = len(blob)
++            else:
++                value = conn.execute(f'SELECT "{column}" FROM messages WHERE id=?',
++                                     (message_id,)).fetchone()[0]
++                values[column] = value
++                sizes[column] = 0 if value is None else len(str(value).encode())
++        return dict(zip(columns,types)), sizes, values
++
++    @staticmethod
++    def _history_blob_read(conn, message_id, column, offset, limit):
++        if not 0 < limit <= CHUNK or offset < 0:
++            raise ValueError('history blob range invalid')
++        with conn.blobopen('messages',column,message_id,readonly=True) as blob:
++            blob.seek(offset)
++            return blob.read(limit)
++
++    def _history_native_values(self, conn, message_id, types, sizes, values, proofs=None):
++        result = dict(values)
++        for column, storage in types.items():
++            if storage not in {'text','blob'}:
++                continue
++            reader = lambda offset,limit,c=column: self._history_blob_read(conn,message_id,c,offset,limit)
++            if proofs and column in proofs:
++                result[column] = HistoryValue(proofs[column],reader)
++                continue
++            if sizes[column] > 4*1024*1024:
++                raise ValueError('unproven large history value')
++            with conn.blobopen('messages',column,message_id,readonly=True) as blob:
++                data = blob.read()
++            result[column] = data.decode('utf-8') if storage == 'text' else data
++        return result
++
++    def _history_probe_native_page(self, conn, domain, *, max_rows, max_bytes, work_deadline):
++        ids = conn.execute(
++            'SELECT id FROM messages WHERE session_id=? AND id>? AND id<=? ORDER BY id LIMIT ?',
++            (domain['domain_id'],domain['cursor_message_id'],domain['target_max_message_id'],max_rows+1),
++        ).fetchall()
++        payload, sizes_by_id, resident = [], {}, 0
++        for entry in ids[:max_rows]:
++            message_id = int(entry[0])
++            # SQLite must walk a giant record even to locate fields after its
++            # payload. Reuse only its body-free shape while the captured row
++            # versions still match; unrelated appends cannot change that shape.
++            version = tuple(conn.execute(
++                'SELECT change_seq FROM hermes_history_changes WHERE '+column+'=? '
++                'ORDER BY change_seq DESC LIMIT 1', (message_id,)).fetchone() or (0,)
++                for column in ('old_row_id','new_row_id'))
++            floor = conn.execute('SELECT retained_floor FROM hermes_history_state WHERE singleton=1').fetchone()[0]
++            key = (domain['domain_id'],message_id,domain['scan_base_change_seq'],version,floor,
++                   domain['activation_epoch'])
++            pending = getattr(self,'_history_stream_pending',None)
++            if pending is not None and pending['key'] == key:
++                types, sizes, scalars = pending['shape']
++            else:
++                types, sizes, scalars = self._history_native_shape(conn,message_id)
++            size = sum(sizes.values())
++            if size <= max_bytes:
++                if resident+size > max_bytes:
++                    break
++                payload.append(self._history_native_values(conn,message_id,types,sizes,scalars))
++                sizes_by_id[message_id] = size
++                resident += size
++                continue
++            if payload:
++                break
++            # Same-size edits invalidate unfinished work. Appending a different
++            # row must not restart it: busy mouths still need to finish audit.
++            if pending is None or pending['key'] != key:
++                pending = {'key':key, 'shape':(types,sizes,scalars),
++                           'proofs':{}, 'work':None, 'column':None}
++                self._history_stream_pending = pending
++            for column, storage in types.items():
++                if storage not in {'text','blob'} or sizes[column] <= CHUNK or column in pending['proofs']:
++                    continue
++                if pending['work'] is None:
++                    prefix = self._history_blob_read(conn,message_id,column,0,min(6,sizes[column]))
++                    offset = (6 if column == 'content' and prefix == b'\x00json:' else
++                              0 if column in {'tool_calls','display_metadata'} else None)
++                    pending['work'] = ValueWork(sizes[column],storage_type=storage,json_offset=offset)
++                    pending['column'] = column
++                if pending['column'] != column:
++                    raise AssertionError('history value work order changed')
++                # Reopening at every chunk loses SQLite's overflow-page cache
++                # and turns sequential byte work into repeated prefix walks.
++                # The handle is still closed before this quantum can yield.
++                with conn.blobopen('messages',column,message_id,readonly=True) as blob:
++                    def reader(offset, limit):
++                        if not 0 < limit <= CHUNK or offset < 0:
++                            raise ValueError('history blob range invalid')
++                        blob.seek(offset)
++                        return blob.read(limit)
++                    if not pending['work'].step(reader,deadline=work_deadline,max_bytes=max_bytes):
++                        return [],{},0,True,'history_record_stream_pending'
++                pending['proofs'][column] = pending['work'].proof
++                pending['work'],pending['column'] = None,None
++                if len(json.dumps(pending['proofs'],separators=(',',':')).encode()) > 1024*1024:
++                    return [],{},0,True,'history_value_descriptor_limit_exceeded'
++            row = self._history_native_values(conn,message_id,types,sizes,scalars,pending['proofs'])
++            resident = (sum(sizes[column] for column in types if column not in pending['proofs'])
++                        + len(json.dumps(pending['proofs'],separators=(',',':')).encode()))
++            if resident > max_bytes:
++                return [],{},0,True,"history_row_byte_limit_exceeded"
++            payload.append(row)
++            sizes_by_id[message_id] = size
++            # Keep the completed proof until this row is actually committed.
++            # A quantum may finish hashing just after its row-work deadline;
++            # dropping it here would hash that same giant row forever.
++            break
++        return payload,sizes_by_id,resident,len(ids)>len(payload),None
++
++    def _history_decode_values(self, row):
++        lazy = {key:value for key,value in row.items() if isinstance(value,HistoryValue)}
++        decoded = self._decode_message_rows([{key:None if key in lazy else value for key,value in row.items()}])[0]
++        for key,value in lazy.items():
++            decoded[key] = (HistoryValue(value._proof,value._read,decoded=True)
++                            if key in {'content','tool_calls','display_metadata'} else value)
++        return decoded
++
++    def _history_deferred_read(self, token, message_id, column, offset, limit):
++        # No connection outlives a page. A later fragment is a new, validated
++        # canonical snapshot; changed/missing provenance cannot lend old hashes
++        # to a newly edited body.
++        with self._read_ctx() as connection:
++            connection.execute("BEGIN")
++            try:
++                validation = self._history_validate_token_conn(connection, token)
++                if validation["status"] != "valid" or validation["invalidated_from_position"]:
++                    raise ValueError("history_deferred_source_changed")
++                return self._history_blob_read(connection,message_id,column,offset,limit)
++            finally:
++                connection.rollback()
++
++    def _history_verified_row(self, conn, index_row, token, max_bytes):
++        message_id = int(index_row["winner_message_id"])
++        proof_row = conn.execute("SELECT proof_json FROM hermes_history_values "
++                                 "WHERE domain_id=? AND message_id=?",
++                                 (token["domain_id"],message_id)).fetchone()
++        envelope = json.loads(proof_row[0]) if proof_row else None
++        if envelope is not None and (
++            not isinstance(envelope,dict)
++            or set(envelope) != {'schema','values','sha256'}
++            or envelope['schema'] != 'hermes.history_value_proofs.v1'
++            or not isinstance(envelope['values'],dict)
++            or envelope['sha256'] != _digest(envelope['values'])
++        ):
++            raise ValueError('history_value_descriptor_invalid')
++        proofs = envelope['values'] if envelope else {}
++        types,sizes,scalars = self._history_native_shape(conn,message_id)
++        resident = (sum(size for key,size in sizes.items() if key not in proofs)
++                    + len(proof_row[0].encode()) if proof_row else sum(sizes.values()))
++        if resident > max_bytes:
++            return None,resident
++        row = self._history_native_values(conn,message_id,types,sizes,scalars,proofs)
++        material = self._history_row_material(row,sum(sizes.values()))
++        if any(material[key] != index_row[key] for key in
++               ("raw_key_digest","semantic_key_digest","raw_signature","semantic_signature")):
++            # Notification recovery is applied after raw physical verification.
++            recovered = self._history_recover_notification_clone(conn,token["domain_id"],index_row,row)
++            if recovered is None:
++                raise ValueError("history_deferred_identity_changed")
++        for column,proof in proofs.items():
++            reader = lambda offset,limit,c=column: self._history_deferred_read(
++                token,message_id,c,offset,limit)
++            row[column] = HistoryValue(proof,reader)
++        return row,resident
+ 
+     def _history_row_material(
+         self, row: sqlite3.Row, stored_bytes: int
+     ) -> Dict[str, Any]:
+         raw = dict(row)
+-        decoded = self._decode_message_rows([row])[0]
++        decoded = self._history_decode_values(raw)
+         raw_active = raw.get("active")
+         raw_compacted = raw.get("compacted")
+         lifecycle_valid = (
+@@ -1296,24 +1510,26 @@ class SessionHistoryMixin:
+             decoded.get("tool_calls"),
+             decoded.get("tool_name"),
+         ]
++        def field_digest(value):
++            return value.ascii_sha256 if isinstance(value,HistoryValue) else _digest(value)
+         raw_signature = _digest(
+-            {key: value for key, value in raw.items() if key not in {"id", "active", "compacted"}}
++            {key: field_digest(value) for key, value in raw.items() if key not in {"id", "active", "compacted"}}
+         )
+         semantic_signature = _digest(
+             {
+-                key: value
++                key: field_digest(value)
+                 for key, value in decoded.items()
+                 if key not in {"id", "active", "compacted"}
+             }
+         )
+-        semantic_key_digest = _digest(semantic_key)
++        semantic_key_digest = _digest([field_digest(value) for value in semantic_key])
+         anchor = "hca_" + _digest(
+             ["hermes.canonical_history_anchor.v1", raw.get("session_id"), semantic_key_digest]
+         )
+         return {
+             "message_id": int(raw["id"]),
+             "anchor": anchor,
+-            "raw_key_digest": _digest(raw_key),
++            "raw_key_digest": _digest([field_digest(value) for value in raw_key]),
+             "semantic_key_digest": semantic_key_digest,
+             "raw_signature": raw_signature,
+             "semantic_signature": semantic_signature,
+@@ -2065,8 +2281,15 @@ class SessionHistoryMixin:
+                     domain,
+                     max_rows=max_rows_per_page,
+                     max_bytes=max_page_bytes,
++                    work_deadline=work_deadline,
+                 )
+                 if overflow_reason:
++                    if overflow_reason == "history_record_stream_pending":
++                        # An unfinished value is byte work, never a completed
++                        # row or a reason to skip/retire that row.
++                        self._history_save_domain(conn, domain)
++                        return self._history_result(state, domain, status="progress",
++                                                    reason=overflow_reason, more=True, pages=1)
+                     domain["phase"] = "overflow"
+                     domain["failure_reason"] = overflow_reason
+                     break
+@@ -2086,6 +2309,13 @@ class SessionHistoryMixin:
+                         domain["failure_reason"] = failure
+                         domain["invalidated_from_position"] = 1
+                         break
++                    proofs = {key:value._proof for key,value in dict(row).items()
++                              if isinstance(value,HistoryValue)}
++                    if proofs:
++                        envelope = {'schema':'hermes.history_value_proofs.v1',
++                                    'values':proofs, 'sha256':_digest(proofs)}
++                        conn.execute("INSERT OR REPLACE INTO hermes_history_values VALUES(?,?,?)",
++                                     (domain_id,int(row["id"]),json.dumps(envelope,separators=(',',':'))))
+                     domain["cursor_message_id"] = int(row["id"])
+                     physical_rows += 1
+                 pages += 1
+@@ -2596,8 +2826,10 @@ class SessionHistoryMixin:
+                 ).fetchall()
+                 selected = []
+                 total = 0
++                raw_rows = []
++                resident_sizes = []
+                 for index_row in index_rows[:max_rows]:
+-                    size = int(index_row["winner_stored_bytes"])
++                    raw_row,size = self._history_verified_row(conn,index_row,token,max_bytes-total)
+                     if size > max_bytes and not selected:
+                         return {
+                             "schema": HISTORY_PAGE_SCHEMA,
+@@ -2615,52 +2847,29 @@ class SessionHistoryMixin:
+                     if total + size > max_bytes:
+                         break
+                     selected.append(index_row)
++                    raw_rows.append(raw_row)
++                    resident_sizes.append(size)
+                     total += size
+                 if not selected and index_rows:
+                     raise AssertionError("history page budget selection made no progress")
+-                winner_ids = [int(row["winner_message_id"]) for row in selected]
+-                raw_rows: list[sqlite3.Row] = []
+-                if winner_ids:
+-                    placeholders = ",".join("?" for _ in winner_ids)
+-                    fetched = conn.execute(
+-                        f"SELECT * FROM messages WHERE session_id=? "
+-                        f"AND id IN ({placeholders})",
+-                        (domain_id, *winner_ids),
+-                    ).fetchall()
+-                    by_id = {int(row["id"]): row for row in fetched}
+-                    if set(by_id) != set(winner_ids):
+-                        return {
+-                            "schema": HISTORY_PAGE_SCHEMA,
+-                            "status": "changed",
+-                            "reason": "history_winner_missing",
+-                            "target": token,
+-                            "rows": [],
+-                            "entries": [],
+-                            "page_token": None,
+-                            "next_cursor": None,
+-                            "scan_complete": False,
+-                            "returned_rows": 0,
+-                            "stored_bytes": 0,
+-                        }
+-                    raw_rows = [by_id[value] for value in winner_ids]
+                 projected = []
+                 for index_row, raw_row in zip(selected, raw_rows):
+                     recovered = self._history_recover_notification_clone(
+                         conn, domain_id, index_row, raw_row)
+                     projected.append(recovered if recovered is not None else raw_row)
+-                decoded = self._decode_message_rows(projected)
++                decoded = [self._history_decode_values(dict(row)) for row in projected]
+                 entries = [
+                     {
+                         "anchor": str(row["anchor"]),
+                         "position": int(row["position"]),
+                         "canonical_count": int(row["position"]),
+                         "prefix_hash": str(row["prefix_hash"]),
+-                        "stored_bytes": int(row["winner_stored_bytes"]),
++                        "stored_bytes": resident_size,
+                         "physical_count": int(row["physical_count"]),
+                         "active": int(row["active"]),
+                         "compacted": int(row["compacted"]),
+                     }
+-                    for row in selected
++                    for row,resident_size in zip(selected,resident_sizes)
+                 ]
+                 if selected:
+                     last = selected[-1]
+diff --git a/tests/test_history_stream_values.py b/tests/test_history_stream_values.py
+new file mode 100644
+index 00000000..dcf31e92
+--- /dev/null
++++ b/tests/test_history_stream_values.py
+@@ -0,0 +1,233 @@
++"""The byte-work owner must finish all raw/semantic hashes before publishing."""
++import hashlib
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_history_content import CHUNK, ValueWork, HistoryValue, HistoryString
++
++
++def test_streamed_value_keeps_exact_json_identity_across_quanta(tmp_path):
++    value = [{"type":"text", "text":"中😀\\\n"*20000},
++             {"type":"image_url", "image_url":{"url":"data:image/png;base64,"+"A"*17_500_000}}]
++    content = '\x00json:'+json.dumps(value)
++    connection = sqlite3.connect(tmp_path/'values.sqlite3')
++    connection.execute('CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT)')
++    connection.execute('INSERT INTO messages VALUES(1,?)', (content,))
++    connection.commit()
++    size = len(content.encode())
++    del content
++    work = ValueWork(size, json_offset=6)
++    max_read = steps = 0
++
++    def read(offset, limit):
++        nonlocal max_read
++        assert limit <= CHUNK
++        max_read = max(max_read, limit)
++        with connection.blobopen('messages','content',1,readonly=True) as blob:
++            blob.seek(offset)
++            return blob.read(limit)
++
++    while not work.step(read, deadline=time.monotonic()+1, max_bytes=2*CHUNK):
++        steps += 1
++        assert work.proof is None and not work.complete
++        # A quantum owns no open blob/connection; cancellation can discard it.
++        assert work._reader is None
++    assert steps > 300 and max_read == CHUNK
++    original = connection.execute('SELECT content FROM messages').fetchone()[0]
++    for ascii_only, key in ((True,'semantic_ascii_sha256'),(False,'semantic_utf8_sha256')):
++        expected = hashlib.sha256(json.dumps(value, ensure_ascii=ascii_only, sort_keys=True,
++                                             separators=(',',':')).encode()).hexdigest()
++        assert work.proof[key] == expected
++    assert work.proof['raw_ascii_sha256'] == hashlib.sha256(
++        json.dumps(original, ensure_ascii=True).encode()).hexdigest()
++    descriptor = json.dumps(work.proof)
++    assert len(descriptor) < 10_000 and 'data:image' not in descriptor and '中' not in descriptor
++    capability = HistoryValue(json.loads(descriptor),read,decoded=True)
++    assert capability.utf8_sha256 == work.proof['semantic_utf8_sha256']
++    assert isinstance(capability.root[0]['text'],HistoryString)
++    assert isinstance(capability.root[1]['image_url']['url'],HistoryString)
++    # Sparse character/byte checkpoints make repeated compiler fragments read
++    # only their local region, including escaped emoji/UTF-8 boundaries.
++    for index,original_text in ((0,value[0]['text']), (1,value[1]['image_url']['url'])):
++        reference = capability.root[index]['text'] if index == 0 else capability.root[index]['image_url']['url']
++        for start in (0,10,65535,len(original_text)-100):
++            assert reference.slice(start,start+80) == original_text[start:start+80]
++    connection.close()
++
++
++def test_restarting_unfinished_value_does_not_publish_partial_proof():
++    data = json.dumps(['界😀'*30000]).encode()
++    read = lambda offset, limit: data[offset:offset+limit]
++    abandoned = ValueWork(len(data), json_offset=0)
++    assert not abandoned.step(read, deadline=time.monotonic()+1, max_bytes=CHUNK)
++    assert abandoned.proof is None
++    restarted = ValueWork(len(data), json_offset=0)
++    while not restarted.step(read, deadline=time.monotonic()+1, max_bytes=CHUNK):
++        assert restarted.proof is None
++    assert restarted.complete
++
++
++@pytest.mark.parametrize('payload', [b'[1,]', b'{"x":}', b'"bad\nline"', b'[1] 2'])
++def test_invalid_json_cannot_finish_a_value(payload):
++    work = ValueWork(len(payload), json_offset=0)
++    with pytest.raises(ValueError):
++        while not work.step(lambda offset, limit: payload[offset:offset+limit],
++                            deadline=time.monotonic()+1, max_bytes=CHUNK):
++            pass
++    assert not work.complete and work.proof is None
++
++
++def test_plain_giant_text_fragments_do_not_materialize_the_whole_value():
++    original = '中😀\r\nabc\\'*30000
++    data = original.encode()
++    sizes = []
++    def read(offset,limit):
++        sizes.append(limit)
++        return data[offset:offset+limit]
++    work = ValueWork(len(data))
++    while not work.step(read,deadline=time.monotonic()+1,max_bytes=CHUNK):
++        pass
++    capability = HistoryValue(json.loads(json.dumps(work.proof)),read,decoded=True)
++    assert isinstance(capability.root,HistoryString)
++    sizes.clear()
++    assert capability.root.slice(len(original)-100,len(original)) == original[-100:]
++    assert sum(sizes) < 3*CHUNK
++
++
++def test_real_host_streams_then_reads_after_page_connection_closes(tmp_path):
++    from hermes_state import SessionDB
++    value = [{"type":"text","text":"recorded meaning"},
++             {"type":"image_url","image_url":{"url":"data:image/png;base64,"+"A"*(5*1024*1024)}}]
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session("giant", "cli")
++        row_id = db.append_message("giant","user",value,timestamp=1)
++        db.append_message("giant","assistant","recorded response",timestamp=2)
++        progresses = 0
++        for _ in range(2000):
++            prepared = db.prepare_history_step("giant",owner_id="test-stream",deadline_ms=50)
++            if prepared["status"] == "ready":
++                break
++            assert prepared["status"] == "progress", prepared
++            progresses += 1
++        else:
++            raise AssertionError("stream preparation stalled")
++        assert progresses > 0
++        page = db.read_history_page("giant",target=prepared["head_token"])
++        assert page["status"] == "ready", page
++        assert page["returned_rows"] == 2 and page["stored_bytes"] < 4*1024*1024
++        capability = page["rows"][0]["content"]
++        assert isinstance(capability,HistoryValue)
++        assert capability.utf8_sha256 == hashlib.sha256(json.dumps(
++            value,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
++        assert capability.root[0]["text"] == "recorded meaning"
++        image = capability.root[1]["image_url"]["url"]
++        assert isinstance(image,HistoryString)
++        assert image.slice(0,22) == "data:image/png;base64,"
++        db._execute_write(lambda conn: conn.execute(
++            "UPDATE messages SET content='changed' WHERE session_id='giant' AND role='user'"))
++        with pytest.raises(ValueError,match="history_deferred_source_changed"):
++            image.slice(0,22)
++
++
++@pytest.mark.parametrize("read_only", [False, True])
++def test_completed_proof_survives_a_quantum_that_cannot_commit_the_row(tmp_path, monkeypatch, read_only):
++    from hermes_state import SessionDB
++    import hermes_state_history as history
++    value = [{"type":"text","text":"meaning"},
++             {"type":"image_url","image_url":{"url":"A"*(5*1024*1024)}}]
++    constructions = 0
++    original_work = history.ValueWork
++    def work(*args, **kwargs):
++        nonlocal constructions
++        constructions += 1
++        return original_work(*args, **kwargs)
++    monkeypatch.setattr(history, "ValueWork", work)
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session("late", "cli")
++        db.append_message("late", "user", value, timestamp=1)
++        db.append_message("late", "assistant", "reply", timestamp=2)
++        original_probe = history.SessionHistoryMixin._history_probe_native_page
++        yielded_after_completion = False
++        def probe(self, *args, **kwargs):
++            nonlocal yielded_after_completion
++            result = original_probe(self, *args, **kwargs)
++            if result[0] and not yielded_after_completion:
++                yielded_after_completion = True
++                time.sleep(0.06)  # actual row cannot be committed in this quantum
++            return result
++        monkeypatch.setattr(history.SessionHistoryMixin, "_history_probe_native_page", probe)
++        reader = SessionDB(tmp_path / "state.db", read_only=True) if read_only else db
++        try:
++            for _ in range(2000):
++                prepared = reader.prepare_history_step("late", owner_id="late-worker", deadline_ms=50)
++                if prepared["status"] == "ready":
++                    break
++                assert prepared["status"] == "progress", prepared
++            else:
++                raise AssertionError("completed proof was repeatedly discarded")
++            assert yielded_after_completion and constructions == 1
++            assert reader.read_history_page("late", target=prepared["head_token"])["returned_rows"] == 2
++        finally:
++            if read_only:
++                reader.close()
++
++
++def test_unrelated_tail_appends_do_not_restart_giant_value_work(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    import hermes_state_history as history
++    constructions = 0
++    original_work = history.ValueWork
++    def work(*args, **kwargs):
++        nonlocal constructions
++        constructions += 1
++        return original_work(*args, **kwargs)
++    monkeypatch.setattr(history, "ValueWork", work)
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session("appending", "cli")
++        db.append_message("appending", "user", [
++            {"type":"text","text":"meaning"},
++            {"type":"image_url","image_url":{"url":"A"*(5*1024*1024)}}], timestamp=1)
++        db.append_message("appending", "assistant", "reply", timestamp=2)
++        for step in range(2000):
++            result = db.prepare_history_step("appending", owner_id="append-worker", deadline_ms=50)
++            if result["status"] == "ready":
++                break
++            assert result["status"] == "progress", result
++            db.append_message("appending", "assistant", "new tail", timestamp=step+3)
++        else:
++            raise AssertionError("tail writes starved the giant value proof")
++        assert constructions == 1
++
++
++def test_same_size_edit_restarts_byte_work_and_descriptor_corruption_is_rejected(tmp_path):
++    from hermes_state import SessionDB
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session("edited", "cli")
++        row_id = db.append_message("edited", "user", "A"*(5*1024*1024), timestamp=1)
++        result = db.prepare_history_step("edited",owner_id="edit-worker",deadline_ms=50)
++        assert result['status'] == 'progress'
++        old_work = db._history_stream_pending['work']
++        assert old_work is not None
++        db._execute_write(lambda conn: conn.execute(
++            'UPDATE messages SET content=? WHERE id=?', ('B'*(5*1024*1024),row_id)))
++        for _ in range(2000):
++            result = db.prepare_history_step("edited",owner_id="edit-worker",deadline_ms=50)
++            if result['status'] == 'ready':
++                break
++            assert result['status'] == 'progress', result
++        else:
++            raise AssertionError('edited byte work did not converge')
++        assert db._history_stream_pending['work'] is not old_work
++        page = db.read_history_page('edited',target=result['head_token'])
++        assert page['rows'][0]['content'].root.slice(0,10) == 'B'*10
++        def corrupt(conn):
++            envelope = json.loads(conn.execute(
++                'SELECT proof_json FROM hermes_history_values').fetchone()[0])
++            envelope['values']['content']['tree']['start'] = 1
++            conn.execute('UPDATE hermes_history_values SET proof_json=?', (json.dumps(envelope),))
++        db._execute_write(corrupt)
++        with pytest.raises(ValueError,match='history_value_descriptor_invalid'):
++            db.read_history_page('edited',target=result['head_token'])
+-- 
+2.50.1 (Apple Git-155)
+

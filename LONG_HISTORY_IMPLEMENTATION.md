@@ -218,3 +218,43 @@ These changes require a future Assembly candidate relock, not an overwrite of
 its selected deployment pins. This main-repository task records the new source
 and rollback obligations; it does not mutate the second repository or label a
 source-only candidate as installed.
+
+## Owner-approved question-driven recall repair
+
+Rolling retirement remains a contiguous-prefix contract. A live hole can
+therefore block the rolling compiler even when preparation is ready. Patch 18
+does not change that contract: `search_history_matches` reuses native Hermes
+search grammar/routing and returns bounded canonical positions for one verified
+domain. `ContinuityHistoryIndex.read_recall` ranks metadata candidates by
+reciprocal native-query rank, hydrates complete groups through the same page,
+occurrence and fingerprint checks as the rolling reader, and revalidates the
+source. No canonical body enters an added database or cache table.
+The owner-copy SQL plan originally rescanned the whole canonical domain per
+FTS hit and scored all matching clones before LIMIT. It is now FTS postings
+first, seek through the existing winner index, then message metadata. Native
+newest-posting order requires no temporary score sort. The 50-ms deadline and
+candidate limits are unchanged; failed SQL is visible by closed SQLite code.
+
+The runtime reuses host auxiliary completion, the shared request overlay,
+execution source checks, final provider-body budget guard and post-settled
+body-free receipts. One query planner and, for nonempty candidates, one
+selection/summary call are added per new indexed turn. Each input retains the
+configured source token ceiling; both references share the configured bridge
+output ceiling. Hard retrieval ceilings are three 50-ms native queries / 64
+positions each, 24 whole groups / 2,048 rows / 4 MiB. Process admission remains
+32 MiB with 8-MiB per-turn reservation; these are serialized work budgets, not
+an absolute RSS promise. An incomplete model response or invalid ID cannot
+project; a changed source cannot authorize retirement or reuse. Recall-only
+post records `delivered_recall`; changed source after delivery records the
+delivery fact separately. Existing rolling checkpoint/CAS is unchanged.
+
+The keyword candidate ceiling deliberately remains native. Selection can
+handle salient entities/synonyms and uncertainty, but cannot recover a semantic
+match absent from native candidates. Date filters apply after bounded native
+top-k; this is not exhaustive temporal search. No embedding dependency, second
+archive, new memory-provider slot, full-history model summarization, or automatic
+retry recursion is added. This candidate is for source review and protected-copy
+qualification, not production deployment or natural relevance acceptance.
+The two recall calls share the existing configured auxiliary timeout. Shared
+byte/output capacity is checked before replacing a valid rolling plan, so an
+optional over-budget recall cannot discard that already valid bridge.

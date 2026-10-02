@@ -24,7 +24,8 @@ from hermes_state import SessionDB
 
 CASES = {"history_1x": (24, 0), "history_10x": (240, 0),
          "history_100x": (2400, 0), "clones_2000": (24, 2000),
-         "clones_20000": (24, 20000)}
+         "clones_20000": (24, 20000),
+         "streamed_image_16m": (24, 0), "streamed_image_64m": (24, 0)}
 
 
 def peak_kib():
@@ -50,6 +51,13 @@ def setup(root, case):
         names = ",".join('"'+column+'"' for column in columns)
         for _ in range(clones//2):
             connection.execute(f"INSERT INTO messages ({names}) SELECT {names} FROM messages WHERE id<=2")
+        if case.startswith("streamed_image_"):
+            size = (16 if case.endswith("16m") else 64)*1024*1024
+            content = "\x00json:" + json.dumps([
+                {"type": "text", "text": "Recorded diagram meaning: approved design"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A"*size}},
+            ])
+            connection.execute("UPDATE messages SET content=? WHERE id=?", (content, pairs*2-1))
         connection.commit()
 
 
@@ -60,6 +68,7 @@ def measure(root, case):
     store = ContinuityMetadataStore(root / "metadata.db")
     adapter = HermesSessionAdapter(db, store)
     llm = FakeLlm()
+    initial_peak = peak_kib()
     phases = {}
     vm_steps = 0
 
@@ -166,12 +175,19 @@ def measure(root, case):
             temp_schema_bytes = (connection.execute("PRAGMA temp.page_count").fetchone()[0]
                                  * connection.execute("PRAGMA temp.page_size").fetchone()[0])
         assert llm.calls == 1
+        if case.startswith("streamed_image_"):
+            # Includes SQLite pools/caches and the normal admitted worksets;
+            # the 64 MiB case distinguishes a full giant-value allocation.
+            assert peak_kib()-initial_peak < 32*1024, {
+                "measurement_peak_delta_kib": peak_kib()-initial_peak,
+                "initial_peak_kib": initial_peak, "peak_kib": peak_kib()}
         return {"case": case, "scope": "disposable SQLite/plugin chain; synthetic provider/transport",
                 "phases": phases, "summary_calls": llm.calls, "receipts": 2,
+                "recall_query_calls": llm.recall_queries,
                 "group_query_plan": plans, "host_query_plans": host_plans,
                 "temp_schema_bytes_at_end": temp_schema_bytes,
                 "temp_measurement_scope": "named temp schema only; transient files not a disk quota",
-                "peak_kib": peak_kib()}
+                "peak_kib": peak_kib(), "measurement_peak_delta_kib": peak_kib()-initial_peak}
     finally:
         adapter.close()
         db.close()
@@ -186,7 +202,10 @@ if __name__ == "__main__":
         if result is not None:
             print(json.dumps(result, sort_keys=True))
     else:
-        for case in CASES:
+        selected = ([case for case in CASES if case.startswith("streamed_image_")]
+                    if "--streamed-only" in sys.argv else
+                    [case for case in CASES if not case.startswith("streamed_image_")])
+        for case in selected:
             with tempfile.TemporaryDirectory(prefix="continuity-index-scale-") as directory:
                 for action in ("setup", "measure"):
                     result = subprocess.run(
