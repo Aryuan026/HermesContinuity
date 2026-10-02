@@ -537,3 +537,39 @@ accuracy or live QQ. Real discovery/manager unload-reload is independently
 covered by the synthetic 16-MiB/live-hole AIAgent test. No original database,
 production installation, enable, restart, source switch or .21.x update is
 part of this result. PR/source review and live canary remain later gates.
+
+### B4-GIANT-REWIND-01: actual-host source correction
+
+- owner_goal / current_phase: close the reviewed giant-value rewind write
+  defect in this Block 4 source candidate; retain question-recall positives.
+- accepted_checkpoint: Blocks 1–3 and the previously reviewed preparation,
+  provenance and image-policy contracts remain closed. `2fdc6ec` is the
+  reviewed HOLD source, not an accepted installation or selected rollback.
+- product_delta / real_consumer: the existing history preparation loop writes
+  a value proof only when its actual `hermes_history_members` parent exists.
+  Legal `(active,compacted)=(0,0)` rows remain durable, skip canonical indexing,
+  and advance the scan without a foreign-key failure; restoration remains live.
+- forbidden_surfaces / stop_condition: no FK disable, fabricated member,
+  message rewrite/deletion, budget change, recall redesign, original/copy DB
+  operation, Global Hot, donor, .21.x or target mutation. Publish the corrected
+  source/CI for external re-review; no merge/deployment/observation starts.
+
+Before the correction, the new actual-host subprocess matrix reproduces two
+`FOREIGN KEY constraint failed` exits: giant plain text and encoded multimodal
+rows rewound before their first preparation. Five positive controls pass.
+This is real `SessionDB`/stream verification/SQLite execution, not the review's
+small material/proof substitute. Each child has an external 90-second timeout.
+
+The correction uses INSERT-from-member in the same existing transaction.
+The seven cases then pass, including a second fresh interpreter, actual
+rollback invalidation/rebuild, restore and a subsequent indexed rewind/redo.
+They assert FK enforcement, original message fields, normal dialogue pairs,
+absence of parent/child rows for legal rewinds, reconstructed real raw hashes,
+and deferred canonical reads after restore. No parser or proof is mocked.
+
+The retained five-file host suite passes 118/118. Exported patch 19 reconstructs
+host tree `d212962d9c0a0a49000d1132fe9e5b68d739821a` after the unchanged eighteen
+artifacts. Whole product and successor public CI results are recorded
+separately in PROGRESS / the PR receipt; old exact-head Green is not substituted.
+No owner database or service was accessed in this correction. The earlier
+owner-copy recall results remain evidence at their original scope and identity.

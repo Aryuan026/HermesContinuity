@@ -94,7 +94,7 @@ each subsequent use verifies its compact proof against the canonical source.
 
 ### Question-selected recall (additive host patch 18)
 
-The eighteen-patch candidate also delivers an ephemeral historical reference
+The nineteen-patch candidate also delivers an ephemeral historical reference
 selected for the current question. It can cross an old live hole without
 retiring it. One bounded host auxiliary call extracts up to three keyword
 queries; Hermes native FTS/LIKE returns body-free positions, then up to 24
@@ -124,6 +124,10 @@ next turns plan afresh. Natural relevance and live latency still need a canary.
 Both recall auxiliary calls share `summary_timeout_seconds`, rather than each
 adding a fresh full timeout. A timeout cannot erase an already valid rolling
 bridge; it is visible in status and does not create a delivery receipt.
+Additive correction 19 keeps streamed-value proofs subordinate to real
+canonical members: a rewound giant row remains on disk but creates neither
+member nor child proof; restore/redo revalidates it normally. It does not
+change recall, checkpoint retirement, foreign keys or byte/time budgets.
 
 This is a **0.20.5 compatibility-lane source candidate**, not a deployed release
 or a requalification of the separate accepted 0.21.3 lane. Scope, test commands,
@@ -248,7 +252,7 @@ python -B -m unittest discover -s tests -v
 All committed fixtures are synthetic. Public GitHub Actions first replays the
 twelve baseline patches from pure upstream `fcbd1076`, installs that host and
 runs the overlay plus product suite on Python 3.11/3.12. Additive lanes apply
-patches 13–17 and then native-search patch 18, rerun retained contracts and
+patches 13–17, native-search patch 18 and lifecycle correction 19, rerun retained contracts and
 resource benchmarks, and exercise real `AIAgent.run_conversation` with question
 recall and the pinned Global Hot pair. Providers and auxiliary responses in
 this proof remain synthetic; it does not authorize production deployment.

@@ -375,3 +375,29 @@
   pin, install/enable/restart/merge or natural observation is changed. Review
   candidate and live-use acceptance remain separate. The requested donor
   reference Markdown follows actual reviewed deployment, not this source receipt.
+
+## 2026-10-02 — B4-GIANT-REWIND-01 source correction
+
+- External review of `2fdc6ec` keeps recall positives but reports one new P1:
+  streamed proof insertion follows a successful audit even when a legal rewind
+  creates no parent member. The candidate remains HOLD pending this increment's
+  independent re-review; Blocks 1–3 are not reopened.
+- Actual compatible-host red matrix: giant plain text and encoded multimodal
+  rewinds fail with SQLite FK errors, while five ordinary/active/compacted
+  controls pass. Patch 19 changes only that proof INSERT to select its actual
+  member in the same transaction. No exception suppression, fake parent,
+  canonical-row change, schema or budget expansion.
+- Seven real-host cases now pass, with an external timeout per child and two
+  separate interpreters: first-prepare rewind, reopen/rollback rebuild, raw
+  field preservation, original-byte hash verification, restore and a further
+  indexed rewind/redo. The retained host suite is 118/118; complete compatible
+  plugin suite is 314/314, including positive recall and real AIAgent delivery.
+- Fresh exported-patch replay reconstructs host tree
+  `d212962d9c0a0a49000d1132fe9e5b68d739821a` and independently passes the seven
+  new lifecycle cases. Host commit `964c65ab` directly follows `69baf5ef`.
+  First eighteen artifacts and all plugin production code remain unchanged.
+- Public successor CI is pending at commit time and is recorded separately in
+  the PR receipt. Read-only intent audit: PASS. No owner/copy database,
+  server, Global Hot, donor, .21.x, selected Assembly/rollback pin, merge,
+  install, enable, restart or observation is changed. Source/artifact candidate
+  identity changes only; selected runtime recovery truth is not promoted.

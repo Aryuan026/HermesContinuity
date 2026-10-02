@@ -55,6 +55,7 @@ The exported patch SHA-256 values, in application order, are:
 16. `a6c726f18cd7fdb49b95c2a843e6d2e90f0ea383f324be897a6aca00f7eb46cc`
 17. `60a6332287346b4ef217efd76fc16a297e3267a6bac2fcfbed605009d7e6f41e`
 18. `89d5866af9e8de1e4964f39721068e080523990f248f650044c58d2d5d26f2b4`
+19. `fe6a6c691d2a3dc0de4ee54dacc3dc8423e5514c681383d313a12ea783e60ecb`
 
 Patch 13 (`hermes-0.20.5-incremental-history.patch`) is the additive Block 3
 canonical journal/index seam. It is exported from compatibility-host commit
@@ -128,6 +129,20 @@ retirement. This new retrieval composition is not presented as an unchanged
 donor algorithm: donor compiler/checkpoint selection and CAS are retained;
 Hermes owns candidate search, and two bounded existing host auxiliary calls
 plan keywords and select/summarize candidates. No donor source is modified.
+
+Patch 19 (`hermes-0.20.5-history-value-member-lifecycle.patch`) is the narrow
+`B4-GIANT-REWIND-01` correction, exported from host commit
+`964c65abfe7b646dca284737e41f62c37d6324f6`, tree
+`d212962d9c0a0a49000d1132fe9e5b68d739821a`, directly after patch 18's
+`69baf5ef` materialization. The proof INSERT selects only the actual parent
+member inside the existing preparation transaction. A legally rewound row
+still advances the physical scan without creating a canonical member or
+child proof. Restore/redo remains journaled and revalidates the real bytes.
+Foreign keys, canonical rows, schema, budgets, compiler, checkpoints, CAS and
+recall are unchanged. Seven actual-host subprocess cases cover plain and
+encoded multimodal values, ordinary rewinds, active/compacted controls,
+fresh-process reopen, rollback invalidation, restore and indexed rewind/redo.
+The first eighteen artifacts remain byte-identical; this is not a deployment.
 
 ## Extraction matrix
 

@@ -107,9 +107,11 @@ jobs:
           path: ${{ runner.temp }}/history-streamed.jsonl
       - name: Apply bounded native-search seam
         run: git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-native-search.patch"
+      - name: Apply giant-value member lifecycle correction
+        run: git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-value-member-lifecycle.patch"
       - name: Verify native search and retained source/overlay contracts
         run: |
           cd "$RUNNER_TEMP/hermes"
-          python -B -m pytest -q tests/test_history_search.py tests/test_history_stream_values.py tests/test_hermes_state_history.py tests/test_request_overlay.py tests/test_middleware.py
+          HERMES_PYTHON="$(command -v python)" bash scripts/run_tests.sh --file-retries 0 tests/test_history_search.py tests/test_history_stream_values.py tests/test_hermes_state_history.py tests/test_request_overlay.py tests/test_middleware.py
       - name: Verify question recall and real-host delivery
         run: python -B -m unittest discover -s tests -v
