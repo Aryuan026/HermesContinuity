@@ -333,3 +333,45 @@
   owner agreement. Source-candidate PR/public CI, target qualification,
   deployment and 48–72h observation remain distinct. No live change, Global Hot
   algorithm change or .21.x adaptation occurs in this candidate.
+
+## 2026-10-02 — owner-approved bounded question recall candidate
+
+- Owner approved independent query recall after the preceding retirement
+  barrier; that earlier pending decision is now superseded, not a deletion or
+  relabeling of live groups. Patch 18 reuses native FTS/LIKE for bounded IDs.
+  Complete groups reuse the existing page/occurrence/fingerprint proof path;
+  donor compiler, checkpoint-v2/v3 and CAS are unchanged.
+- Existing auxiliary LLM completion plans up to three keywords and, for
+  nonempty admitted candidates, selects/summarizes complete relevant groups.
+  Recall is ephemeral; it shares the existing overlay/output/final-provider
+  budget, and post-settlement records IDs/hashes/counts only. Recall-only
+  delivery cannot publish or retire a checkpoint. Invalid selection, source
+  rewrite, late expansion, provider error and reload are covered.
+- The initial owner-copy attempt failed honestly at
+  `native_search_sqlite_interrupt`; no receipt was written. Query-plan probes
+  found domain-first FTS rescans and global clone scoring. Native newest
+  postings plus the existing winner index close that reproduced bottleneck
+  without increasing the 50-ms SQL deadline or creating another index store.
+- The same protected copy then returns 24 complete groups / 80 canonical rows /
+  365,198 admitted bytes in 0.065s. Two fresh runtimes deliver and settle with
+  two auxiliary calls each (0.109s / 0.085s synthetic chains), peak 50,584 KiB.
+  All fields of the existing v2 checkpoint and 94 receipts remain equal;
+  v3 checkpoint count remains zero. Earlier full preparation was 5,478 quanta /
+  256.758s, peak 121,008 KiB. These phases are separate: the final probe reuses
+  the prepared index but revalidates its real token. Models/providers/transport
+  are substitutes, not natural relevance, QQ latency or deployment evidence.
+- Final-source copy rerun admits the same 24 groups / 80 rows / 365,198 bytes
+  in 0.065s; two fresh synthetic runtime chains take 0.106s / 0.086s, peak
+  50,588 KiB. All fields of the then-existing 96 receipts (the original 94 plus
+  the first probe's two) and the nonempty v2 checkpoint remain equal. Two new
+  body-free recall receipts are appended only to that disposable copy.
+- Local retained product suite is 314/314 with the accepted old module enabled;
+  the final page-status preservation is also checked by 24/24 history-index tests;
+  exact host search/history/overlay suite is 111 plus 15 subtests. Real
+  AIAgent recall passes across a 16-MiB historical image, live hole, final-body
+  post-settlement, next-turn manager unload/reload and provider error. Public
+  successor results are pending at commit time; old c0 CI is not its evidence.
+- No original database, Global Hot, donor source, .21.x lane, selected Assembly
+  pin, install/enable/restart/merge or natural observation is changed. Review
+  candidate and live-use acceptance remain separate. The requested donor
+  reference Markdown follows actual reviewed deployment, not this source receipt.

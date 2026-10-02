@@ -501,3 +501,39 @@ not quarantined, deleted or silently relabeled. Public successor CI and
 external review remain separate from local evidence. No production deployment,
 natural provider/QQ call, merge or observation start is claimed; selected
 Assembly/rollback identities remain unchanged.
+
+### Owner-approved independent recall: protected-copy qualification
+
+The owner subsequently approved separating recall from retirement. The new
+path reads complete verified groups through native bounded search, without
+changing the old live holes or checkpoint retirement cursor. The initial
+protected-copy attempt reached ready at 5,478 quanta / 256.758s, peak RSS
+121,008 KiB, then failed with `native_search_sqlite_interrupt`; no delivery was
+recorded. That failure remains evidence, not a successful run.
+
+Body-free native query-plan probes showed domain-first repeated FTS lookups
+and a global physical-clone BM25 sort. A FTS-posting-first winner seek with
+native newest-posting order removes the repeated scan and temporary score
+sort. It uses the existing `idx_hermes_history_buckets_winner`, no new table,
+writer, repair pass, increased deadline or full-body decode. SQL error class
+is now visible rather than confused with empty relevance.
+
+On the same already prepared consistent copy, ordinary source/proof validation
+plus search returns **24 complete groups / 80 canonical rows / 365,198 admitted
+bytes in 0.065s**, with `retirement_authority=false`. The rolling reader still
+honestly returns `foreground_group_limit_exceeded`. Two fresh request runtimes
+then deliver and settle selected context with two auxiliary calls each,
+0.109s / 0.085s for the synthetic chains, peak process RSS 50,584 KiB. Their
+body-free outcomes are `delivered_recall`; no v3 checkpoint is published.
+All fields of the existing nonempty v2 checkpoint and the first 94 delivery
+receipts remain equal before/after; two recall receipts are appended only in
+this disposable plugin store. The preparation peak and foreground peak come
+from separate processes, not one shared service-RSS measurement.
+
+The auxiliary planner/selector and foreground provider/transport are
+substitutes. This proves real owner-copy search/hydration plus synthetic
+projection/post settlement and fresh-runtime reuse, not natural semantic
+accuracy or live QQ. Real discovery/manager unload-reload is independently
+covered by the synthetic 16-MiB/live-hole AIAgent test. No original database,
+production installation, enable, restart, source switch or .21.x update is
+part of this result. PR/source review and live canary remain later gates.

@@ -134,6 +134,7 @@ def measure(directory, case):
             "peak_kib": peak, "peak_growth_kib": peak-start_rss,
             "total_seconds": time.perf_counter()-started, "phases": phases,
             "projected_rounds": sum(r["projected"] for r in rounds), "summary_calls": llm.calls,
+            "recall_query_calls": llm.recall_queries,
             "receipt_count": status["receipt_count"], "checkpoint": status["checkpoint"],
             "reasons": [r["runtime"]["reason_counts"] for r in rounds]}
 

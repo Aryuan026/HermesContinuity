@@ -54,6 +54,7 @@ The exported patch SHA-256 values, in application order, are:
 15. `77aa8db643df87618413ec3c86333790ef53dc219fa8d70b82d2b797c880f0c5`
 16. `a6c726f18cd7fdb49b95c2a843e6d2e90f0ea383f324be897a6aca00f7eb46cc`
 17. `60a6332287346b4ef217efd76fc16a297e3267a6bac2fcfbed605009d7e6f41e`
+18. `89d5866af9e8de1e4964f39721068e080523990f248f650044c58d2d5d26f2b4`
 
 Patch 13 (`hermes-0.20.5-incremental-history.patch`) is the additive Block 3
 canonical journal/index seam. It is exported from compatibility-host commit
@@ -109,6 +110,24 @@ The first sixteen exported artifacts remain byte-identical. Plugin adaptation
 uses actual complete content hashes for identity and private descriptor sizes
 only for admission; historical image pixels remain excluded only from summary
 input. This is not a port to 0.21.x or a selected production artifact.
+
+Patch 18 (`hermes-0.20.5-history-native-search.patch`) is exported from
+`69baf5efd01de0b375cf58c37c8da668fba15677`, tree
+`013ab213b91836df2cb9d2bf3854e2aea625520c`. The single exported diff spans
+the generic seam, deterministic fixture, and owner-copy query-plan correction after patch
+17's local materialization; it does not rewrite either local commit.
+It reuses Hermes native search routing/grammar and returns
+only bounded canonical positions under a verified domain token and SQL deadline.
+It does not return snippets, decode neighboring bodies, repair FTS, create a
+search store or register a tool. Native newest-posting order and the existing
+winner index avoid domain-first rescans and global clone BM25 scoring. The
+first seventeen artifacts are unchanged.
+The owner-approved plugin adaptation selects complete verified groups for an
+ephemeral question-driven request reference, independently of checkpoint
+retirement. This new retrieval composition is not presented as an unchanged
+donor algorithm: donor compiler/checkpoint selection and CAS are retained;
+Hermes owns candidate search, and two bounded existing host auxiliary calls
+plan keywords and select/summarize candidates. No donor source is modified.
 
 ## Extraction matrix
 

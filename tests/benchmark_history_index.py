@@ -183,6 +183,7 @@ def measure(root, case):
                 "initial_peak_kib": initial_peak, "peak_kib": peak_kib()}
         return {"case": case, "scope": "disposable SQLite/plugin chain; synthetic provider/transport",
                 "phases": phases, "summary_calls": llm.calls, "receipts": 2,
+                "recall_query_calls": llm.recall_queries,
                 "group_query_plan": plans, "host_query_plans": host_plans,
                 "temp_schema_bytes_at_end": temp_schema_bytes,
                 "temp_measurement_scope": "named temp schema only; transient files not a disk quota",

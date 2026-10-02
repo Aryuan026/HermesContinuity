@@ -194,6 +194,12 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
         self.tempdir.cleanup()
 
     async def _summary_complete(self, _plugin_llm, messages, **_kwargs):
+        if _kwargs.get("purpose") == "thread_continuity_recall_query":
+            marker = SUMMARY_MARKER.search(repr(messages)).group(0)
+            return PluginLlmCompleteResult(
+                text=json.dumps({"queries": [], "start_at": None, "end_at": None})+"\n"+marker,
+                provider="long-history-provider", model="long-history-summary-model",
+                agent_id="default", usage=None, finish_reason="stop")
         self.summary_calls += 1
         rendered = "\n".join(str(row.get("content") or "") for row in messages)
         self.assertNotIn("data:image/", rendered)

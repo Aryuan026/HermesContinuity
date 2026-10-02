@@ -213,10 +213,15 @@ class FakeLlm:
         self.result = result or LlmResult()
         self.include_completion_marker = include_completion_marker
         self.calls = 0
+        self.recall_queries = 0
 
     async def acomplete(self, messages, **kwargs):
-        self.calls += 1
-        text = self.result.text
+        if kwargs.get("purpose") == "thread_continuity_recall_query":
+            self.recall_queries += 1
+            text = json.dumps({"queries": [], "start_at": None, "end_at": None})
+        else:
+            self.calls += 1
+            text = self.result.text
         if self.include_completion_marker:
             marker = next(
                 str(row.get("content") or "").splitlines()[-1]

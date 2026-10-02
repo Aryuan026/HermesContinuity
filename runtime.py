@@ -13,10 +13,11 @@ import copy
 import hashlib
 import inspect
 import json
+import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
@@ -383,6 +384,9 @@ class _TurnPlan:
     provider_key: tuple[str, str, str] = ("", "", "")
     publish_status: str = ""
     source_checkpoint: dict[str, Any] | None = None
+    recall_proof: dict[str, Any] | None = None
+    recall_status: str = ""
+    recall_reason: str = ""
     workset_bytes: int = 0
     created_at: float = 0.0
 
@@ -586,7 +590,7 @@ class ContinuityRuntime:
             summary_messages,
             max_tokens=int(descriptor.get("max_output_tokens") or 0),
             timeout=self.summary_timeout_seconds,
-            purpose="thread_continuity_summary",
+            purpose=str(descriptor.get("purpose") or "thread_continuity_summary"),
         )
         finish_reason = getattr(result, "finish_reason", None)
         raw_text = str(getattr(result, "text", "") or "")
@@ -703,10 +707,20 @@ class ContinuityRuntime:
                 source.get("status") != "ready"
                 or source.get("scan_complete") is not True
             ):
-                return _TurnPlan(
+                plan = _TurnPlan(
                     current_sha,
                     reason=str(source.get("error") or "source_unavailable"),
                 )
+                if indexed and plan.reason == "foreground_group_limit_exceeded":
+                    plan.context_window_tokens = window
+                    plan.usable_context_window_tokens = usable_window
+                    plan.context_window_source = source_label
+                    plan.context_window_confidence = confidence_label
+                    plan.reserved_output_tokens = reserve
+                    plan.provider_key = (model, provider, base_url)
+                    return self._add_recall(plan, session_id=session_id, query=current_text,
+                                            reference_at=reference_at)
+                return plan
             compacted_ids = list(
                 dict(source.get("stats") or {}).get(
                     "compacted_prefix_group_ids"
@@ -785,7 +799,7 @@ class ContinuityRuntime:
             for value in list(bridge.get("represented_source_group_ids") or [])
             if str(value)
         )
-        return _TurnPlan(
+        plan = _TurnPlan(
             current_sha256=current_sha,
             marker=marker,
             bridge_body=bridge_body,
@@ -805,6 +819,68 @@ class ContinuityRuntime:
             workset_bytes=(len(_json_text(bundle).encode("utf-8"))
                            if indexed else 0),
         )
+        return (self._add_recall(plan, session_id=session_id, query=current_text,
+                                 reference_at=reference_at) if indexed else plan)
+
+    def _add_recall(self, plan, *, session_id, query, reference_at):
+        index = self.adapter.history_index
+        if not callable(getattr(getattr(index, "db", None), "search_history_matches", None)):
+            plan.recall_status = "unavailable"
+            plan.recall_reason = "bounded_native_search_missing"
+            return plan
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            return plan
+        from .recall import build_recall
+        existing = plan.bridge_body.removesuffix("\n" + CONTINUITY_END_BOUNDARY)
+        available = self.output_token_limit - self.estimator(
+            [{"role": "user", "content": existing}]) if existing else self.output_token_limit
+        try:
+            recall = asyncio.run(asyncio.wait_for(build_recall(
+                index, self._summary_call, session_id=session_id, query=query,
+                reference_at=reference_at, estimate_messages=self.estimator,
+                source_token_limit=self.source_token_limit, output_token_limit=available),
+                timeout=self.summary_timeout_seconds))
+            if recall is None:
+                plan.recall_status = "empty"
+                return plan
+            body = "\n\n".join(part for part in (existing, recall["body"]) if part)
+            if self.estimator([{"role": "user", "content": body}]) > self.output_token_limit:
+                plan.recall_status = "over_budget"
+                return plan
+            body += "\n" + CONTINUITY_END_BOUNDARY
+            if len(body) > self.max_projection_chars:
+                plan.recall_status = "over_budget"
+                return plan
+            proof = recall["source_proof"]
+            marker = (f"{CONTINUITY_MARKER_NAMESPACE} "
+                           f"source_snapshot={plan.expected_source_snapshot or _sha256(proof)} "
+                           f"recall_source={_sha256(proof)} "
+                           f"bridge_sha256={hashlib.sha256(body.encode('utf-8')).hexdigest()}]")
+            recall_only = plan.reason == "foreground_group_limit_exceeded"
+            combined = replace(plan, recall_proof=proof, recall_status="selected",
+                bridge_body=body, marker=marker,
+                source_ids=tuple(dict.fromkeys((*plan.source_ids, *recall["source_ids"]))),
+                workset_bytes=plan.workset_bytes+recall["workset_bytes"],
+                reason="" if recall_only else plan.reason,
+                expected_source_snapshot=_sha256(proof) if recall_only else plan.expected_source_snapshot)
+            if combined.workset_bytes+combined.serialized_bytes() > 8*1024*1024:
+                plan.recall_status = "over_budget"
+                plan.recall_reason = "recall_shared_workset_budget"
+                return plan
+            return combined
+        except Exception as error:
+            # A failed auxiliary recall cannot invalidate an already valid
+            # rolling bridge. It grants no checkpoint or receipt authority.
+            plan.recall_status = "failed"
+            code = str(error)
+            plan.recall_reason = ("recall_auxiliary_timeout" if isinstance(error, TimeoutError)
+                                  else code if re.fullmatch(r"recall_[a-z_]+", code)
+                                  else "recall_auxiliary_failed")
+            return plan
 
     def _plan_for_request(
         self,
@@ -844,6 +920,12 @@ class ContinuityRuntime:
                             existing.source_checkpoint, session_id=session_id)
                     except Exception:
                         return _TurnPlan(current_sha, reason="cached_source_proof_changed")
+                if existing.recall_proof is not None:
+                    try:
+                        self.adapter.history_index.validate_recall(existing.recall_proof, session_id=session_id)
+                    except Exception:
+                        return _TurnPlan(current_sha, reason="cached_recall_source_changed")
+                if existing.source_checkpoint is not None or existing.recall_proof is not None:
                     if not ACTIVE_WORKSETS.acquire(self._budget_key(turn_key), existing.workset_bytes):
                         return _TurnPlan(current_sha, reason="workset_capacity_exceeded")
                     COLD_PLANS.release(self._budget_key(turn_key))
@@ -1310,6 +1392,11 @@ class ContinuityRuntime:
                 )
             )
         )
+        if transport_ready and plan.recall_proof is not None:
+            try:
+                self.adapter.history_index.validate_recall(plan.recall_proof, session_id=attempt_key[0])
+            except Exception:
+                transport_ready = False
         if not transport_ready:
             native_request = (
                 self._native_request(request, projection)
@@ -1424,15 +1511,16 @@ class ContinuityRuntime:
         receipt_id = "hcr_" + _sha256(
             [*attempt_key, stage.attempt_seq, stage.request_sha256]
         )
+        hashes = {
+            "request_sha256": stage.request_sha256,
+            "bridge_body_sha256": hashlib.sha256(plan.bridge_body.encode("utf-8")).hexdigest(),
+            "source_snapshot": plan.expected_source_snapshot,
+        }
+        if plan.recall_proof is not None:
+            hashes["recall_source_sha256"] = _sha256(plan.recall_proof)
         return (
             receipt_id,
-            {
-                "request_sha256": stage.request_sha256,
-                "bridge_body_sha256": hashlib.sha256(
-                    plan.bridge_body.encode("utf-8")
-                ).hexdigest(),
-                "source_snapshot": plan.expected_source_snapshot,
-            },
+            hashes,
             {"represented_source_group_count": len(plan.source_ids)},
         )
 
@@ -1502,6 +1590,16 @@ class ContinuityRuntime:
             transport_verified = False
         if not transport_verified:
             return None
+
+        if plan.recall_proof is not None:
+            try:
+                self.adapter.history_index.validate_recall(plan.recall_proof, session_id=attempt_key[0])
+            except Exception:
+                self._record_receipt(attempt_key, stage, plan, "delivered_recall_source_changed")
+                return None
+            if plan.checkpoint_candidate is None and plan.source_checkpoint is None:
+                self._record_receipt(attempt_key, stage, plan, "delivered_recall")
+                return None
 
         candidate = plan.checkpoint_candidate
         cached = ""
@@ -1648,9 +1746,15 @@ class ContinuityRuntime:
                 if not session_filter or turn_key[0] == session_filter
             ]
             reason_counts: dict[str, int] = {}
+            recall_counts: dict[str, int] = {}
+            recall_reasons: dict[str, int] = {}
             for _turn_key, plan in plans:
                 if plan.reason:
                     reason_counts[plan.reason] = reason_counts.get(plan.reason, 0) + 1
+                if plan.recall_status:
+                    recall_counts[plan.recall_status] = recall_counts.get(plan.recall_status, 0) + 1
+                if plan.recall_reason:
+                    recall_reasons[plan.recall_reason] = recall_reasons.get(plan.recall_reason, 0) + 1
             context_source_counts: dict[str, int] = {}
             context_confidence_counts: dict[str, int] = {}
             for _turn_key, plan in plans:
@@ -1690,6 +1794,8 @@ class ContinuityRuntime:
                     for status in ("applied", "stored_unvalidated", "conflict", "failed", "in_progress")
                 },
                 "reason_counts": reason_counts,
+                "recall_status_counts": recall_counts,
+                "recall_reason_counts": recall_reasons,
                 "context_window_source_counts": context_source_counts,
                 "context_window_confidence_counts": context_confidence_counts,
                 "final_provider_estimate": {
