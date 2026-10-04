@@ -495,7 +495,7 @@
 
 - The owner requested investigation/repair of the separately recorded
   `checkpoint_index_pending` replay failure. Current main is `284ff1f2`, with
-  the same production tree as the accepted/installed `d549c95a`; this is source
+  the same production code as the accepted/installed `d549c95a`; this is source
   maintenance, not deployment or an upstream-version transition.
 - A deterministic real-SQLite regression reproduces a false publication
   conflict: the host audits a physical API-sidecar edit on a trailing incomplete
@@ -518,3 +518,8 @@
   already-bounded host/group/preparation diagnostics instead of status alone.
   The independent 50-ms streamed-value test assumption remains separately
   recorded and untouched. No natural relevance/stability claim is added.
+- Final workflow-order discovery with the exact paired Global Hot executes
+  315 tests, 314 pass / 1 existing conditional skip. An alternate hand-selected
+  module order first hit PyYAML constructor/config pollution (one failure and
+  one registration error); it is retained as a failed harness selection, not
+  counted as product Green or repaired by changing production YAML handling.
