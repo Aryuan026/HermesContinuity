@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Mapping, Sequence
 from .context_compactor import (
     _content_hash,
     _content_to_text,
+    HistoryValue,
     normalize_complete_thread_groups,
     normalize_thread_continuity_checkpoint,
 )
@@ -101,6 +102,12 @@ class _ProjectionError(ValueError):
     pass
 
 
+def _history_footprint(value: Any) -> Any:
+    if isinstance(value, HistoryValue):
+        return value.footprint()
+    raise TypeError("source_row_not_json")
+
+
 def _json_text(value: Any) -> str:
     try:
         return json.dumps(
@@ -108,6 +115,7 @@ def _json_text(value: Any) -> str:
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+            default=_history_footprint,
         )
     except (TypeError, ValueError) as exc:
         raise _ProjectionError("source_row_not_json") from exc
@@ -532,7 +540,12 @@ def _project_canonical_source(
                     "ambiguous", "consecutive_user_content_unmergeable"
                 )
             evidence = _source_evidence(pending_users[-1])
-            if any(_source_evidence(pending) != evidence for pending in pending_users):
+            # Continuity retains the whole dialogue without granting a source
+            # class. The separate typed Global Hot window still requires one
+            # consistent provenance for every merged user row.
+            if include_lineage_proofs and any(
+                _source_evidence(pending) != evidence for pending in pending_users
+            ):
                 return _failed_source("ambiguous", "source_evidence_ambiguous")
             user_hash = _content_hash(user_content)
             group_kind = "dialogue_turn"

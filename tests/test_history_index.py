@@ -53,6 +53,41 @@ class HistoryIndexTests(unittest.TestCase):
             self.assertEqual(result["status"], "progress", result)
         self.fail("history preparation did not finish within bounded work steps")
 
+    def test_evidenced_notification_clone_remains_in_complete_dialogue(self):
+        self.writer.append_message("session-1", "user", "notification", timestamp=1787961600,
+                                   display_kind="internal_notification")
+        missing = dict(self.writer.get_messages("session-1")[0], display_kind=None)
+        self.writer.archive_and_compact("session-1", [missing])
+        self.writer.archive_and_compact("session-1", [missing])
+        self.writer.append_message("session-1", "assistant", "reply", timestamp=1787961601)
+        before = [tuple(row) for row in self.writer._conn.execute("SELECT * FROM messages ORDER BY id")]
+        self.prepare()
+        source = self.adapter.read_source("session-1", reference_at="2026-08-30T00:00:00+00:00")
+        self.assertEqual(source["status"], "ready", source)
+        self.assertEqual(source["source_proof"]["group_count"], 1)
+        self.assertEqual([message["content"] for message in source["groups"][0]["messages"]],
+                         ["notification", "reply"])
+        self.assertEqual([tuple(row) for row in self.writer._conn.execute("SELECT * FROM messages ORDER BY id")], before)
+
+    def test_mixed_user_provenance_retains_dialogue_without_granting_hot_authority(self):
+        self.writer.append_message("session-1", "user", "system notice", timestamp=1787961600,
+                                   display_kind="internal_notification")
+        self.writer.append_message("session-1", "user", "human reply", timestamp=1787961601)
+        self.writer.append_message("session-1", "assistant", "answer", timestamp=1787961602)
+        before = [tuple(row) for row in self.writer._conn.execute("SELECT * FROM messages ORDER BY id")]
+        self.prepare()
+        source = self.adapter.read_source("session-1", reference_at="2026-08-30T00:00:00+00:00")
+        self.assertEqual(source["status"], "ready", source)
+        self.assertEqual(source["groups"][0]["messages"][0]["content"], "system notice\n\nhuman reply")
+        from test_hermes_adapter import PACKAGE
+        import importlib
+        adapter = importlib.import_module(f"{PACKAGE}.hermes_adapter")
+        classified = adapter._project_canonical_source(
+            "session-1", self.writer.get_messages("session-1"), full_prefix=True,
+            include_lineage_proofs=True)
+        self.assertEqual(classified["error"], "source_evidence_ambiguous")
+        self.assertEqual([tuple(row) for row in self.writer._conn.execute("SELECT * FROM messages ORDER BY id")], before)
+
     def test_more_than_2048_rows_has_compact_proof_and_bounded_suffix(self):
         self.seed(1200)
         self.prepare()
@@ -70,6 +105,50 @@ class HistoryIndexTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM continuity_group_index").fetchone()[0], 1200)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(continuity_group_index)")}
             self.assertFalse(columns & {"content", "body", "messages", "transcript"})
+
+    def test_old_live_hole_cannot_silently_grant_retirement_to_later_compacted_groups(self):
+        self.seed(1200)
+        self.writer._execute_write(lambda connection: connection.execute(
+            "UPDATE messages SET active=1,compacted=0 WHERE id IN "
+            "(SELECT id FROM messages ORDER BY id LIMIT 2 OFFSET 20)"))
+        self.prepare()
+        source = self.adapter.read_source("session-1", reference_at="2026-08-30T00:00:00+00:00")
+        self.assertEqual(source["status"], "overflow")
+        self.assertEqual(source["error"], "foreground_group_limit_exceeded")
+        with closing(self.store._connect()) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM continuity_group_index").fetchone()[0], 1200)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM continuity_checkpoints_v3").fetchone()[0], 0)
+        self.assertEqual(self.writer._conn.execute("SELECT COUNT(*) FROM messages WHERE active=1").fetchone()[0], 2)
+
+    @unittest.skipUnless(SessionDB and hasattr(SessionDB, "search_history_matches"),
+                         "requires bounded native history search")
+    def test_question_recall_crosses_live_hole_without_retiring_or_copying_history(self):
+        self.seed(1200)
+        self.writer._execute_write(lambda connection: connection.execute(
+            "UPDATE messages SET active=1,compacted=0 WHERE id IN "
+            "(SELECT id FROM messages ORDER BY id LIMIT 2 OFFSET 20)"))
+        self.writer.append_message("session-1", "user", "之前讨论过樱桃项目的预算吗？", timestamp=1787965000)
+        self.writer.append_message("session-1", "assistant", "樱桃项目预算为12万元，待确认。", timestamp=1787965001)
+        self.writer.create_session("other", "cli")
+        self.writer.append_message("other", "user", "樱桃项目另一个profile或session的答案", timestamp=1787965000)
+        before = [tuple(row) for row in self.writer._conn.execute("SELECT * FROM messages ORDER BY id")]
+        self.prepare()
+        source = self.adapter.read_source("session-1", reference_at="2026-08-30T00:00:00+00:00")
+        self.assertEqual(source["error"], "foreground_group_limit_exceeded")
+        recalled = self.adapter.history_index.read_recall("session-1", ["樱桃项目"])
+        self.assertEqual(recalled["status"], "ready", recalled)
+        self.assertEqual(len(recalled["groups"]), 1, recalled)
+        self.assertEqual([row["content"] for row in recalled["groups"][0]["messages"]],
+                         ["之前讨论过樱桃项目的预算吗？", "樱桃项目预算为12万元，待确认。"])
+        self.assertFalse(recalled["stats"]["retirement_authority"])
+        self.assertEqual(self.adapter.history_index.read_recall("session-1", ["unknown-entity"])["groups"], [])
+        with closing(self.store._connect()) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM continuity_checkpoints_v3").fetchone()[0], 0)
+        self.assertEqual([tuple(row) for row in self.writer._conn.execute("SELECT * FROM messages ORDER BY id")], before)
+        self.writer._execute_write(lambda connection: connection.execute(
+            "UPDATE messages SET content='changed' WHERE session_id='session-1' AND content LIKE '樱桃项目%'"))
+        with self.assertRaisesRegex(ValueError, "recall_source_changed"):
+            self.adapter.history_index.validate_recall(recalled["source_proof"], session_id="session-1")
 
     def test_pending_user_then_assistant_preserves_full_group(self):
         self.seed(2)

@@ -62,8 +62,28 @@ The additive `hermes-0.20.5-incremental-history.patch` enables body-free host
 change capture/canonical indexing and compact checkpoint v3. It applies after
 the original twelve patches, followed by `hermes-0.20.5-history-value-guard.patch`
 to bound SQLite value materialization during probes and reads. The original
-thirteen artifacts are unchanged. Without the indexed host seam the
+fourteen artifacts are unchanged by the additional Block 4
+`hermes-0.20.5-history-quantum-progress.patch`: it closes preparation pages
+between complete rows with time reserved for cursor publication, retaining
+the original SQL deadline, row/byte ceilings and proof rules. Without the indexed host seam the
 accepted Block 1/v2 protection remains active.
+
+`hermes-0.20.5-history-origin-recovery.patch` additionally preserves producer
+tags in Gateway replay and recovers a proven lost notification tag in indexed
+clone views. It does not discard dialogue groups, rewrite canonical rows or
+infer human origin from text. All other signature conflicts remain errors;
+old index proofs are revalidated under canonical rule v2. This indexed repair
+does not relax the separate legacy/recent-window reader used by Global Hot.
+
+The additional `hermes-0.20.5-history-streamed-values.patch` permits giant
+stored values to be verified in 64-KiB chunks without loading their full
+body. Complete identity hashes and checksummed range descriptors stay private;
+foreground fragments revalidate their source before reading. The 4-MiB page
+and complete-group limits remain. Recorded image meanings enter the bridge,
+not historical pixels. Giant text still requires bounded fragments and may
+explicitly exceed the current summary workset; this is not unlimited decoding.
+Canonical rule v3 rebuilds derived proofs, not canonical messages. This source
+candidate still requires target qualification and review before deployment.
 
 One background worker validates history in finite pages without calling a
 model. The foreground reads only a bounded recent complete-group window;
@@ -71,6 +91,43 @@ index completion does not summarize all history or grant retirement authority.
 V3 uses a separate table in the same plugin database, preserving v2 rows and
 receipts. Successful post-delivery CAS means `stored_unvalidated`, not reusable:
 each subsequent use verifies its compact proof against the canonical source.
+
+### Question-selected recall (additive host patch 18)
+
+The nineteen-patch candidate also delivers an ephemeral historical reference
+selected for the current question. It can cross an old live hole without
+retiring it. One bounded host auxiliary call extracts up to three keyword
+queries; Hermes native FTS/LIKE returns body-free positions, then up to 24
+complete verified groups are hydrated within 2,048 rows / 4 MiB. A second
+bounded call selects relevant groups and summarizes only admitted material.
+The recall shares the 2,048-token overlay output ceiling with any rolling
+bridge, and the existing final-provider budget guard remains authoritative.
+Auxiliary input is bounded by `source_token_limit`; each native query has a
+50-ms SQL progress deadline and at most 64 hits. These are work limits, not
+exact tokenizer or hard I/O wall-clock guarantees.
+FTS candidates use native newest-posting order rather than scoring every
+matching physical clone; relevance is decided over the admitted complete groups.
+
+This is automatic question-driven **selection and semantic delivery**, not
+merely permission to use a search tool. It is not embedding similarity search
+or a promise to find every paraphrase: native keyword candidates remain the
+retrieval ceiling; optional date filtering applies to those bounded candidates.
+There is no transcript copy, new search tool, background whole-history summary
+or persisted recall body. Selected source IDs/hashes are recorded only after
+verified post-settlement. Recall-only delivery never CASes a checkpoint or
+advances retirement. Empty, unproven, failed or over-budget recall leaves the
+native request / valid rolling bridge intact. `/continuity-status` distinguishes
+`selected`, `empty`, `failed`, and a missing search seam. Planning adds one
+bounded auxiliary call per new indexed turn; nonempty candidates can add a
+second, besides any existing rolling summary. Retries reuse the frozen plan;
+next turns plan afresh. Natural relevance and live latency still need a canary.
+Both recall auxiliary calls share `summary_timeout_seconds`, rather than each
+adding a fresh full timeout. A timeout cannot erase an already valid rolling
+bridge; it is visible in status and does not create a delivery receipt.
+Additive correction 19 keeps streamed-value proofs subordinate to real
+canonical members: a rewound giant row remains on disk but creates neither
+member nor child proof; restore/redo revalidates it normally. It does not
+change recall, checkpoint retirement, foreign keys or byte/time budgets.
 
 This is a **0.20.5 compatibility-lane source candidate**, not a deployed release
 or a requalification of the separate accepted 0.21.3 lane. Scope, test commands,
@@ -192,23 +249,22 @@ HERMES_SOURCE_ROOT=/path/to/hermes \
 python -B -m unittest discover -s tests -v
 ```
 
-All committed fixtures are synthetic. Public GitHub Actions replays all twelve
-patches from pure upstream `fcbd1076`, installs that materialized host, exports
-`HERMES_SOURCE_ROOT`, runs the shared-overlay host tests, and then runs the
-plugin's Python 3.11/3.12 suite with its real-host tests enabled. The
-dual-plugin `AIAgent.run_conversation` entrypoint still requires a Global Hot
-tree and is exercised by Global Hot's paired workflow rather than this
-single-repository workflow.
+All committed fixtures are synthetic. Public GitHub Actions first replays the
+twelve baseline patches from pure upstream `fcbd1076`, installs that host and
+runs the overlay plus product suite on Python 3.11/3.12. Additive lanes apply
+patches 13–17, native-search patch 18 and lifecycle correction 19, rerun retained contracts and
+resource benchmarks, and exercise real `AIAgent.run_conversation` with question
+recall and the pinned Global Hot pair. Providers and auxiliary responses in
+this proof remain synthetic; it does not authorize production deployment.
 
 ## Current status
 
-The first public replacement candidate received external review. Its
-source-policy findings are incorporated in this next exact-revision candidate.
-The current v2 source/checkpoint path still performs work and stores proof
-material proportional to full session history; formal use on a long-lived
-profile remains blocked until a stable host prefix-proof seam and compact
-checkpoint v3 exist. The plugin is not installed, enabled, deployed, or
-observed in a live conversation; see [`PROGRESS.md`](PROGRESS.md).
+Blocks 1–3 are source-accepted. The additive streamed-value and question-recall
+candidate extends Block 4 target qualification: the former crosses giant
+canonical values, the latter can quote verified relevant groups without
+claiming retirement past live holes. The original twelve-patch v2 path remains
+full-history-proportional. This current candidate has not been installed,
+enabled, deployed or naturally observed; see [`PROGRESS.md`](PROGRESS.md).
 
 The extraction lineage and deliberate omissions are recorded in
 [`PROVENANCE.md`](PROVENANCE.md). Security and privacy boundaries are in

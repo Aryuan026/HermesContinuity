@@ -431,6 +431,125 @@ class ContinuityHistoryIndex:
                 if time.monotonic() >= deadline:
                     return result
 
+    def _hydrate_groups(self, connection, session_id, target, records, max_rows, max_bytes):
+        """Hydrate complete indexed groups; the same proof checks serve both paths."""
+        rows, entries, actual_bytes = [], [], 0
+        position = records[0]["start_position"]-1 if records else 0
+        start_position = position
+        end_position = records[-1]["end_position"] if records else position
+        while position < end_position:
+            page = self._page(session_id, target, position,
+                              min(256, end_position-position, max_rows-len(rows)),
+                              max_bytes-actual_bytes)
+            if page.get("status") not in {"ready", "valid"} or not page.get("rows"):
+                raise ValueError("history_page_unavailable")
+            rows.extend(page["rows"])
+            entries.extend(page["entries"])
+            actual_bytes += page["stored_bytes"]
+            position = entries[-1]["position"]
+        projected = _project_canonical_source(
+            session_id, rows, full_prefix=False,
+            identity_occurrences=_Occurrences(connection, session_id, "message", start_position),
+            group_occurrences=_Occurrences(connection, session_id, "group", start_position),
+            prior_group_count=records[0]["ordinal"]-1 if records else 0,
+            include_group_boundaries=True,
+        )
+        if projected.get("status") != "ready" or len(projected["groups"]) != len(records):
+            raise ValueError("group_index_projection_mismatch")
+        for group, record in zip(projected["groups"], records):
+            if group["source_prefix_id"] != record["group_id"] or _group_fingerprint(group) != record["fingerprint"]:
+                raise ValueError("group_index_projection_mismatch")
+        return projected["groups"], len(rows), actual_bytes
+
+    def read_recall(self, session_id, queries, *, max_groups=24, max_rows=2048,
+                    max_bytes=4*1024*1024, start_at=None, end_at=None):
+        """Question-selected complete groups, never retirement eligibility."""
+        from .hermes_adapter import _failed_source
+        search = getattr(self.db, "search_history_matches", None)
+        if not callable(search):
+            return _failed_source("unavailable", "bounded_native_search_missing")
+        if (not isinstance(queries, list) or not 1 <= len(queries) <= 3
+                or any(not isinstance(q, str) or not 1 <= len(q) <= 80 for q in queries)):
+            raise ValueError("recall_queries_invalid")
+        if any(type(value) is not int or not 1 <= value <= limit for value, limit in
+               ((max_groups, 24), (max_rows, 2048), (max_bytes, 4*1024*1024))):
+            raise ValueError("recall_workset_budget_invalid")
+        start = datetime.fromisoformat(start_at) if start_at else None
+        end = datetime.fromisoformat(end_at) if end_at else None
+        with closing(self.store._connect()) as connection:
+            connection.execute("BEGIN")
+            progress = connection.execute(
+                "SELECT * FROM continuity_group_progress WHERE session_id=?", (session_id,)
+            ).fetchone()
+            if progress is None or not progress["ready"] or progress["invalid_from"] is not None:
+                self.request(session_id)
+                return _failed_source("pending", "history_preparation_pending")
+            target = self._prefix(json.loads(progress["head_json"]), json.loads(progress["prefix_json"]))
+            validation = self.db.validate_history_prefix(target)
+            if validation.get("status") != "valid" or validation.get("invalidated_from_position"):
+                self.request(session_id)
+                return _failed_source("pending", "history_source_changed")
+            ranked = {}
+            records = {}
+            for query in queries:
+                hits = search(session_id, target=target, query=query, max_matches=64, deadline_ms=50)
+                if hits.get("status") != "ready":
+                    return _failed_source("unavailable", str(hits.get("reason") or "recall_search_unavailable"))
+                seen = set()
+                for rank, position in enumerate(hits["matches"], 1):
+                    record = connection.execute(
+                        "SELECT * FROM continuity_group_index WHERE session_id=? AND end_position>=? "
+                        "ORDER BY end_position LIMIT 1", (session_id, position)
+                    ).fetchone()
+                    if record is None or record["start_position"] > position:
+                        continue
+                    key = record["group_id"]
+                    event = datetime.fromisoformat(record["event_at"])
+                    if key in seen or (start and event < start) or (end and event > end):
+                        continue
+                    seen.add(key)
+                    records[key] = record
+                    ranked[key] = ranked.get(key, 0) + 1/(60+rank)
+            selected, groups, rows_used, bytes_used = [], [], 0, 0
+            for key in sorted(ranked, key=lambda key: (ranked[key], records[key]["ordinal"]), reverse=True):
+                record = records[key]
+                count = record["end_position"]-record["start_position"]+1
+                if count+rows_used > max_rows or record["stored_bytes"]+bytes_used > max_bytes:
+                    continue
+                try:
+                    hydrated, count, size = self._hydrate_groups(
+                        connection, session_id, target, [record], max_rows-rows_used, max_bytes-bytes_used)
+                except ValueError as error:
+                    return _failed_source("unavailable", str(error))
+                selected.append({"group_id": key, "fingerprint": record["fingerprint"]})
+                groups.extend(hydrated)
+                rows_used += count
+                bytes_used += size
+                if len(groups) >= max_groups:
+                    break
+            proof = {"host_token": target, "grouping_rule_version": GROUP_RULE, "groups": selected}
+            self.validate_recall(proof, session_id=session_id)
+            return {"status": "ready", "groups": groups, "source_proof": proof,
+                    "source_snapshot": _sha256(proof),
+                    "stats": {"workset_rows": rows_used, "workset_bytes": bytes_used,
+                              "returned_groups": len(groups), "retirement_authority": False}}
+
+    def validate_recall(self, proof, *, session_id):
+        target = proof["host_token"]
+        if target["domain_id"] != session_id or proof["grouping_rule_version"] != GROUP_RULE:
+            raise ValueError("recall_domain_or_group_rule_changed")
+        validation = self.db.validate_history_prefix(target)
+        if validation.get("status") != "valid" or validation.get("invalidated_from_position"):
+            raise ValueError("recall_source_changed")
+        with closing(self.store._connect()) as connection:
+            for group in proof["groups"]:
+                row = connection.execute(
+                    "SELECT fingerprint,end_position FROM continuity_group_index WHERE session_id=? AND group_id=?",
+                    (session_id, group["group_id"])).fetchone()
+                if row is None or row["fingerprint"] != group["fingerprint"] or row["end_position"] > target["canonical_count"]:
+                    raise ValueError("recall_group_changed")
+        return proof
+
     def _read_source_once(self, session_id, *, reference_at, recent_horizon_hours=72,
                           max_rows=2048, max_bytes=4*1024*1024):
         from .hermes_adapter import _failed_source
@@ -508,32 +627,14 @@ class ContinuityHistoryIndex:
                 (session_id, start_ordinal-1),
             ).fetchone()
             prefix_before = json.loads(before[0]) if before else empty_prefix
-            rows, entries, actual_bytes = [], [], 0
-            position = selected[0]["start_position"]-1 if selected else (last_position or 0)
-            start_position = position
-            end_position = selected[-1]["end_position"] if selected else position
-            while position < end_position:
-                page = self._page(session_id, target, position,
-                                  min(256, end_position-position, max_rows-len(rows)),
-                                  max_bytes-actual_bytes)
-                if page.get("status") not in {"ready", "valid"} or not page.get("rows"):
-                    return _failed_source("pending", "history_page_unavailable")
-                rows.extend(page["rows"])
-                entries.extend(page["entries"])
-                actual_bytes += page["stored_bytes"]
-                position = entries[-1]["position"]
-            projected = _project_canonical_source(
-                session_id, rows, full_prefix=False,
-                identity_occurrences=_Occurrences(connection, session_id, "message", start_position),
-                group_occurrences=_Occurrences(connection, session_id, "group", start_position),
-                prior_group_count=prefix_before["group_count"], include_group_boundaries=True,
-            )
-            if projected.get("status") != "ready" or len(projected["groups"]) != len(selected):
-                return _failed_source("ambiguous", "group_index_projection_mismatch")
+            try:
+                groups, row_count, actual_bytes = self._hydrate_groups(
+                    connection, session_id, target, selected, max_rows, max_bytes)
+            except ValueError as error:
+                return _failed_source("pending" if str(error) == "history_page_unavailable"
+                                      else "ambiguous", str(error))
             prefixes = []
-            for group, record in zip(projected["groups"], selected):
-                if group["source_prefix_id"] != record["group_id"] or _group_fingerprint(group) != record["fingerprint"]:
-                    return _failed_source("ambiguous", "group_index_projection_mismatch")
+            for record in selected:
                 prefixes.append({"source_prefix_id": record["group_id"],
                                  "source_group_fingerprint": record["fingerprint"],
                                  "prefix": json.loads(record["prefix_json"])})
@@ -557,10 +658,10 @@ class ContinuityHistoryIndex:
             result = {
                 "schema": "thread_continuity_compact_source.v1", "status": "ready", "scan_complete": True,
                 "source_snapshot": canonical_proof_sha256(proof), "source_proof": proof,
-                "prefix_before_groups": prefix_before, "groups": projected["groups"],
+                "prefix_before_groups": prefix_before, "groups": groups,
                 "group_prefixes": prefixes, "retirement_eligibility": eligibility,
                 "stats": {"full_prefix": False, "canonical_message_count": complete_target["canonical_count"],
-                          "returned_groups": len(selected), "workset_rows": len(rows),
+                          "returned_groups": len(selected), "workset_rows": row_count,
                           "workset_bytes": actual_bytes,
                           "compacted_prefix_group_ids": [record["group_id"] for record in selected
                                                          if record["ordinal"] <= eligible_count]},
