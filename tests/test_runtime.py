@@ -4,7 +4,9 @@ import asyncio
 import copy
 import importlib
 import json
+import sqlite3
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -23,6 +25,9 @@ if PACKAGE not in sys.modules:
     sys.modules[PACKAGE] = package
 
 runtime_module = importlib.import_module(f"{PACKAGE}.runtime")
+checkpoint_store_v3_module = importlib.import_module(
+    f"{PACKAGE}.checkpoint_store_v3"
+)
 ContinuityRuntime = runtime_module.ContinuityRuntime
 MARKER = runtime_module.CONTINUITY_MARKER
 
@@ -208,10 +213,15 @@ class FakeLlm:
         self.result = result or LlmResult()
         self.include_completion_marker = include_completion_marker
         self.calls = 0
+        self.recall_queries = 0
 
     async def acomplete(self, messages, **kwargs):
-        self.calls += 1
-        text = self.result.text
+        if kwargs.get("purpose") == "thread_continuity_recall_query":
+            self.recall_queries += 1
+            text = json.dumps({"queries": [], "start_at": None, "end_at": None})
+        else:
+            self.calls += 1
+            text = self.result.text
         if self.include_completion_marker:
             marker = next(
                 str(row.get("content") or "").splitlines()[-1]
@@ -1303,6 +1313,63 @@ class ContinuityRuntimeTests(unittest.TestCase):
                 self.assertEqual(result["content"], "summary")
                 self.assertEqual(messages, original)
 
+    def test_summary_omits_pixels_before_hash_copy_and_provider_call(self) -> None:
+        class Pixels:
+            def __deepcopy__(self, memo):
+                raise AssertionError("historical pixels copied")
+
+        class InspectLlm(FakeLlm):
+            async def acomplete(self, messages, **kwargs):
+                serialized = json.dumps(messages, ensure_ascii=False)
+                self_test.assertNotIn("image_url", serialized)
+                self_test.assertNotIn("input_image", serialized)
+                self_test.assertIn("not unseen details", serialized)
+                self_test.assertIn(expected, serialized)
+                return await super().acomplete(messages, **kwargs)
+
+        self_test = self
+        for expected in (
+            "这次用表情表达反讽，不是画面描述",
+            "已识别信息：图表标注为 12；模糊数字未知",
+            "已保藏：pic_007；语义：用户指定保留的设计参考",
+        ):
+            for kind in ("image_url", "input_image", "bedrock"):
+                with self.subTest(meaning=expected, kind=kind):
+                    pixels = Pixels()
+                    image = ({"image": {"source": {"bytes": pixels}}}
+                             if kind == "bedrock" else
+                             {"type": kind, "image_url": {"url": pixels}})
+                    content = [{"type": "text", "text": expected}, image]
+                    messages = [{"role": "user", "content": content}]
+                    runtime = make_runtime(FakeAdapter(bundle()), FakeCompiler(None), llm=InspectLlm())
+                    result = asyncio.run(runtime._summary_call({"max_output_tokens": 128}, messages))
+                    self.assertNotIn("status", result)
+                    self.assertIs(messages[0]["content"], content)
+                    self.assertIs(content[1], image)
+                    self.assertEqual(runtime.plugin_llm.calls, 1)
+
+    def test_image_omission_does_not_invent_semantics_or_saved_numbers(self) -> None:
+        image = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+        projected = runtime_module._summary_source_content(image)
+        self.assertNotIn("AAAA", json.dumps(projected))
+        self.assertIn("not unseen details", projected[0]["text"])
+        self.assertNotIn("pic_", json.dumps(projected))
+        self.assertNotIn("description", projected[0])
+
+    def test_summary_image_policy_does_not_remove_current_turn_attachment(self) -> None:
+        runtime = make_runtime(FakeAdapter(bundle()), FakeCompiler(checkpoint("bridge")))
+        wire = request()
+        content = [{"type": "text", "text": "current image"},
+                   {"type": "image_url", "image_url": {"url": "data:image/png;base64,CURRENT"}}]
+        wire["messages"][-1]["content"] = content
+        original = copy.deepcopy(wire)
+        projected = project(runtime, wire)
+        projected_content = projected["request"]["messages"][-1]["content"]
+        self.assertEqual(projected_content[1:], content)
+        self.assertEqual(len(projected_content), len(content) + 1)
+        self.assertIn(MARKER.split(" marker=", 1)[0], projected_content[0]["text"])
+        self.assertEqual(wire, original)
+
     def test_missing_post_error_or_execution_drift_never_publishes(self) -> None:
         adapter = FakeAdapter(bundle())
         compiler = FakeCompiler(checkpoint("bridge"))
@@ -1556,6 +1623,90 @@ class ContinuityRuntimeTests(unittest.TestCase):
             [row["status"] for row in adapter.metadata_store.rows],
             ["delivered_checkpoint_conflict", "delivered_checkpoint_conflict"],
         )
+
+    def test_v3_retry_records_namespaced_unchanged_without_second_cas(self) -> None:
+        from test_checkpoint_v3 import checkpoint_fixture
+        from test_hermes_adapter import ContinuityMetadataStore
+
+        candidate = checkpoint_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "continuity.sqlite3"
+            store = ContinuityMetadataStore(path)
+            checkpoint_store_v3_module.initialize_checkpoint_store_v3(store)
+
+            class ValidHistoryIndex:
+                @staticmethod
+                def validate_checkpoint(value, **_kwargs):
+                    return copy.deepcopy(value)
+
+            class IndexedAdapter:
+                def __init__(self):
+                    self.metadata_store = store
+                    self.history_index = ValidHistoryIndex()
+                    self.cas_calls = []
+
+                @staticmethod
+                def read_bundle(_session_id, **_kwargs):
+                    return bundle()
+
+                def settle_checkpoint_delivery(self, session_id, **kwargs):
+                    self.cas_calls.append(copy.deepcopy(kwargs))
+                    return checkpoint_store_v3_module.settle_checkpoint_delivery_v3(
+                        self.metadata_store,
+                        session_id,
+                        expected_revision=kwargs["expected_revision"],
+                        checkpoint_candidate=kwargs["checkpoint_candidate"],
+                        receipt_id=kwargs["receipt_id"],
+                        validate_checkpoint_source=(
+                            self.history_index.validate_checkpoint
+                        ),
+                        source_ids=kwargs["source_ids"],
+                        hashes=kwargs["hashes"],
+                        counts=kwargs["counts"],
+                    )
+
+            adapter = IndexedAdapter()
+            runtime = make_runtime(adapter, FakeCompiler(candidate))
+            try:
+                original = request()
+                for api_request_id in ("a1", "a2"):
+                    projected = project(
+                        runtime, original, api=api_request_id
+                    )
+                    self.assertIsNotNone(projected)
+                    execute(
+                        runtime,
+                        projected["request"],
+                        original,
+                        api=api_request_id,
+                    )
+                    post(runtime, api=api_request_id)
+
+                with sqlite3.connect(path) as connection:
+                    receipts = connection.execute(
+                        "SELECT receipt_id,status FROM continuity_receipts "
+                        "ORDER BY rowid"
+                    ).fetchall()
+                    revision = connection.execute(
+                        "SELECT revision FROM continuity_checkpoints_v3"
+                    ).fetchone()[0]
+                self.assertEqual(len(adapter.cas_calls), 1)
+                self.assertEqual(revision, 1)
+                self.assertEqual(
+                    [status for _receipt_id, status in receipts],
+                    [
+                        "delivered_checkpoint_stored_unvalidated",
+                        "delivered_checkpoint_unchanged",
+                    ],
+                )
+                self.assertTrue(
+                    all(
+                        receipt_id.startswith("v3:")
+                        for receipt_id, _status in receipts
+                    )
+                )
+            finally:
+                runtime.clear()
 
     def test_non_conflict_cas_failure_is_persistently_reported_as_failed(self) -> None:
         adapter = FakeAdapter(

@@ -54,6 +54,34 @@ provider, or a replacement compressor.
 
 ## Long-history gate
 
+Block 1 is **complete-entry transitional protection and resource baseline**:
+guard full-prefix messages and checkpoint loading before payload transfer,
+preserve small-session compile/settlement, and measure the full plugin chain in
+disposable processes. Source overflow may still leave native Hermes unchanged.
+It does not prove continuity for sessions exceeding 2,048 physical rows.
+
+Block 2 must freeze the writer census, host pagination/source-validity protocol,
+publication guarantee and checkpoint-v3 format before Block 3 implements them.
+The accepted specification is [LONG_HISTORY_PROTOCOL.md](LONG_HISTORY_PROTOCOL.md):
+host-owned change capture and bounded indexes, conditional checkpoint storage
+with validation on every use. The owner accepted Block 2 at `e54472f2` and
+authorized Block 3 implementation. Current work adds the thirteenth host patch
+and its fourteenth value-guard correction,
+compact v3 storage/compiler input and bounded preparation; implementation
+review and deployment remain distinct. See LONG_HISTORY_IMPLEMENTATION.md.
+Index progress, provider delivery and checkpoint publication remain separate
+facts. Index completion must not trigger whole-history model summarization.
+Block 3 must positively prove a >2,048-row bridge, actual settlement and next-turn
+reuse. The accepted Block 1 exact SHA becomes the preferred v3 rollback target;
+`34780f0` / 0.4.1 remains a historical recovery point, not an equivalent guard.
+The accepted source rollback SHA is now
+`1d6f502f2c21636d9f75b31fcc46f109c3bfece6`; this does not select a deployed pin.
+Retained v3 data alone cannot prove writes performed by an older host.
+
+This block changes neither the accepted 0.21.3 migration lane nor Global Hot's
+product algorithm. Its byte guard applies to the full-prefix Continuity entry;
+the separate canonical time-window service retains its existing row budget.
+
 Checkpoint v2 still reads and proves the complete canonical prefix and stores
 full-prefix identity/fingerprint arrays. Work, memory, and checkpoint bytes
 therefore grow with total history while the physical row count remains within
@@ -64,6 +92,31 @@ logical anchor/prefix digest seam and a compact checkpoint v3 that proves
 bounded suffix growth and detects prefix rewrite. The existing bounded
 time-window API is sufficient for the cross-mouth window service, but cannot
 honestly replace this full-prefix contract.
+
+## Owner-approved independent recall repair
+
+The owner approved separating bounded question-driven recall from the continuous
+retirement cursor on 2026-10-02. The current source checkpoint is `c0a0d607`;
+the primary worktree is HermesContinuity's existing Block 4 review branch.
+The actual owner copy reaches index-ready but 139 live groups block 3,153 later
+compacted groups behind the retirement prefix. The new request-only path may
+select verified complete groups across those holes. It must not retire, relabel,
+quarantine or copy them into another transcript/search store.
+
+Reuse Hermes's native FTS routing for body-free bounded candidate locators,
+the existing host canonical page/proof seam for hydration, and this runtime's
+overlay, final-body budget and post-settled receipt. A bounded host auxiliary
+call extracts search terms; a bounded second call selects relevant groups and
+summarizes only that admitted workset. No embedding runtime or memory-provider
+slot is added. Checkpoint v2/v3 and their CAS remain the rolling path's property.
+Recall output is ephemeral and cannot update their retirement cursor.
+
+Acceptance must cover complete-group relevance, unrelated/empty queries,
+source rewrite, shared token/byte budgets, final provider delivery, post/error,
+next-turn and manager reload, and the protected real copy. Stop at a published
+source candidate with these evidence layers distinct; deployment still requires
+the existing review/target qualification conditions. Global Hot, donor source,
+0.21.x migration, original databases and production configuration are untouched.
 
 ## Release gates
 

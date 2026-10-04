@@ -1,0 +1,238 @@
+From a488b6ebf46765a7323bb3e862bcbb77bccbd172 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 09:01:03 +0800
+Subject: [PATCH] fix(history): bound SQLite value probes and restore borrowed
+ read state
+
+---
+ hermes_state_history.py            | 104 +++++++++++++++++++----------
+ tests/test_hermes_state_history.py |  76 +++++++++++++++++++++
+ 2 files changed, 144 insertions(+), 36 deletions(-)
+
+diff --git a/hermes_state_history.py b/hermes_state_history.py
+index 517ab2a..03b82d4 100644
+--- a/hermes_state_history.py
++++ b/hermes_state_history.py
+@@ -676,6 +676,17 @@ class SessionHistoryMixin:
+                 self._conn.execute(f"PRAGMA cache_size={cache_size}")
+                 self._conn.execute(f"PRAGMA temp_store={temp_store}")
+ 
++    @staticmethod
++    @contextmanager
++    def _history_value_limit(conn: sqlite3.Connection, max_bytes: int):
++        """Bound SQLite value materialization, including length/Cast probes."""
++        old_limit = conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH)
++        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, min(old_limit, max_bytes + 4096))
++        try:
++            yield
++        finally:
++            conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, old_limit)
++
+     @staticmethod
+     def _history_message_columns(conn: sqlite3.Connection) -> Sequence[str]:
+         rows = conn.execute("PRAGMA table_info(messages)").fetchall()
+@@ -1217,40 +1228,44 @@ class SessionHistoryMixin:
+     ) -> tuple[list[sqlite3.Row], Dict[int, int], int, bool, Optional[str]]:
+         columns = self._history_message_columns(conn)
+         expression = self._history_probe_expression(columns)
+-        probes = conn.execute(
+-            f"SELECT id, ({expression}) AS stored_bytes FROM messages "
+-            "WHERE session_id=? AND id>? AND id<=? ORDER BY id LIMIT ?",
+-            (
+-                domain["domain_id"],
+-                domain["cursor_message_id"],
+-                domain["target_max_message_id"],
+-                max_rows + 1,
+-            ),
+-        ).fetchall()
+-        if not probes:
+-            return [], {}, 0, False, None
+-        selected: list[int] = []
+-        selected_sizes: Dict[int, int] = {}
+-        total = 0
+-        for probe in probes[:max_rows]:
+-            size = int(probe["stored_bytes"] or 0)
+-            if size > max_bytes and not selected:
++        with self._history_value_limit(conn, max_bytes):
++            try:
++                probes = conn.execute(
++                    f"SELECT id, ({expression}) AS stored_bytes FROM messages "
++                    "WHERE session_id=? AND id>? AND id<=? ORDER BY id LIMIT ?",
++                    (
++                        domain["domain_id"],
++                        domain["cursor_message_id"],
++                        domain["target_max_message_id"],
++                        max_rows + 1,
++                    ),
++                ).fetchall()
++                if not probes:
++                    return [], {}, 0, False, None
++                selected: list[int] = []
++                selected_sizes: Dict[int, int] = {}
++                total = 0
++                for probe in probes[:max_rows]:
++                    size = int(probe["stored_bytes"] or 0)
++                    if size > max_bytes and not selected:
++                        return [], {}, 0, True, "history_row_byte_limit_exceeded"
++                    if total + size > max_bytes:
++                        break
++                    selected.append(int(probe["id"]))
++                    selected_sizes[int(probe["id"])] = size
++                    total += size
++                if not selected:
++                    return [], {}, 0, True, "history_page_byte_limit_exceeded"
++                placeholders = ",".join("?" for _ in selected)
++                payload = conn.execute(
++                    f"SELECT * FROM messages WHERE session_id=? AND id IN ({placeholders}) "
++                    "ORDER BY id",
++                    (domain["domain_id"], *selected),
++                ).fetchall()
++                more = len(probes) > len(selected)
++                return payload, selected_sizes, total, more, None
++            except sqlite3.DataError:
+                 return [], {}, 0, True, "history_row_byte_limit_exceeded"
+-            if total + size > max_bytes:
+-                break
+-            selected.append(int(probe["id"]))
+-            selected_sizes[int(probe["id"])] = size
+-            total += size
+-        if not selected:
+-            return [], {}, 0, True, "history_page_byte_limit_exceeded"
+-        placeholders = ",".join("?" for _ in selected)
+-        payload = conn.execute(
+-            f"SELECT * FROM messages WHERE session_id=? AND id IN ({placeholders}) "
+-            "ORDER BY id",
+-            (domain["domain_id"], *selected),
+-        ).fetchall()
+-        more = len(probes) > len(selected)
+-        return payload, selected_sizes, total, more, None
+ 
+     def _history_row_material(
+         self, row: sqlite3.Row, stored_bytes: int
+@@ -2501,8 +2516,8 @@ class SessionHistoryMixin:
+             if cursor is None
+             else _normalize_cursor(cursor, token)
+         )
+-        with self._read_ctx() as conn:
+-            conn.execute("BEGIN")
++        with self._read_ctx() as conn, self._history_value_limit(conn, max_bytes):
++            conn.execute("SAVEPOINT history_read_page")
+             try:
+                 validation = self._history_validate_token_conn(conn, token)
+                 if validation["status"] != "valid":
+@@ -2625,8 +2640,25 @@ class SessionHistoryMixin:
+                     "returned_rows": len(decoded),
+                     "stored_bytes": total,
+                 }
++            except sqlite3.DataError:
++                return {
++                    "schema": HISTORY_PAGE_SCHEMA,
++                    "status": "overflow",
++                    "reason": "history_row_byte_limit_exceeded",
++                    "target": token,
++                    "rows": [],
++                    "entries": [],
++                    "page_token": None,
++                    "next_cursor": None,
++                    "scan_complete": False,
++                    "returned_rows": 0,
++                    "stored_bytes": 0,
++                }
+             finally:
+-                conn.rollback()
++                try:
++                    conn.execute("ROLLBACK TO history_read_page")
++                finally:
++                    conn.execute("RELEASE history_read_page")
+ 
+ 
+ __all__ = [
+diff --git a/tests/test_hermes_state_history.py b/tests/test_hermes_state_history.py
+index e6d1910..51142c0 100644
+--- a/tests/test_hermes_state_history.py
++++ b/tests/test_hermes_state_history.py
+@@ -119,6 +119,82 @@ def test_page_byte_budget_refuses_before_payload_decode(history_db, monkeypatch)
+     assert page["rows"] == []
+ 
+ 
++def test_probe_rejects_large_value_before_decode_and_restores_borrowed_state(history_db, monkeypatch):
++    history_db.append_message("history", "user", "large" * 10000)
++    conn = history_db._conn
++    before = conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH)
++    conn.execute("SAVEPOINT owner_transaction")
++    conn.execute("UPDATE sessions SET title='pending' WHERE id='history'")
++    domain = {"domain_id": "history", "cursor_message_id": 0, "target_max_message_id": 10}
++    probe_limits = []
++    conn.set_trace_callback(lambda sql: probe_limits.append(conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH))
++                            if " AS stored_bytes FROM messages " in sql else None)
++    try:
++        rows, sizes, total, more, reason = history_db._history_probe_page(
++            conn, domain, max_rows=2, max_bytes=1024)
++        assert (rows, sizes, total, more, reason) == (
++            [], {}, 0, True, "history_row_byte_limit_exceeded")
++        assert probe_limits == [1024 + 4096]
++        assert conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH) == before
++        assert conn.in_transaction
++        assert conn.execute("SELECT title FROM sessions WHERE id='history'").fetchone()[0] == "pending"
++    finally:
++        conn.set_trace_callback(None)
++        conn.execute("ROLLBACK TO owner_transaction")
++        conn.execute("RELEASE owner_transaction")
++
++    def decode_must_not_run(rows):
++        raise AssertionError("oversized source reached decoder")
++    with monkeypatch.context() as guard:
++        guard.setattr(history_db, "_decode_message_rows", decode_must_not_run)
++        result = history_db.prepare_history_step("history", owner_id="guard", max_page_bytes=1024)
++    assert result["status"] == "overflow"
++    assert result["reason"] == "history_row_byte_limit_exceeded"
++    assert conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH) == before
++    assert not conn.in_transaction
++    history_db.create_session("small", source="cli")
++    history_db.append_message("small", "user", "small body")
++    result = history_db.prepare_history_step("small", owner_id="guard", max_page_bytes=1024)
++    assert result["status"] == "ready"
++    page = history_db.read_history_page("small", target=result["head_token"], max_bytes=1024)
++    assert page["rows"][0]["content"] == "small body"
++
++
++def test_frontend_read_restores_limit_and_outer_transaction(history_db, monkeypatch):
++    from contextlib import contextmanager
++    history_db.append_message("history", "user", "budget body")
++    prepared = _prepare(history_db)
++    conn = history_db._conn
++    before = conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH)
++    original_decode = history_db._decode_message_rows
++    def checked_decode(rows):
++        assert conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH) == 1024 + 4096
++        return original_decode(rows)
++    @contextmanager
++    def borrowed_read():
++        yield conn
++    monkeypatch.setattr(history_db, "_read_ctx", borrowed_read)
++    monkeypatch.setattr(history_db, "_decode_message_rows", checked_decode)
++    conn.execute("SAVEPOINT owner_transaction")
++    conn.execute("UPDATE sessions SET title='pending' WHERE id='history'")
++    try:
++        page = history_db.read_history_page("history", target=prepared["head_token"], max_bytes=1024)
++        assert page["status"] == "ready"
++        assert page["rows"][0]["content"] == "budget body"
++        assert conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH) == before
++        assert conn.in_transaction
++        assert conn.execute("SELECT title FROM sessions WHERE id='history'").fetchone()[0] == "pending"
++        with monkeypatch.context() as failure:
++            failure.setattr(history_db, "_decode_message_rows", lambda rows: (_ for _ in ()).throw(RuntimeError("decode failed")))
++            with pytest.raises(RuntimeError, match="decode failed"):
++                history_db.read_history_page("history", target=prepared["head_token"], max_bytes=1024)
++        assert conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH) == before
++        assert conn.in_transaction
++    finally:
++        conn.execute("ROLLBACK TO owner_transaction")
++        conn.execute("RELEASE owner_transaction")
++
++
+ def test_prepare_reports_pages_for_shared_quantum(history_db):
+     for number in range(4):
+         _append_turn(history_db, number)
+-- 
+2.50.1 (Apple Git-155)

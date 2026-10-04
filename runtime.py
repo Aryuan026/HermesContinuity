@@ -13,10 +13,11 @@ import copy
 import hashlib
 import inspect
 import json
+import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
@@ -29,8 +30,10 @@ from hermes_cli.request_overlay import (
     request_messages,
 )
 
-from .context_compactor import thread_continuity_bridge_projection
+from .context_compactor import _summary_source_content, thread_continuity_bridge_projection
 from .thread_continuity_runtime import compile_thread_continuity_turn
+from .resource_budget import ACTIVE_WORKSETS, COLD_PLANS
+from .hermes_adapter import _json_text
 
 
 _request_sha256 = canonical_request_sha256
@@ -380,6 +383,15 @@ class _TurnPlan:
     reserved_output_tokens: int = 0
     provider_key: tuple[str, str, str] = ("", "", "")
     publish_status: str = ""
+    source_checkpoint: dict[str, Any] | None = None
+    recall_proof: dict[str, Any] | None = None
+    recall_status: str = ""
+    recall_reason: str = ""
+    workset_bytes: int = 0
+    created_at: float = 0.0
+
+    def serialized_bytes(self):
+        return len(json.dumps(vars(self), ensure_ascii=False).encode("utf-8"))
 
 
 @dataclass
@@ -451,6 +463,20 @@ class ContinuityRuntime:
         self._transport: dict[tuple[str, str, str], _TransportStage] = {}
         self._executing: set[tuple[str, str, str]] = set()
         self._attempt_seq = 0
+        self._budget_identity = object()
+        self._closed = False
+
+    def _budget_key(self, turn_key):
+        return (self._budget_identity, turn_key)
+
+    def _release_workset(self, turn_key):
+        ACTIVE_WORKSETS.release(self._budget_key(turn_key))
+        plan = self._turns.get(turn_key)
+        if plan is not None and plan.workset_bytes:
+            cold_bytes = plan.serialized_bytes()
+            if not COLD_PLANS.acquire(self._budget_key(turn_key), cold_bytes):
+                self._turns.pop(turn_key, None)
+                COLD_PLANS.release(self._budget_key(turn_key))
 
     def _trim_locked(
         self,
@@ -474,6 +500,8 @@ class ContinuityRuntime:
             if expired is None:
                 return False
             self._turns.pop(expired, None)
+            ACTIVE_WORKSETS.release(self._budget_key(expired))
+            COLD_PLANS.release(self._budget_key(expired))
             self._projections = {
                 key: value
                 for key, value in self._projections.items()
@@ -500,6 +528,15 @@ class ContinuityRuntime:
         for key in expired:
             self._projections.pop(key, None)
             self._transport.pop(key, None)
+        active_turns = {value.turn_key for value in (*self._projections.values(), *self._transport.values())}
+        for turn_key in {key[:2] for key in expired} - active_turns:
+            self._release_workset(turn_key)
+        for turn_key, plan in list(self._turns.items()):
+            if (plan.created_at and plan.created_at <= cutoff
+                    and turn_key not in active_turns and turn_key not in self._compiling):
+                self._turns.pop(turn_key, None)
+                ACTIVE_WORKSETS.release(self._budget_key(turn_key))
+                COLD_PLANS.release(self._budget_key(turn_key))
 
     def _attempt_capacity_available_locked(
         self,
@@ -529,11 +566,14 @@ class ContinuityRuntime:
             getattr(self.plugin_llm, "acomplete", None)
         ):
             raise RuntimeError("plugin_llm_unavailable")
+        summary_messages = copy.deepcopy([
+            {**row, "content": _summary_source_content(row.get("content"))}
+            for row in messages
+        ])
         marker = (
             f"{_SUMMARY_END_PREFIX}"
-            f"{canonical_request_sha256({'descriptor': dict(descriptor), 'messages': messages})}]"
+            f"{canonical_request_sha256({'descriptor': dict(descriptor), 'messages': summary_messages})}]"
         )
-        summary_messages = copy.deepcopy(messages)
         terminal_instruction = (
             "End the response with this exact completion marker, exactly once, "
             "as the final non-whitespace text. Do not quote or explain it:\n"
@@ -550,7 +590,7 @@ class ContinuityRuntime:
             summary_messages,
             max_tokens=int(descriptor.get("max_output_tokens") or 0),
             timeout=self.summary_timeout_seconds,
-            purpose="thread_continuity_summary",
+            purpose=str(descriptor.get("purpose") or "thread_continuity_summary"),
         )
         finish_reason = getattr(result, "finish_reason", None)
         raw_text = str(getattr(result, "text", "") or "")
@@ -655,7 +695,11 @@ class ContinuityRuntime:
                 request, messages, current_index
             )
             reserve = _reserved_output_tokens(request, usable_window)
-            bundle = self.adapter.read_bundle(session_id)
+            reference_at = self.clock()
+            indexed = getattr(self.adapter, "history_index", None) is not None
+            bundle = (self.adapter.read_bundle(session_id, reference_at=reference_at,
+                                              recent_horizon_hours=self.recent_horizon_hours)
+                      if indexed else self.adapter.read_bundle(session_id))
             source = bundle.get("source") if isinstance(bundle, Mapping) else None
             if not isinstance(source, Mapping):
                 raise ValueError("source_unavailable")
@@ -663,10 +707,20 @@ class ContinuityRuntime:
                 source.get("status") != "ready"
                 or source.get("scan_complete") is not True
             ):
-                return _TurnPlan(
+                plan = _TurnPlan(
                     current_sha,
                     reason=str(source.get("error") or "source_unavailable"),
                 )
+                if indexed and plan.reason == "foreground_group_limit_exceeded":
+                    plan.context_window_tokens = window
+                    plan.usable_context_window_tokens = usable_window
+                    plan.context_window_source = source_label
+                    plan.context_window_confidence = confidence_label
+                    plan.reserved_output_tokens = reserve
+                    plan.provider_key = (model, provider, base_url)
+                    return self._add_recall(plan, session_id=session_id, query=current_text,
+                                            reference_at=reference_at)
+                return plan
             compacted_ids = list(
                 dict(source.get("stats") or {}).get(
                     "compacted_prefix_group_ids"
@@ -696,7 +750,7 @@ class ContinuityRuntime:
                 physical_owner_generation=object(),
                 post_current_messages=[],
                 minimum_fold_source_group_ids=compacted_ids,
-                bridge_reference_at=self.clock(),
+                bridge_reference_at=reference_at,
                 bridge_recent_horizon_hours=self.recent_horizon_hours,
                 bridge_source_token_limit=self.source_token_limit,
                 bridge_output_token_limit=self.output_token_limit,
@@ -745,7 +799,7 @@ class ContinuityRuntime:
             for value in list(bridge.get("represented_source_group_ids") or [])
             if str(value)
         )
-        return _TurnPlan(
+        plan = _TurnPlan(
             current_sha256=current_sha,
             marker=marker,
             bridge_body=bridge_body,
@@ -761,7 +815,72 @@ class ContinuityRuntime:
             context_window_confidence=confidence_label,
             reserved_output_tokens=reserve,
             provider_key=(model, provider, base_url),
+            source_checkpoint=(dict(selected) if indexed and selected else None),
+            workset_bytes=(len(_json_text(bundle).encode("utf-8"))
+                           if indexed else 0),
         )
+        return (self._add_recall(plan, session_id=session_id, query=current_text,
+                                 reference_at=reference_at) if indexed else plan)
+
+    def _add_recall(self, plan, *, session_id, query, reference_at):
+        index = self.adapter.history_index
+        if not callable(getattr(getattr(index, "db", None), "search_history_matches", None)):
+            plan.recall_status = "unavailable"
+            plan.recall_reason = "bounded_native_search_missing"
+            return plan
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            return plan
+        from .recall import build_recall
+        existing = plan.bridge_body.removesuffix("\n" + CONTINUITY_END_BOUNDARY)
+        available = self.output_token_limit - self.estimator(
+            [{"role": "user", "content": existing}]) if existing else self.output_token_limit
+        try:
+            recall = asyncio.run(asyncio.wait_for(build_recall(
+                index, self._summary_call, session_id=session_id, query=query,
+                reference_at=reference_at, estimate_messages=self.estimator,
+                source_token_limit=self.source_token_limit, output_token_limit=available),
+                timeout=self.summary_timeout_seconds))
+            if recall is None:
+                plan.recall_status = "empty"
+                return plan
+            body = "\n\n".join(part for part in (existing, recall["body"]) if part)
+            if self.estimator([{"role": "user", "content": body}]) > self.output_token_limit:
+                plan.recall_status = "over_budget"
+                return plan
+            body += "\n" + CONTINUITY_END_BOUNDARY
+            if len(body) > self.max_projection_chars:
+                plan.recall_status = "over_budget"
+                return plan
+            proof = recall["source_proof"]
+            marker = (f"{CONTINUITY_MARKER_NAMESPACE} "
+                           f"source_snapshot={plan.expected_source_snapshot or _sha256(proof)} "
+                           f"recall_source={_sha256(proof)} "
+                           f"bridge_sha256={hashlib.sha256(body.encode('utf-8')).hexdigest()}]")
+            recall_only = plan.reason == "foreground_group_limit_exceeded"
+            combined = replace(plan, recall_proof=proof, recall_status="selected",
+                bridge_body=body, marker=marker,
+                source_ids=tuple(dict.fromkeys((*plan.source_ids, *recall["source_ids"]))),
+                workset_bytes=plan.workset_bytes+recall["workset_bytes"],
+                reason="" if recall_only else plan.reason,
+                expected_source_snapshot=_sha256(proof) if recall_only else plan.expected_source_snapshot)
+            if combined.workset_bytes+combined.serialized_bytes() > 8*1024*1024:
+                plan.recall_status = "over_budget"
+                plan.recall_reason = "recall_shared_workset_budget"
+                return plan
+            return combined
+        except Exception as error:
+            # A failed auxiliary recall cannot invalidate an already valid
+            # rolling bridge. It grants no checkpoint or receipt authority.
+            plan.recall_status = "failed"
+            code = str(error)
+            plan.recall_reason = ("recall_auxiliary_timeout" if isinstance(error, TimeoutError)
+                                  else code if re.fullmatch(r"recall_[a-z_]+", code)
+                                  else "recall_auxiliary_failed")
+            return plan
 
     def _plan_for_request(
         self,
@@ -784,6 +903,8 @@ class ContinuityRuntime:
             if index >= 0 and isinstance(shape[1][index], Mapping):
                 current_sha = _current_message_sha256(shape[1][index])
         with self._lock:
+            if self._closed:
+                return _TurnPlan(current_sha, reason="runtime_unloaded")
             existing = self._turns.get(turn_key)
             if existing is not None:
                 self._turns.move_to_end(turn_key)
@@ -793,10 +914,33 @@ class ContinuityRuntime:
                     existing.current_identity,
                 ):
                     return _TurnPlan(current_sha, reason="current_identity_drift")
+                if existing.source_checkpoint is not None:
+                    try:
+                        self.adapter.history_index.validate_checkpoint(
+                            existing.source_checkpoint, session_id=session_id)
+                    except Exception:
+                        return _TurnPlan(current_sha, reason="cached_source_proof_changed")
+                if existing.recall_proof is not None:
+                    try:
+                        self.adapter.history_index.validate_recall(existing.recall_proof, session_id=session_id)
+                    except Exception:
+                        return _TurnPlan(current_sha, reason="cached_recall_source_changed")
+                if existing.source_checkpoint is not None or existing.recall_proof is not None:
+                    if not ACTIVE_WORKSETS.acquire(self._budget_key(turn_key), existing.workset_bytes):
+                        return _TurnPlan(current_sha, reason="workset_capacity_exceeded")
+                    COLD_PLANS.release(self._budget_key(turn_key))
                 return existing
             if turn_key in self._compiling:
                 return _TurnPlan(current_sha, reason="turn_compile_in_progress")
             self._compiling.add(turn_key)
+        indexed = getattr(self.adapter, "history_index", None) is not None
+        if indexed:
+            # Reserve the source + checkpoint ceilings before allocating either.
+            if not ACTIVE_WORKSETS.acquire(self._budget_key(turn_key), 8*1024*1024):
+                with self._lock:
+                    self._compiling.discard(turn_key)
+                return _TurnPlan(current_sha, reason="workset_capacity_exceeded")
+        transferred = False
         try:
             plan = self._compile_plan(
                 request,
@@ -809,21 +953,35 @@ class ContinuityRuntime:
                 context_window_source=context_window_source,
                 context_window_confidence=context_window_confidence,
             )
-            if plan.current_sha256 and current_sha == plan.current_sha256:
+            if plan.current_sha256 and current_sha == plan.current_sha256 and (plan.marker or not indexed):
                 plan.current_identity = _current_identity_content(
                     shape[1][last_real_user_index(shape[1])].get("content")
                 )
+            if indexed:
+                plan.workset_bytes += plan.serialized_bytes()
+            plan.created_at = self.monotonic()
+            with self._lock:
+                if self._closed:
+                    return _TurnPlan(current_sha, reason="runtime_unloaded")
+                if indexed:
+                    if plan.workset_bytes > 8*1024*1024:
+                        return _TurnPlan(current_sha, reason="workset_byte_limit_exceeded")
+                    ACTIVE_WORKSETS.acquire(self._budget_key(turn_key), plan.workset_bytes)
+                self._turns[turn_key] = plan
+                self._turns.move_to_end(turn_key)
+                if not self._trim_locked(protected_turns=(turn_key,)):
+                    if self._turns.get(turn_key) is plan:
+                        self._turns.pop(turn_key, None)
+                    return _TurnPlan(current_sha, reason="turn_capacity_exceeded")
+                transferred = True
+            return plan
         finally:
             with self._lock:
+                # Until installation succeeds, the compiler owns admission,
+                # including BaseException/cancellation and unload exits.
+                if indexed and not transferred:
+                    ACTIVE_WORKSETS.release(self._budget_key(turn_key))
                 self._compiling.discard(turn_key)
-        with self._lock:
-            self._turns[turn_key] = plan
-            self._turns.move_to_end(turn_key)
-            if not self._trim_locked(protected_turns=(turn_key,)):
-                if self._turns.get(turn_key) is plan:
-                    self._turns.pop(turn_key, None)
-                return _TurnPlan(current_sha, reason="turn_capacity_exceeded")
-        return plan
 
     def _attempt_budget(
         self,
@@ -1234,6 +1392,11 @@ class ContinuityRuntime:
                 )
             )
         )
+        if transport_ready and plan.recall_proof is not None:
+            try:
+                self.adapter.history_index.validate_recall(plan.recall_proof, session_id=attempt_key[0])
+            except Exception:
+                transport_ready = False
         if not transport_ready:
             native_request = (
                 self._native_request(request, projection)
@@ -1348,19 +1511,37 @@ class ContinuityRuntime:
         receipt_id = "hcr_" + _sha256(
             [*attempt_key, stage.attempt_seq, stage.request_sha256]
         )
+        hashes = {
+            "request_sha256": stage.request_sha256,
+            "bridge_body_sha256": hashlib.sha256(plan.bridge_body.encode("utf-8")).hexdigest(),
+            "source_snapshot": plan.expected_source_snapshot,
+        }
+        if plan.recall_proof is not None:
+            hashes["recall_source_sha256"] = _sha256(plan.recall_proof)
         return (
             receipt_id,
-            {
-                "request_sha256": stage.request_sha256,
-                "bridge_body_sha256": hashlib.sha256(
-                    plan.bridge_body.encode("utf-8")
-                ).hexdigest(),
-                "source_snapshot": plan.expected_source_snapshot,
-            },
+            hashes,
             {"represented_source_group_count": len(plan.source_ids)},
         )
 
     def post_api_request(
+        self, *, session_id: str, turn_id: str, api_request_id: str,
+        transport_record: Any = None, transport_schema_version: str = "", **kwargs: Any,
+    ) -> None:
+        try:
+            return self._settle_api_request(
+                session_id=session_id, turn_id=turn_id, api_request_id=api_request_id,
+                transport_record=transport_record, transport_schema_version=transport_schema_version,
+                **kwargs,
+            )
+        finally:
+            turn_key = (str(session_id or "").strip(), str(turn_id or "").strip())
+            with self._lock:
+                active = {value.turn_key for value in (*self._projections.values(), *self._transport.values())}
+                if turn_key not in active:
+                    self._release_workset(turn_key)
+
+    def _settle_api_request(
         self,
         *,
         session_id: str,
@@ -1410,6 +1591,16 @@ class ContinuityRuntime:
         if not transport_verified:
             return None
 
+        if plan.recall_proof is not None:
+            try:
+                self.adapter.history_index.validate_recall(plan.recall_proof, session_id=attempt_key[0])
+            except Exception:
+                self._record_receipt(attempt_key, stage, plan, "delivered_recall_source_changed")
+                return None
+            if plan.checkpoint_candidate is None and plan.source_checkpoint is None:
+                self._record_receipt(attempt_key, stage, plan, "delivered_recall")
+                return None
+
         candidate = plan.checkpoint_candidate
         cached = ""
         if candidate is not None:
@@ -1420,12 +1611,40 @@ class ContinuityRuntime:
                 if not cached:
                     plan.publish_status = "in_progress"
         if cached:
-            status = {
-                "applied": "delivered_checkpoint_unchanged",
-                "conflict": "delivered_checkpoint_conflict",
-                "failed": "delivered_checkpoint_failed",
-            }.get(cached, "delivered_checkpoint_failed")
-            self._record_receipt(attempt_key, stage, plan, status)
+            if (
+                getattr(self.adapter, "history_index", None) is not None
+                and str(candidate.get("schema") or "")
+                == "thread_continuity_checkpoint.v3"
+            ):
+                from .checkpoint_store_v3 import record_checkpoint_delivery_v3
+
+                receipt_id, hashes, counts = self._receipt_material(
+                    attempt_key, stage, plan
+                )
+                record_checkpoint_delivery_v3(
+                    self.adapter.metadata_store,
+                    attempt_key[0],
+                    checkpoint=candidate,
+                    receipt_id=receipt_id,
+                    outcome=(
+                        "unchanged"
+                        if cached in {"applied", "stored_unvalidated"}
+                        else cached
+                        if cached in {"conflict", "failed"}
+                        else "failed"
+                    ),
+                    source_ids=plan.source_ids,
+                    hashes=hashes,
+                    counts=counts,
+                )
+            else:
+                status = {
+                    "applied": "delivered_checkpoint_unchanged",
+                    "stored_unvalidated": "delivered_checkpoint_unchanged",
+                    "conflict": "delivered_checkpoint_conflict",
+                    "failed": "delivered_checkpoint_failed",
+                }.get(cached, "delivered_checkpoint_failed")
+                self._record_receipt(attempt_key, stage, plan, status)
             return None
 
         receipt_id, hashes, counts = self._receipt_material(
@@ -1433,6 +1652,27 @@ class ContinuityRuntime:
             stage,
             plan,
         )
+        stored_checkpoint = plan.source_checkpoint
+        if (
+            candidate is None
+            and getattr(self.adapter, "history_index", None) is not None
+            and isinstance(stored_checkpoint, Mapping)
+            and str(stored_checkpoint.get("schema") or "")
+            == "thread_continuity_checkpoint.v3"
+        ):
+            from .checkpoint_store_v3 import record_checkpoint_delivery_v3
+
+            record_checkpoint_delivery_v3(
+                self.adapter.metadata_store,
+                attempt_key[0],
+                checkpoint=stored_checkpoint,
+                receipt_id=receipt_id,
+                outcome="unchanged",
+                source_ids=plan.source_ids,
+                hashes=hashes,
+                counts=counts,
+            )
+            return None
         settler = getattr(self.adapter, "settle_checkpoint_delivery", None)
         if not callable(settler):
             settled: Mapping[str, Any] = {
@@ -1460,10 +1700,10 @@ class ContinuityRuntime:
                 "receipt_recorded": False,
             }
         outcome = str(settled.get("status") or "failed")
-        if outcome not in {"applied", "unchanged", "conflict", "failed"}:
+        if outcome not in {"applied", "stored_unvalidated", "unchanged", "conflict", "failed"}:
             outcome = "failed"
         if candidate is not None:
-            terminal = outcome if outcome in {"applied", "conflict"} else "failed"
+            terminal = outcome if outcome in {"applied", "stored_unvalidated", "conflict"} else "failed"
             with self._publish_condition:
                 plan.publish_status = terminal
                 self._publish_condition.notify_all()
@@ -1489,6 +1729,9 @@ class ContinuityRuntime:
             self._trim_locked(
                 protected_turns=(projection.turn_key,) if projection else ()
             )
+            active = {value.turn_key for value in (*self._projections.values(), *self._transport.values())}
+            if attempt_key[:2] not in active:
+                self._release_workset(attempt_key[:2])
         return None
 
     def status_command(self, raw_args: str = "") -> str:
@@ -1503,9 +1746,15 @@ class ContinuityRuntime:
                 if not session_filter or turn_key[0] == session_filter
             ]
             reason_counts: dict[str, int] = {}
+            recall_counts: dict[str, int] = {}
+            recall_reasons: dict[str, int] = {}
             for _turn_key, plan in plans:
                 if plan.reason:
                     reason_counts[plan.reason] = reason_counts.get(plan.reason, 0) + 1
+                if plan.recall_status:
+                    recall_counts[plan.recall_status] = recall_counts.get(plan.recall_status, 0) + 1
+                if plan.recall_reason:
+                    recall_reasons[plan.recall_reason] = recall_reasons.get(plan.recall_reason, 0) + 1
             context_source_counts: dict[str, int] = {}
             context_confidence_counts: dict[str, int] = {}
             for _turn_key, plan in plans:
@@ -1542,9 +1791,11 @@ class ContinuityRuntime:
                     status: sum(
                         1 for _key, plan in plans if plan.publish_status == status
                     )
-                    for status in ("applied", "conflict", "failed", "in_progress")
+                    for status in ("applied", "stored_unvalidated", "conflict", "failed", "in_progress")
                 },
                 "reason_counts": reason_counts,
+                "recall_status_counts": recall_counts,
+                "recall_reason_counts": recall_reasons,
                 "context_window_source_counts": context_source_counts,
                 "context_window_confidence_counts": context_confidence_counts,
                 "final_provider_estimate": {
@@ -1570,12 +1821,20 @@ class ContinuityRuntime:
                     "status": "unavailable",
                     "body_included": False,
                 }
+        if store is not None and getattr(self.adapter, "history_index", None) is not None:
+            from .checkpoint_store_v3 import checkpoint_v3_status
+            payload["durable_v3"] = checkpoint_v3_status(store, session_filter)
+            payload["history_preparation"] = self.adapter.history_index.status(session_filter)
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     def clear(self) -> None:
         """Drop process-private frozen plans; durable checkpoints stay intact."""
 
         with self._lock:
+            self._closed = True
+            for turn_key in self._turns:
+                ACTIVE_WORKSETS.release(self._budget_key(turn_key))
+                COLD_PLANS.release(self._budget_key(turn_key))
             self._turns.clear()
             self._compiling.clear()
             self._projections.clear()

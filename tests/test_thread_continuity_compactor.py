@@ -1007,7 +1007,7 @@ class ThreadContinuitySummaryBatchTests(unittest.TestCase):
             )
         self.assertTrue(all(message.get("content") != tail_a[0]["content"] for message in planned["provider_messages"]))
 
-    def test_prompt_preserves_typed_multimodal_names_and_excludes_current(self) -> None:
+    def test_prompt_preserves_recorded_text_names_and_excludes_pixels_and_current(self) -> None:
         parts = [
             {"type": "input_text", "text": "看这四张图"},
             *[
@@ -1022,7 +1022,11 @@ class ThreadContinuitySummaryBatchTests(unittest.TestCase):
         self.assertEqual(plan["status"], "ready")
         prompt = plan["provider_messages"]
         self.assertTrue(any(message.get("name") == "owner" for message in prompt))
-        self.assertTrue(any(message.get("content") == parts for message in prompt))
+        projected = context_compactor._summary_source_content(parts)
+        self.assertTrue(any(message.get("content") == projected for message in prompt))
+        self.assertEqual(projected[0], parts[0])
+        self.assertNotIn("https://example.invalid/", json.dumps(prompt))
+        self.assertEqual(rows[0]["messages"][0]["content"], parts)
         self.assertFalse(any(message.get("content") == current["content"] for message in prompt))
         instruction = prompt[0]["content"].lower()
         for term in ("people", "events", "decisions", "emotions", "causes", "promises", "open loops", "uncertainty"):
@@ -1687,12 +1691,12 @@ class ThreadContinuitySummaryChunkTests(unittest.TestCase):
         self.fail("chunk protocol did not terminate")
 
     def test_fragments_preserve_canonical_body_and_only_finalize_source_once(self) -> None:
-        user = "甲" * 100 + " \n\t  " + "乙" * 100
+        user = "甲" * 500 + " \n\t  " + "乙" * 500
         assistant = [
-            {"type": "input_text", "text": "丙" * 80},
+            {"type": "input_text", "text": "丙" * 400},
             {"type": "input_text", "text": ""},
             {"type": "image_url", "image_url": {"url": "https://example.invalid/one.png"}},
-            {"type": "text", "text": "丁" * 80},
+            {"type": "text", "text": "丁" * 400},
         ]
         rows = [group("huge", user, assistant), group("tail", "未折叠尾巴", "尾巴回答")]
         rows[0]["messages"][0]["name"] = "human-owner"
@@ -1763,7 +1767,11 @@ class ThreadContinuitySummaryChunkTests(unittest.TestCase):
         self.assertEqual(plan["status"], "complete")
         self.assertEqual(plan["covered_source_group_ids"], ["huge"])
         self.assertEqual("".join(user_fragments), user)
-        self.assertEqual("".join(assistant_fragments), self._typed_stream(assistant))
+        self.assertEqual(
+            "".join(assistant_fragments),
+            self._typed_stream(context_compactor._summary_source_content(assistant)),
+        )
+        self.assertEqual(rows[0]["messages"][1]["content"], assistant)
         self.assertTrue(empty_part_seen)
         self.assertEqual(phases[-1], "group_finalize")
         self.assertTrue(all(phase == "fragment_update" for phase in phases[:-1]))
@@ -1879,7 +1887,7 @@ class ThreadContinuitySummaryChunkTests(unittest.TestCase):
         )
         self.assertEqual((recovered["status"], recovered["descriptor"]["fragment_start"]), ("ready", 0))
 
-    def test_atomic_image_over_budget_blocks_without_cursor_or_source_progress(self) -> None:
+    def test_image_pixels_are_not_a_recurrent_atomic_budget_obligation(self) -> None:
         image = [{"type": "image_url", "image_url": {"url": "https://example.invalid/huge.png"}}]
         rows = [group("image", image, "回答" * 100)]
 
@@ -1893,14 +1901,13 @@ class ThreadContinuitySummaryChunkTests(unittest.TestCase):
 
         current = {"role": "user", "message_id": "u-current", "content": "当前"}
         owner = fold_plan(rows, window=280, reserve=40, current=current, estimator=expensive_image)
-        blocked = plan_next_summary_chunk_attempt(
-            **chunk_inputs(rows, owner, current, estimator=expensive_image, minimum=[])
-        )
-        self.assertEqual(
-            (blocked["status"], blocked["reason"], blocked["blocked_atom_kind"]),
-            ("blocked", "atomic_fragment_too_large", "image_url"),
-        )
-        self.assertEqual(blocked["progress_source_group_count"], 0)
+        inputs = chunk_inputs(rows, owner, current, estimator=expensive_image, minimum=[])
+        ready = plan_next_summary_chunk_attempt(**inputs)
+        self.assertEqual(ready["status"], "ready")
+        self.assertNotIn("image_url", json.dumps(ready["provider_messages"]))
+        accepted = accept_summary_chunk_attempt(ready["descriptor"], "仍有文字待处理", **inputs)
+        self.assertEqual(accepted["progress_source_group_count"], 0)
+        self.assertEqual(rows[0]["messages"][0]["content"], image)
 
     def test_nonmonotonic_estimator_never_turns_first_over_second_fit_into_progress(self) -> None:
         rows = [group("huge", "用" * 60, "答" * 60)]

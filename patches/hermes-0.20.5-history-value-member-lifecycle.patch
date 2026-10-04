@@ -1,0 +1,159 @@
+diff --git a/hermes_state_history.py b/hermes_state_history.py
+index b279bab7..ebb4b176 100644
+--- a/hermes_state_history.py
++++ b/hermes_state_history.py
+@@ -2314,8 +2314,13 @@ class SessionHistoryMixin:
+                     if proofs:
+                         envelope = {'schema':'hermes.history_value_proofs.v1',
+                                     'values':proofs, 'sha256':_digest(proofs)}
+-                        conn.execute("INSERT OR REPLACE INTO hermes_history_values VALUES(?,?,?)",
+-                                     (domain_id,int(row["id"]),json.dumps(envelope,separators=(',',':'))))
++                        # Successful lifecycle audit can legally skip a rewound
++                        # row. Persist a child proof only for its actual member.
++                        conn.execute(
++                            "INSERT OR REPLACE INTO hermes_history_values "
++                            "SELECT domain_id,message_id,? FROM hermes_history_members "
++                            "WHERE domain_id=? AND message_id=?",
++                            (json.dumps(envelope,separators=(',',':')),domain_id,int(row["id"])))
+                     domain["cursor_message_id"] = int(row["id"])
+                     physical_rows += 1
+                 pages += 1
+diff --git a/tests/test_history_stream_values.py b/tests/test_history_stream_values.py
+index dcf31e92..ee237e08 100644
+--- a/tests/test_history_stream_values.py
++++ b/tests/test_history_stream_values.py
+@@ -1,8 +1,11 @@
+ """The byte-work owner must finish all raw/semantic hashes before publishing."""
+ import hashlib
+ import json
++import subprocess
+ import sqlite3
++import sys
+ import time
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -231,3 +234,122 @@ def test_same_size_edit_restarts_byte_work_and_descriptor_corruption_is_rejected
+         db._execute_write(corrupt)
+         with pytest.raises(ValueError,match='history_value_descriptor_invalid'):
+             db.read_history_page('edited',target=result['head_token'])
++
++
++def _rewound_value_case(path, kind, lifecycle, phase):
++    """Real host in a disposable process; no hand-written proof or parser."""
++    from hermes_state import SessionDB
++    import hermes_state_history as history
++
++    def prepare(db):
++        for _ in range(2000):
++            result = db.prepare_history_step("lifecycle", owner_id="value-lifecycle", deadline_ms=50)
++            if result["status"] == "ready":
++                return result
++            assert result["status"] == "progress", result
++        raise AssertionError("value lifecycle preparation stalled")
++
++    with SessionDB(Path(path)) as db:
++        assert db._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
++        if phase == "seed":
++            db.create_session("lifecycle", "cli")
++            db.append_message("lifecycle", "user", "ordinary question", timestamp=1)
++            db.append_message("lifecycle", "assistant", "ordinary answer", timestamp=2)
++            value = ("small withdrawn" if kind == "small" else "A"*(5*1024*1024))
++            if kind == "multimodal":
++                value = [{"type": "text", "text": "recorded image meaning"},
++                         {"type": "image_url", "image_url": {"url": "data:image/png;base64,"+value}}]
++            target = db.append_message("lifecycle", "user", value, timestamp=3)
++            db.append_message("lifecycle", "assistant", "recorded response", timestamp=4)
++            if lifecycle == "rewound":
++                assert db.rewind_to_message("lifecycle", target)["rewound_count"] == 2
++            elif lifecycle == "compacted":
++                db._execute_write(lambda conn: conn.execute(
++                    "UPDATE messages SET active=0,compacted=1 WHERE id>=?", (target,)))
++        else:
++            target = db._conn.execute("SELECT id FROM messages WHERE timestamp=3").fetchone()[0]
++            # A fresh process plus the actual rollback invalidation forces
++            # source revalidation, rather than trusting the previous ready row.
++            db.invalidate_history_for_rollback()
++        before = [tuple(row) for row in db._conn.execute("SELECT * FROM messages ORDER BY id")]
++        result = prepare(db)
++        assert result["canonical_count"] == (2 if lifecycle == "rewound" else 4)
++        assert [tuple(row) for row in db._conn.execute("SELECT * FROM messages ORDER BY id")] == before
++        expected_member = int(lifecycle != "rewound")
++        assert db._conn.execute(
++            "SELECT count(*) FROM hermes_history_members WHERE message_id=?", (target,)
++        ).fetchone()[0] == expected_member
++        expected_value = expected_member * int(kind != "small")
++        assert db._conn.execute(
++            "SELECT count(*) FROM hermes_history_values WHERE message_id=?", (target,)
++        ).fetchone()[0] == expected_value
++        page = db.read_history_page("lifecycle", target=result["head_token"])
++        assert page["status"] == "ready" and page["returned_rows"] == result["canonical_count"]
++        assert page["rows"][0]["content"] == "ordinary question"
++        if phase == "reopen" and lifecycle == "rewound":
++            constructed = []
++            original_work = history.ValueWork
++            def tracked(*args, **kwargs):
++                work = original_work(*args, **kwargs)
++                constructed.append(work)
++                return work
++            history.ValueWork = tracked
++            try:
++                assert db.restore_rewound("lifecycle", target) == 2
++                restored = prepare(db)
++            finally:
++                history.ValueWork = original_work
++            assert restored["canonical_count"] == 4
++            after = [tuple(row) for row in db._conn.execute("SELECT * FROM messages ORDER BY id")]
++            columns = [row[1] for row in db._conn.execute("PRAGMA table_info(messages)")]
++            active_column = columns.index("active")
++            for original, current in zip(before, after):
++                assert current == tuple(1 if index == active_column else value
++                                        for index, value in enumerate(original))
++            if kind != "small":
++                assert constructed and all(work.complete for work in constructed)
++            result = restored
++        if kind != "small" and (lifecycle != "rewound" or phase == "reopen"):
++            envelope = json.loads(db._conn.execute(
++                "SELECT proof_json FROM hermes_history_values WHERE message_id=?", (target,)
++            ).fetchone()[0])
++            raw = db._conn.execute("SELECT content FROM messages WHERE id=?", (target,)).fetchone()[0]
++            assert envelope["values"]["content"]["raw_ascii_sha256"] == hashlib.sha256(
++                json.dumps(raw, ensure_ascii=True).encode()).hexdigest()
++            content = db.read_history_page("lifecycle", target=result["head_token"])["rows"][2]["content"]
++            assert isinstance(content, HistoryValue)
++            if kind == "text":
++                assert content.root.slice(0,10) == "A"*10
++            else:
++                assert content.root[0]["text"] == "recorded image meaning"
++                assert content.root[1]["image_url"]["url"].slice(0,22) == "data:image/png;base64,"
++        if phase == "reopen" and lifecycle == "rewound":
++            # Also withdraw an already indexed row: invalidation must remove
++            # its old child proof before rebuilding the same legal skip.
++            assert db.rewind_to_message("lifecycle", target)["rewound_count"] == 2
++            before_redo = [tuple(row) for row in db._conn.execute("SELECT * FROM messages ORDER BY id")]
++            assert prepare(db)["canonical_count"] == 2
++            assert db._conn.execute("SELECT count(*) FROM hermes_history_values").fetchone()[0] == 0
++            assert [tuple(row) for row in db._conn.execute("SELECT * FROM messages ORDER BY id")] == before_redo
++            assert db.restore_rewound("lifecycle", target) == 2
++            assert prepare(db)["canonical_count"] == 4
++            assert db._conn.execute("SELECT count(*) FROM hermes_history_values").fetchone()[0] == int(kind != "small")
++        assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
++    print(json.dumps({"kind": kind, "lifecycle": lifecycle, "phase": phase, "status": "verified"}))
++
++
++@pytest.mark.parametrize("kind,lifecycle", [
++    ("small", "rewound"), ("text", "rewound"), ("multimodal", "rewound"),
++    ("text", "active"), ("multimodal", "active"),
++    ("text", "compacted"), ("multimodal", "compacted"),
++])
++def test_real_host_giant_rewind_rebuild_reopen_and_restore(tmp_path, kind, lifecycle):
++    command = [sys.executable, "-B", "-c",
++               "import runpy,sys; runpy.run_path(sys.argv[1])['_rewound_value_case'](*sys.argv[2:])",
++               str(Path(__file__).resolve()), str(tmp_path/"lifecycle.sqlite3"), kind, lifecycle]
++    for phase in ("seed", "reopen"):
++        # External process timeout also catches a non-yielding preparation loop.
++        completed = subprocess.run(command+[phase], capture_output=True, text=True, timeout=90)
++        assert completed.returncode == 0, completed.stdout+completed.stderr
++        assert json.loads(completed.stdout.splitlines()[-1]) == {
++            "kind": kind, "lifecycle": lifecycle, "phase": phase, "status": "verified"}

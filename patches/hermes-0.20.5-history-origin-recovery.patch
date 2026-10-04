@@ -1,0 +1,294 @@
+From ff67db0d2fdf1a08c02aedccedb77f29a7549a24 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 21:45:28 +0800
+Subject: [PATCH] fix(history): preserve and recover evidenced notification
+ clone origin
+
+---
+ gateway/run.py                            |  6 ++
+ hermes_state_history.py                   | 54 +++++++++++++--
+ tests/gateway/test_replay_entry_fields.py | 30 +++++++-
+ tests/test_hermes_state_history.py        | 83 +++++++++++++++++++++++
+ 4 files changed, 165 insertions(+), 8 deletions(-)
+
+diff --git a/gateway/run.py b/gateway/run.py
+index 13ff7f9..dabc83f 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -26,6 +26,7 @@ except ModuleNotFoundError:
+ 
+ import asyncio
+ import concurrent.futures
++import copy
+ import dataclasses
+ import faulthandler
+ import inspect
+@@ -1431,6 +1432,11 @@ def _build_replay_entry(
+     providers.
+     """
+     entry: Dict[str, Any] = {"role": role, "content": content}
++    # Durable producer metadata must survive replay and later compaction.
++    # Only the provider-bound copy strips these fields.
++    for key in ("display_kind", "display_metadata"):
++        if key in msg:
++            entry[key] = copy.deepcopy(msg[key])
+     # api_content sidecar (persist-what-you-send, prompt-cache stability):
+     # forward the exact bytes previously sent to the API for this message so
+     # the agent's api_messages build can substitute them and keep the request
+diff --git a/hermes_state_history.py b/hermes_state_history.py
+index cf811ce..4d3cd1d 100644
+--- a/hermes_state_history.py
++++ b/hermes_state_history.py
+@@ -21,7 +21,7 @@ from contextlib import contextmanager
+ from typing import Any, Callable, Dict, Mapping, Optional, Sequence
+ 
+ 
+-HISTORY_RULE_VERSION = "hermes.canonical_history_rule.v1"
++HISTORY_RULE_VERSION = "hermes.canonical_history_rule.v2"
+ HISTORY_PREFIX_SCHEMA = "hermes.canonical_history_prefix.v1"
+ HISTORY_CURSOR_SCHEMA = "hermes.canonical_history_cursor.v1"
+ HISTORY_PREPARE_SCHEMA = "hermes.canonical_history_prepare.v1"
+@@ -1322,6 +1322,30 @@ class SessionHistoryMixin:
+             "compacted": int(raw_compacted) if lifecycle_valid else -1,
+         }
+ 
++    def _history_recover_notification_clone(self, conn, domain_id, bucket, row):
++        """Recover a lost tag from an older archived, otherwise exact clone.
++
++        This is a derived view only. Physical members keep their original
++        signatures; missing metadata never independently grants human origin.
++        """
++        if (row["role"] != "user" or row["display_kind"] is not None
++                or int(row["id"]) <= int(bucket["earliest_message_id"])):
++            return None
++        origin = conn.execute(
++            "SELECT CASE WHEN display_kind='internal_notification' "
++            "AND active=0 AND compacted=1 THEN 1 ELSE 0 END "
++            "FROM messages WHERE session_id=? AND id=?",
++            (domain_id, bucket["earliest_message_id"]),
++        ).fetchone()
++        if origin is None or origin[0] != 1:
++            return None
++        recovered = dict(row, display_kind="internal_notification")
++        material = self._history_row_material(recovered, 0)
++        if any(bucket[key] != material[key] for key in (
++                "raw_key_digest", "semantic_key_digest", "raw_signature", "semantic_signature")):
++            return None
++        return recovered
++
+     def _history_index_row(
+         self,
+         conn: sqlite3.Connection,
+@@ -1406,18 +1430,23 @@ class SessionHistoryMixin:
+             domain["prefix_hash"] = prefix_hash
+         else:
+             bucket = dict(bucket_row)
++            recovered = None
+             if (
+                 bucket["raw_key_digest"] != material["raw_key_digest"]
+                 or bucket["raw_signature"] != material["raw_signature"]
+                 or bucket["semantic_signature"] != material["semantic_signature"]
+             ):
+-                return "canonical_clone_audit_collision"
++                recovered = self._history_recover_notification_clone(
++                    conn, domain["domain_id"], bucket, row)
++                if recovered is None:
++                    return "canonical_clone_audit_collision"
+             if material["active"] and int(bucket["active_count"]) > 0:
+                 return "canonical_active_collision"
+             if not material["active"] and int(bucket["active_count"]) > 0:
+                 return "canonical_clone_order_invalid"
+             winner_id = material["message_id"]
+-            winner_bytes = material["stored_bytes"]
++            winner_bytes = material["stored_bytes"] + (
++                len("internal_notification") if recovered is not None else 0)
+             active_count = int(bucket["active_count"]) + material["active"]
+             domain["physical_cursor_position"] = min(
+                 int(domain["physical_cursor_position"]),
+@@ -1849,12 +1878,16 @@ class SessionHistoryMixin:
+                     (domain_id,),
+                 ).fetchone()
+             domain = dict(existing)
+-            if domain["activation_epoch"] != state["activation_epoch"]:
++            if (domain["activation_epoch"] != state["activation_epoch"]
++                    or domain["canonical_rule_version"] != HISTORY_RULE_VERSION):
++                reason = ("activation_epoch_changed" if domain["activation_epoch"]
++                          != state["activation_epoch"] else "canonical_rule_changed")
+                 domain["activation_epoch"] = state["activation_epoch"]
++                domain["canonical_rule_version"] = HISTORY_RULE_VERSION
+                 self._history_reset_suffix(conn, domain, 1)
+                 domain["target_max_message_id"] = current_max_id
+                 domain["scan_base_change_seq"] = current_seq
+-                domain["failure_reason"] = "activation_epoch_changed"
++                domain["failure_reason"] = reason
+             if domain["topology_revision"] != topology:
+                 domain["topology_revision"] = topology
+                 # Topology is part of the proof identity, not of the canonical
+@@ -2305,6 +2338,10 @@ class SessionHistoryMixin:
+         state = dict(state_row)
+         domain = dict(domain_row)
+         current_seq = int(domain["indexed_change_seq"])
++        if domain["canonical_rule_version"] != HISTORY_RULE_VERSION:
++            return self._history_validation_result(
++                "incompatible", "canonical_rule_changed", current_seq=current_seq
++            )
+         if not state["capture_enabled"] or not self._history_journal_contiguous(
+             conn, state
+         ):
+@@ -2606,7 +2643,12 @@ class SessionHistoryMixin:
+                             "stored_bytes": 0,
+                         }
+                     raw_rows = [by_id[value] for value in winner_ids]
+-                decoded = self._decode_message_rows(raw_rows)
++                projected = []
++                for index_row, raw_row in zip(selected, raw_rows):
++                    recovered = self._history_recover_notification_clone(
++                        conn, domain_id, index_row, raw_row)
++                    projected.append(recovered if recovered is not None else raw_row)
++                decoded = self._decode_message_rows(projected)
+                 entries = [
+                     {
+                         "anchor": str(row["anchor"]),
+diff --git a/tests/gateway/test_replay_entry_fields.py b/tests/gateway/test_replay_entry_fields.py
+index 4bb27e8..b6340d2 100644
+--- a/tests/gateway/test_replay_entry_fields.py
++++ b/tests/gateway/test_replay_entry_fields.py
+@@ -17,10 +17,37 @@ These tests pin the expanded whitelist so it doesn't regress.
+ from __future__ import annotations
+ 
+ 
+-from gateway.run import _ASSISTANT_REPLAY_FIELDS, _build_replay_entry
++from gateway.run import _ASSISTANT_REPLAY_FIELDS, _build_replay_entry, _build_gateway_agent_history
+ 
+ 
+ class TestBuildReplayEntry:
++    def test_gateway_replay_compaction_preserves_origin_across_generations(self, tmp_path):
++        from hermes_state import SessionDB
++        with SessionDB(tmp_path / "state.db") as db:
++            db.create_session("notification", source="qq")
++            db.append_message("notification", "user", "New data arrived from the webhook",
++                              timestamp=1, display_kind="internal_notification",
++                              display_metadata={"internal_kind": "wakeup"})
++            for _ in range(2):
++                history, _ = _build_gateway_agent_history(db.get_messages_as_conversation("notification"))
++                assert history[0]["display_kind"] == "internal_notification"
++                assert history[0]["display_metadata"] == {"internal_kind": "wakeup"}
++                db.archive_and_compact("notification", history)
++            rows = db._conn.execute("SELECT display_kind,display_metadata FROM messages ORDER BY id").fetchall()
++            assert len(rows) == 3
++            assert all(row["display_kind"] == "internal_notification" for row in rows)
++            assert len({row["display_metadata"] for row in rows}) == 1
++
++    def test_replay_preserves_producer_metadata_without_aliasing(self):
++        msg = {"role": "user", "content": "notification", "timestamp": 1,
++               "display_kind": "internal_notification",
++               "display_metadata": {"internal_kind": "wakeup", "extra": ["original"]}}
++        entry = _build_replay_entry("user", msg["content"], msg, preserve_timestamp=True)
++        assert entry["display_kind"] == msg["display_kind"]
++        assert entry["display_metadata"] == msg["display_metadata"]
++        entry["display_metadata"]["extra"].append("changed")
++        assert msg["display_metadata"]["extra"] == ["original"]
++
+     def test_user_message_has_only_role_and_content(self):
+         entry = _build_replay_entry(
+             "user",
+@@ -142,4 +169,3 @@ class TestGatewayHistoryBuildForwardsSidecar:
+         ]
+         agent_history, _obs = _build_gateway_agent_history(history)
+         assert agent_history[0]["api_content"] == "hi\n\nCTX"
+-
+diff --git a/tests/test_hermes_state_history.py b/tests/test_hermes_state_history.py
+index f77a4f0..8f54656 100644
+--- a/tests/test_hermes_state_history.py
++++ b/tests/test_hermes_state_history.py
+@@ -425,6 +425,89 @@ def test_clone_lifecycle_keeps_logical_token_valid_but_requests_physical_refresh
+     assert validation["invalidated_from_position"] == 1
+ 
+ 
++def _notification_clones(db, **changed):
++    db.append_message("history", "user", "notification", timestamp=1,
++                      display_kind="internal_notification")
++    original = db.get_messages("history")
++    missing = dict(original[0], display_kind=None, **changed)
++    db.archive_and_compact("history", [missing])
++    db.archive_and_compact("history", [missing])
++    db.append_message("history", "assistant", "reply", timestamp=2)
++
++
++def test_notification_clone_recovers_content_without_rewriting_physical_rows(history_db):
++    _notification_clones(history_db)
++    before = [tuple(row) for row in history_db._conn.execute("SELECT * FROM messages ORDER BY id")]
++    ready = _prepare(history_db)
++    assert ready["status"] == "ready"
++    assert ready["canonical_count"] == 2
++    page = history_db.read_history_page("history", target=ready["head_token"])
++    assert [row["content"] for row in page["rows"]] == ["notification", "reply"]
++    assert page["rows"][0]["display_kind"] == "internal_notification"
++    assert page["entries"][0]["physical_count"] == 3
++    assert [tuple(row) for row in history_db._conn.execute("SELECT * FROM messages ORDER BY id")] == before
++    members = history_db._conn.execute(
++        "SELECT COUNT(DISTINCT raw_signature), COUNT(DISTINCT semantic_signature) "
++        "FROM hermes_history_members WHERE domain_id='history' AND anchor=?",
++        (page["entries"][0]["anchor"],),
++    ).fetchone()
++    assert tuple(members) == (2, 2)  # Original evidence, not normalized physical signatures.
++    size = page["entries"][0]["stored_bytes"]
++    exact = history_db.read_history_page("history", target=ready["head_token"], max_rows=1, max_bytes=size)
++    assert exact["status"] == "ready"
++    too_small = history_db.read_history_page("history", target=ready["head_token"], max_rows=1, max_bytes=size-1)
++    assert too_small["status"] == "overflow" and not too_small["rows"]
++
++
++@pytest.mark.parametrize("changed", [
++    {"api_content": "different API material"},
++    {"display_metadata": {"internal_kind": "wakeup"}},
++    {"platform_message_id": "different-platform-id"},
++    {"finish_reason": "stop"},
++])
++def test_notification_recovery_does_not_hide_other_persisted_conflicts(history_db, changed):
++    _notification_clones(history_db, **changed)
++    result = _prepare(history_db)
++    assert result["reason"] == "canonical_clone_audit_collision"
++
++
++def test_recovered_origin_mutation_invalidates_and_rejects_recovery(history_db):
++    _notification_clones(history_db)
++    ready = _prepare(history_db)
++    with history_db._conn:
++        history_db._conn.execute("UPDATE messages SET display_kind='hidden' WHERE id=(SELECT MIN(id) FROM messages)")
++    assert history_db.validate_history_prefix(ready["head_token"])["status"] != "valid"
++    assert _prepare(history_db)["reason"] == "canonical_clone_audit_collision"
++
++
++def test_rule_change_resets_existing_domain_before_minting_new_proof(history_db):
++    _append_turn(history_db, 1)
++    ready = _prepare(history_db)
++    old_token = dict(ready["head_token"], canonical_rule_version="hermes.canonical_history_rule.v1")
++    assert history_db.validate_history_prefix(old_token)["status"] == "incompatible"
++    with history_db._conn:
++        history_db._conn.execute("UPDATE hermes_history_domains SET canonical_rule_version='hermes.canonical_history_rule.v1'")
++    assert history_db.validate_history_prefix(ready["head_token"])["reason"] == "canonical_rule_changed"
++    sealed = history_db.seal_history_prefix("history", activation_epoch=ready["activation_epoch"], end_anchor=None)
++    assert sealed["reason"] == "canonical_rule_changed" and sealed["token"] is None
++    step = history_db.prepare_history_step("history", owner_id="test-owner", activation_epoch=ready["activation_epoch"], max_pages=1)
++    assert step["status"] == "progress" and step["head_token"] is None
++    assert _prepare(history_db)["status"] == "ready"
++
++
++@pytest.mark.parametrize("original_kind,clone_kind", [
++    ("hidden", None), (None, "internal_notification"),
++    ("internal_notification", "hidden"),
++])
++def test_recovery_requires_earlier_explicit_notification_and_missing_clone(history_db, original_kind, clone_kind):
++    history_db.append_message("history", "user", "notification", timestamp=1,
++                              display_kind=original_kind)
++    clone = dict(history_db.get_messages("history")[0], display_kind=clone_kind)
++    history_db.archive_and_compact("history", [clone])
++    history_db.append_message("history", "assistant", "reply", timestamp=2)
++    assert _prepare(history_db)["reason"] == "canonical_clone_audit_collision"
++
++
+ def test_physical_validation_uses_point_lookups_for_large_old_prefix(history_db):
+     history_db._execute_write(
+         lambda conn: conn.executemany(
+
