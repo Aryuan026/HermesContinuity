@@ -55,6 +55,15 @@ class FakeSessionDB:
     def close(self):
         self.closed = True
 
+    def _read_ctx(self):
+        raise NotImplementedError
+
+    def _decode_message_rows(self, rows):
+        return rows
+
+    def _dedupe_compacted_message_rows(self, rows):
+        return rows
+
     def get_messages_time_window(self, session_id, **kwargs):
         return {
             "messages": [],
@@ -75,8 +84,10 @@ class FakeContext:
         self.commands: list[tuple[str, object, str, str]] = []
         self.unload: list[object] = []
         self.config: dict[str, object] = {}
+        self.config_reads: list[str] = []
 
     def get_config(self, key, default=None):
+        self.config_reads.append(key)
         return self.config.get(key, default)
 
     def register_middleware(self, name, callback):
@@ -99,7 +110,11 @@ class PluginRegistrationTests(unittest.TestCase):
     def setUp(self):
         FakeSessionDB.instances.clear()
         self.temp = tempfile.TemporaryDirectory()
-        self.ctx = FakeContext(Path(self.temp.name))
+        self.profile_home = Path(self.temp.name) / "profile"
+        self.plugin_data_dir = (
+            self.profile_home / "plugin-data" / "hermes-continuity"
+        )
+        self.ctx = FakeContext(self.plugin_data_dir)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -114,16 +129,24 @@ class PluginRegistrationTests(unittest.TestCase):
         middleware = types.ModuleType("hermes_cli.middleware")
         middleware.MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v2"
         middleware.TRANSPORT_SCHEMA_VERSION = "hermes.transport.v3"
+        request_overlay = types.ModuleType("hermes_cli.request_overlay")
+        request_overlay.REQUEST_OVERLAY_SCHEMA_VERSION = (
+            "hermes.request_overlay.v2"
+        )
         return {
             "agent": agent,
             "agent.plugin_llm": plugin_llm,
             "hermes_state": hermes_state,
             "hermes_cli": hermes_cli,
             "hermes_cli.middleware": middleware,
+            "hermes_cli.request_overlay": request_overlay,
         }
 
     def test_registers_only_request_execution_and_settlement_boundaries(self):
         self.ctx.config["additional_human_sources"] = ["custom_frontend"]
+        self.ctx.config["max_full_prefix_physical_rows"] = 321
+        self.ctx.config["max_full_prefix_bytes"] = 123456
+        self.ctx.config["max_checkpoint_bytes"] = 12345
         with patch.dict(sys.modules, self._modules(CompatibleResult)):
             plugin.register(self.ctx)
 
@@ -150,10 +173,21 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertIn(
             "custom_frontend", self.ctx.services[0][1].human_session_sources
         )
+        self.assertEqual(
+            self.ctx.services[0][1].adapter.max_full_prefix_physical_rows,
+            321,
+        )
+        self.assertEqual(self.ctx.services[0][1].adapter.max_full_prefix_bytes, 123456)
+        self.assertEqual(self.ctx.services[0][1].adapter.metadata_store.max_checkpoint_bytes, 12345)
         self.assertEqual(len(FakeSessionDB.instances), 1)
         self.assertTrue(FakeSessionDB.instances[0].read_only)
-        self.assertIsNone(FakeSessionDB.instances[0].db_path)
-        self.assertTrue((Path(self.temp.name) / "continuity.sqlite3").exists())
+        self.assertEqual(
+            FakeSessionDB.instances[0].db_path,
+            self.profile_home / "state.db",
+        )
+        self.assertTrue(
+            (self.plugin_data_dir / "continuity.sqlite3").exists()
+        )
 
         for callback in reversed(self.ctx.unload):
             callback()
@@ -185,34 +219,28 @@ class PluginRegistrationTests(unittest.TestCase):
 
         self.assertEqual(FakeSessionDB.instances, [])
 
-    def test_metadata_path_cannot_alias_state_database(self):
-        state_path = Path(self.temp.name) / "state.db"
-        state_path.touch()
+    def test_legacy_database_path_settings_cannot_escape_profile_realm(self):
+        outside_state = Path(self.temp.name) / "outside-state.db"
+        outside_metadata = Path(self.temp.name) / "outside-metadata.db"
         self.ctx.config.update(
-            state_db=str(state_path),
-            metadata_db=str(state_path),
+            state_db=str(outside_state),
+            metadata_db=str(outside_metadata),
         )
         with patch.dict(sys.modules, self._modules(CompatibleResult)):
-            with self.assertRaisesRegex(RuntimeError, "must not alias"):
-                plugin.register(self.ctx)
+            plugin.register(self.ctx)
 
         self.assertEqual(len(FakeSessionDB.instances), 1)
-        self.assertTrue(FakeSessionDB.instances[0].closed)
-        self.assertEqual(self.ctx.middleware, [])
-        self.assertEqual(self.ctx.hooks, [])
-        self.assertEqual(self.ctx.services, [])
-        self.assertEqual(self.ctx.commands, [])
-
-    def test_database_alias_check_catches_symlink_and_hardlink(self):
-        state_path = Path(self.temp.name) / "state.db"
-        state_path.touch()
-        symlink_path = Path(self.temp.name) / "state-link.db"
-        hardlink_path = Path(self.temp.name) / "state-hardlink.db"
-        symlink_path.symlink_to(state_path)
-        os.link(state_path, hardlink_path)
-
-        self.assertTrue(plugin._same_database(state_path, symlink_path))
-        self.assertTrue(plugin._same_database(state_path, hardlink_path))
+        self.assertEqual(
+            FakeSessionDB.instances[0].db_path,
+            self.profile_home / "state.db",
+        )
+        self.assertNotIn("state_db", self.ctx.config_reads)
+        self.assertNotIn("metadata_db", self.ctx.config_reads)
+        self.assertFalse(outside_state.exists())
+        self.assertFalse(outside_metadata.exists())
+        self.assertTrue(
+            (self.plugin_data_dir / "continuity.sqlite3").exists()
+        )
 
     def test_missing_bounded_window_seam_closes_db_before_registration(self):
         class IncompatibleSessionDB(FakeSessionDB):
@@ -256,6 +284,17 @@ class PluginRegistrationTests(unittest.TestCase):
 
         self.assertEqual(FakeSessionDB.instances, [])
 
+    def test_request_overlay_v1_fails_before_db_open(self):
+        modules = self._modules(CompatibleResult)
+        modules["hermes_cli.request_overlay"].REQUEST_OVERLAY_SCHEMA_VERSION = (
+            "hermes.request_overlay.v1"
+        )
+        with patch.dict(sys.modules, modules):
+            with self.assertRaisesRegex(RuntimeError, "hermes.request_overlay.v2"):
+                plugin.register(self.ctx)
+
+        self.assertEqual(FakeSessionDB.instances, [])
+
 
 class HermesPluginManagerIntegrationTests(unittest.TestCase):
     def _source_root(self) -> str:
@@ -263,6 +302,19 @@ class HermesPluginManagerIntegrationTests(unittest.TestCase):
         if not source_root:
             self.skipTest("set HERMES_SOURCE_ROOT to run against a Hermes checkout")
         return source_root
+
+    @staticmethod
+    def _load_plugin_in_profile(manager, manifest, home):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(home)
+        try:
+            manager._load_plugin(manifest)
+        finally:
+            reset_hermes_home_override(token)
 
     def test_real_ledger_withdraws_service_before_sessiondb_close(self):
         source_root = self._source_root()
@@ -290,7 +342,7 @@ class HermesPluginManagerIntegrationTests(unittest.TestCase):
                     path=str(ROOT),
                 )
                 with patch.object(hermes_state, "SessionDB", TrackingSessionDB):
-                    manager._load_plugin(manifest)
+                    self._load_plugin_in_profile(manager, manifest, temp_dir)
 
                 qualified = "hermes-continuity:canonical-source.v2"
                 service = manager._get_plugin_service(qualified)
@@ -348,8 +400,8 @@ class HermesPluginManagerIntegrationTests(unittest.TestCase):
                     path=str(ROOT),
                 )
                 with patch.object(hermes_state, "SessionDB", TrackingSessionDB):
-                    manager._load_plugin(manifest)
-                    manager._load_plugin(manifest)
+                    self._load_plugin_in_profile(manager, manifest, temp_dir)
+                    self._load_plugin_in_profile(manager, manifest, temp_dir)
 
                 qualified = "hermes-continuity:canonical-source.v2"
                 self.assertEqual(len(opened), 2)
@@ -361,6 +413,75 @@ class HermesPluginManagerIntegrationTests(unittest.TestCase):
                 self.assertFalse(
                     manager._plugins["hermes-continuity"].enabled
                 )
+        finally:
+            sys.path.remove(source_root)
+
+    def test_real_managers_keep_canonical_and_metadata_realms_profile_local(self):
+        source_root = self._source_root()
+        sys.path.insert(0, source_root)
+        try:
+            from hermes_cli.plugins import PluginManager, PluginManifest
+            from hermes_state import SessionDB
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                homes = [root / "profile-a", root / "profile-b"]
+                managers = []
+                services = []
+                manifest = PluginManifest(
+                    name="hermes-continuity",
+                    key="hermes-continuity",
+                    source="user",
+                    path=str(ROOT),
+                )
+                try:
+                    for home in homes:
+                        state_db = SessionDB(home / "state.db")
+                        state_db.close()
+                        manager = PluginManager(scope_key=str(home))
+                        self._load_plugin_in_profile(manager, manifest, home)
+                        managers.append(manager)
+                        services.append(
+                            manager._get_plugin_service(
+                                "hermes-continuity:canonical-source.v2"
+                            )
+                        )
+
+                    self.assertIsNot(services[0], services[1])
+                    for home, service in zip(homes, services, strict=True):
+                        self.assertIsNotNone(service)
+                        self.assertEqual(
+                            service.session_db.db_path,
+                            home / "state.db",
+                        )
+                        metadata_path = service.adapter.metadata_store.path
+                        self.assertEqual(metadata_path.name, "continuity.sqlite3")
+                        self.assertEqual(
+                            metadata_path.parent.parent,
+                            home / "plugin-data",
+                        )
+
+                    services[0].adapter.metadata_store.record_receipt(
+                        receipt_id="receipt_a",
+                        session_id="session_a",
+                        kind="delivery",
+                        status="delivered",
+                    )
+                    self.assertEqual(
+                        services[0].adapter.metadata_store.status_summary()[
+                            "receipt_count"
+                        ],
+                        1,
+                    )
+                    self.assertEqual(
+                        services[1].adapter.metadata_store.status_summary()[
+                            "receipt_count"
+                        ],
+                        0,
+                    )
+                finally:
+                    for manager in managers:
+                        manager.unload("hermes-continuity")
         finally:
             sys.path.remove(source_root)
 

@@ -13,30 +13,33 @@ import copy
 import hashlib
 import inspect
 import json
+import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
-from .context_compactor import thread_continuity_bridge_projection
-from .request_projection import (
-    CONTINUITY_END_BOUNDARY,
-    CONTINUITY_MARKER_NAMESPACE,
-    _last_real_user_index,
-    _request_text_occurrences,
-    _request_sha256,
-    _request_messages,
-    project_continuity_request,
-    verify_continuity_request_projection,
+from hermes_cli.request_overlay import (
+    OVERLAY_KEPT,
+    RequestOverlay,
+    canonical_request_sha256,
+    last_real_user_index,
+    project_request_overlay,
+    request_messages,
 )
+
+from .context_compactor import _summary_source_content, thread_continuity_bridge_projection
 from .thread_continuity_runtime import compile_thread_continuity_turn
+from .resource_budget import ACTIVE_WORKSETS, COLD_PLANS
+from .hermes_adapter import _json_text
 
 
-CONTINUITY_MARKER = (
-    CONTINUITY_MARKER_NAMESPACE + " marker=continuity_static]"
-)
+_request_sha256 = canonical_request_sha256
+CONTINUITY_MARKER_NAMESPACE = "[THREAD CONTINUITY QUOTED REFERENCE"
+CONTINUITY_END_BOUNDARY = "[END THREAD CONTINUITY QUOTED REFERENCE]"
+CONTINUITY_MARKER = CONTINUITY_MARKER_NAMESPACE + " marker=continuity_static]"
 _SUMMARY_PREFIXES = (
     "[CONTEXT COMPACTION — REFERENCE ONLY]",
     "[CONTEXT SUMMARY]:",
@@ -146,7 +149,7 @@ def _attachment_identity(item: Mapping[str, Any]) -> dict[str, str] | None:
     if payload is None:
         return None
     try:
-        digest = _request_sha256({"content": payload})
+        digest = canonical_request_sha256({"content": payload})
     except (TypeError, ValueError):
         return None
     return {"kind": kind, "content_sha256": digest}
@@ -186,7 +189,7 @@ def _current_identity_content(value: Any) -> Any:
 
 def _current_message_sha256(message: Mapping[str, Any]) -> str:
     try:
-        return _request_sha256(
+        return canonical_request_sha256(
             {
                 "role": "user",
                 "content": _current_identity_content(message.get("content")),
@@ -199,9 +202,9 @@ def _current_message_sha256(message: Mapping[str, Any]) -> str:
 def _text_anchor_present(candidate: str, anchor: str) -> bool:
     return bool(
         candidate == anchor
-        or candidate.startswith(anchor + "\n\n")
-        or candidate.endswith("\n\n" + anchor)
-        or f"\n\n{anchor}\n\n" in candidate
+        or candidate.startswith(anchor + "\n")
+        or candidate.endswith("\n" + anchor)
+        or f"\n{anchor}\n" in candidate
     )
 
 
@@ -237,7 +240,7 @@ def _request_has_user_anchor(
     anchor_sha256: str,
     anchor_identity: Any = None,
 ) -> bool:
-    shape = _request_messages(request)
+    shape = request_messages(request)
     if not anchor_sha256 or shape is None:
         return False
     for message in shape[1]:
@@ -380,16 +383,22 @@ class _TurnPlan:
     reserved_output_tokens: int = 0
     provider_key: tuple[str, str, str] = ("", "", "")
     publish_status: str = ""
+    source_checkpoint: dict[str, Any] | None = None
+    recall_proof: dict[str, Any] | None = None
+    recall_status: str = ""
+    recall_reason: str = ""
+    workset_bytes: int = 0
+    created_at: float = 0.0
+
+    def serialized_bytes(self):
+        return len(json.dumps(vars(self), ensure_ascii=False).encode("utf-8"))
 
 
 @dataclass
 class _Projection:
     turn_key: tuple[str, str]
     attempt_seq: int
-    proof: dict[str, Any] | None
-    carrier_material_sha256: str = ""
-    carrier_material_length: int = 0
-    carrier_material_kind: str = ""
+    overlay: RequestOverlay | None
     provider_key: tuple[str, str, str] = ("", "", "")
     request_model_sha256: str = ""
     context_window_tokens: int = 0
@@ -418,8 +427,7 @@ class ContinuityRuntime:
         plugin_llm: Any,
         *,
         compiler: Callable[..., Any] = compile_thread_continuity_turn,
-        projector: Callable[..., dict[str, Any]] = project_continuity_request,
-        verifier: Callable[..., dict[str, Any]] = verify_continuity_request_projection,
+        projector: Callable[..., RequestOverlay] = project_request_overlay,
         estimator: Callable[[list[dict[str, Any]]], int] | None = None,
         clock: Callable[[], str] | None = None,
         marker: str = CONTINUITY_MARKER,
@@ -436,7 +444,6 @@ class ContinuityRuntime:
         self.plugin_llm = plugin_llm
         self.compiler = compiler
         self.projector = projector
-        self.verifier = verifier
         self.estimator = estimator or _default_estimator
         self.clock = clock or _utc_now
         self.marker = str(marker)
@@ -456,6 +463,20 @@ class ContinuityRuntime:
         self._transport: dict[tuple[str, str, str], _TransportStage] = {}
         self._executing: set[tuple[str, str, str]] = set()
         self._attempt_seq = 0
+        self._budget_identity = object()
+        self._closed = False
+
+    def _budget_key(self, turn_key):
+        return (self._budget_identity, turn_key)
+
+    def _release_workset(self, turn_key):
+        ACTIVE_WORKSETS.release(self._budget_key(turn_key))
+        plan = self._turns.get(turn_key)
+        if plan is not None and plan.workset_bytes:
+            cold_bytes = plan.serialized_bytes()
+            if not COLD_PLANS.acquire(self._budget_key(turn_key), cold_bytes):
+                self._turns.pop(turn_key, None)
+                COLD_PLANS.release(self._budget_key(turn_key))
 
     def _trim_locked(
         self,
@@ -479,6 +500,8 @@ class ContinuityRuntime:
             if expired is None:
                 return False
             self._turns.pop(expired, None)
+            ACTIVE_WORKSETS.release(self._budget_key(expired))
+            COLD_PLANS.release(self._budget_key(expired))
             self._projections = {
                 key: value
                 for key, value in self._projections.items()
@@ -505,6 +528,15 @@ class ContinuityRuntime:
         for key in expired:
             self._projections.pop(key, None)
             self._transport.pop(key, None)
+        active_turns = {value.turn_key for value in (*self._projections.values(), *self._transport.values())}
+        for turn_key in {key[:2] for key in expired} - active_turns:
+            self._release_workset(turn_key)
+        for turn_key, plan in list(self._turns.items()):
+            if (plan.created_at and plan.created_at <= cutoff
+                    and turn_key not in active_turns and turn_key not in self._compiling):
+                self._turns.pop(turn_key, None)
+                ACTIVE_WORKSETS.release(self._budget_key(turn_key))
+                COLD_PLANS.release(self._budget_key(turn_key))
 
     def _attempt_capacity_available_locked(
         self,
@@ -534,11 +566,14 @@ class ContinuityRuntime:
             getattr(self.plugin_llm, "acomplete", None)
         ):
             raise RuntimeError("plugin_llm_unavailable")
+        summary_messages = copy.deepcopy([
+            {**row, "content": _summary_source_content(row.get("content"))}
+            for row in messages
+        ])
         marker = (
             f"{_SUMMARY_END_PREFIX}"
-            f"{_request_sha256({'descriptor': dict(descriptor), 'messages': messages})}]"
+            f"{canonical_request_sha256({'descriptor': dict(descriptor), 'messages': summary_messages})}]"
         )
-        summary_messages = copy.deepcopy(messages)
         terminal_instruction = (
             "End the response with this exact completion marker, exactly once, "
             "as the final non-whitespace text. Do not quote or explain it:\n"
@@ -555,7 +590,7 @@ class ContinuityRuntime:
             summary_messages,
             max_tokens=int(descriptor.get("max_output_tokens") or 0),
             timeout=self.summary_timeout_seconds,
-            purpose="thread_continuity_summary",
+            purpose=str(descriptor.get("purpose") or "thread_continuity_summary"),
         )
         finish_reason = getattr(result, "finish_reason", None)
         raw_text = str(getattr(result, "text", "") or "")
@@ -623,11 +658,11 @@ class ContinuityRuntime:
         context_window_source: Any,
         context_window_confidence: Any,
     ) -> _TurnPlan:
-        shape = _request_messages(request)
+        shape = request_messages(request)
         if shape is None:
             return _TurnPlan("", reason="request_carrier_ambiguous")
         _request_key, messages = shape
-        current_index = _last_real_user_index(messages)
+        current_index = last_real_user_index(messages)
         if current_index < 0:
             return _TurnPlan("", reason="real_user_carrier_missing")
         # A first sighting during a tool continuation has provider-owned tail
@@ -660,10 +695,32 @@ class ContinuityRuntime:
                 request, messages, current_index
             )
             reserve = _reserved_output_tokens(request, usable_window)
-            bundle = self.adapter.read_bundle(session_id)
+            reference_at = self.clock()
+            indexed = getattr(self.adapter, "history_index", None) is not None
+            bundle = (self.adapter.read_bundle(session_id, reference_at=reference_at,
+                                              recent_horizon_hours=self.recent_horizon_hours)
+                      if indexed else self.adapter.read_bundle(session_id))
             source = bundle.get("source") if isinstance(bundle, Mapping) else None
             if not isinstance(source, Mapping):
                 raise ValueError("source_unavailable")
+            if (
+                source.get("status") != "ready"
+                or source.get("scan_complete") is not True
+            ):
+                plan = _TurnPlan(
+                    current_sha,
+                    reason=str(source.get("error") or "source_unavailable"),
+                )
+                if indexed and plan.reason == "foreground_group_limit_exceeded":
+                    plan.context_window_tokens = window
+                    plan.usable_context_window_tokens = usable_window
+                    plan.context_window_source = source_label
+                    plan.context_window_confidence = confidence_label
+                    plan.reserved_output_tokens = reserve
+                    plan.provider_key = (model, provider, base_url)
+                    return self._add_recall(plan, session_id=session_id, query=current_text,
+                                            reference_at=reference_at)
+                return plan
             compacted_ids = list(
                 dict(source.get("stats") or {}).get(
                     "compacted_prefix_group_ids"
@@ -693,7 +750,7 @@ class ContinuityRuntime:
                 physical_owner_generation=object(),
                 post_current_messages=[],
                 minimum_fold_source_group_ids=compacted_ids,
-                bridge_reference_at=self.clock(),
+                bridge_reference_at=reference_at,
                 bridge_recent_horizon_hours=self.recent_horizon_hours,
                 bridge_source_token_limit=self.source_token_limit,
                 bridge_output_token_limit=self.output_token_limit,
@@ -722,7 +779,7 @@ class ContinuityRuntime:
         selected = candidate if candidate is not None else self._old_checkpoint(bundle)
         bridge = thread_continuity_bridge_projection(selected)
         raw_bridge_body = str(bridge.get("body") or "")
-        if str(bridge.get("status") or "") not in {"ready", "legacy_unverified"}:
+        if str(bridge.get("status") or "") != "ready":
             raw_bridge_body = ""
         bridge_body = (
             f"{raw_bridge_body.rstrip()}\n{CONTINUITY_END_BOUNDARY}"
@@ -742,7 +799,7 @@ class ContinuityRuntime:
             for value in list(bridge.get("represented_source_group_ids") or [])
             if str(value)
         )
-        return _TurnPlan(
+        plan = _TurnPlan(
             current_sha256=current_sha,
             marker=marker,
             bridge_body=bridge_body,
@@ -758,7 +815,72 @@ class ContinuityRuntime:
             context_window_confidence=confidence_label,
             reserved_output_tokens=reserve,
             provider_key=(model, provider, base_url),
+            source_checkpoint=(dict(selected) if indexed and selected else None),
+            workset_bytes=(len(_json_text(bundle).encode("utf-8"))
+                           if indexed else 0),
         )
+        return (self._add_recall(plan, session_id=session_id, query=current_text,
+                                 reference_at=reference_at) if indexed else plan)
+
+    def _add_recall(self, plan, *, session_id, query, reference_at):
+        index = self.adapter.history_index
+        if not callable(getattr(getattr(index, "db", None), "search_history_matches", None)):
+            plan.recall_status = "unavailable"
+            plan.recall_reason = "bounded_native_search_missing"
+            return plan
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            return plan
+        from .recall import build_recall
+        existing = plan.bridge_body.removesuffix("\n" + CONTINUITY_END_BOUNDARY)
+        available = self.output_token_limit - self.estimator(
+            [{"role": "user", "content": existing}]) if existing else self.output_token_limit
+        try:
+            recall = asyncio.run(asyncio.wait_for(build_recall(
+                index, self._summary_call, session_id=session_id, query=query,
+                reference_at=reference_at, estimate_messages=self.estimator,
+                source_token_limit=self.source_token_limit, output_token_limit=available),
+                timeout=self.summary_timeout_seconds))
+            if recall is None:
+                plan.recall_status = "empty"
+                return plan
+            body = "\n\n".join(part for part in (existing, recall["body"]) if part)
+            if self.estimator([{"role": "user", "content": body}]) > self.output_token_limit:
+                plan.recall_status = "over_budget"
+                return plan
+            body += "\n" + CONTINUITY_END_BOUNDARY
+            if len(body) > self.max_projection_chars:
+                plan.recall_status = "over_budget"
+                return plan
+            proof = recall["source_proof"]
+            marker = (f"{CONTINUITY_MARKER_NAMESPACE} "
+                           f"source_snapshot={plan.expected_source_snapshot or _sha256(proof)} "
+                           f"recall_source={_sha256(proof)} "
+                           f"bridge_sha256={hashlib.sha256(body.encode('utf-8')).hexdigest()}]")
+            recall_only = plan.reason == "foreground_group_limit_exceeded"
+            combined = replace(plan, recall_proof=proof, recall_status="selected",
+                bridge_body=body, marker=marker,
+                source_ids=tuple(dict.fromkeys((*plan.source_ids, *recall["source_ids"]))),
+                workset_bytes=plan.workset_bytes+recall["workset_bytes"],
+                reason="" if recall_only else plan.reason,
+                expected_source_snapshot=_sha256(proof) if recall_only else plan.expected_source_snapshot)
+            if combined.workset_bytes+combined.serialized_bytes() > 8*1024*1024:
+                plan.recall_status = "over_budget"
+                plan.recall_reason = "recall_shared_workset_budget"
+                return plan
+            return combined
+        except Exception as error:
+            # A failed auxiliary recall cannot invalidate an already valid
+            # rolling bridge. It grants no checkpoint or receipt authority.
+            plan.recall_status = "failed"
+            code = str(error)
+            plan.recall_reason = ("recall_auxiliary_timeout" if isinstance(error, TimeoutError)
+                                  else code if re.fullmatch(r"recall_[a-z_]+", code)
+                                  else "recall_auxiliary_failed")
+            return plan
 
     def _plan_for_request(
         self,
@@ -774,13 +896,15 @@ class ContinuityRuntime:
         context_window_confidence: Any,
     ) -> _TurnPlan:
         turn_key = (session_id, turn_id)
-        shape = _request_messages(request)
+        shape = request_messages(request)
         current_sha = ""
         if shape is not None:
-            index = _last_real_user_index(shape[1])
+            index = last_real_user_index(shape[1])
             if index >= 0 and isinstance(shape[1][index], Mapping):
                 current_sha = _current_message_sha256(shape[1][index])
         with self._lock:
+            if self._closed:
+                return _TurnPlan(current_sha, reason="runtime_unloaded")
             existing = self._turns.get(turn_key)
             if existing is not None:
                 self._turns.move_to_end(turn_key)
@@ -790,10 +914,33 @@ class ContinuityRuntime:
                     existing.current_identity,
                 ):
                     return _TurnPlan(current_sha, reason="current_identity_drift")
+                if existing.source_checkpoint is not None:
+                    try:
+                        self.adapter.history_index.validate_checkpoint(
+                            existing.source_checkpoint, session_id=session_id)
+                    except Exception:
+                        return _TurnPlan(current_sha, reason="cached_source_proof_changed")
+                if existing.recall_proof is not None:
+                    try:
+                        self.adapter.history_index.validate_recall(existing.recall_proof, session_id=session_id)
+                    except Exception:
+                        return _TurnPlan(current_sha, reason="cached_recall_source_changed")
+                if existing.source_checkpoint is not None or existing.recall_proof is not None:
+                    if not ACTIVE_WORKSETS.acquire(self._budget_key(turn_key), existing.workset_bytes):
+                        return _TurnPlan(current_sha, reason="workset_capacity_exceeded")
+                    COLD_PLANS.release(self._budget_key(turn_key))
                 return existing
             if turn_key in self._compiling:
                 return _TurnPlan(current_sha, reason="turn_compile_in_progress")
             self._compiling.add(turn_key)
+        indexed = getattr(self.adapter, "history_index", None) is not None
+        if indexed:
+            # Reserve the source + checkpoint ceilings before allocating either.
+            if not ACTIVE_WORKSETS.acquire(self._budget_key(turn_key), 8*1024*1024):
+                with self._lock:
+                    self._compiling.discard(turn_key)
+                return _TurnPlan(current_sha, reason="workset_capacity_exceeded")
+        transferred = False
         try:
             plan = self._compile_plan(
                 request,
@@ -806,21 +953,35 @@ class ContinuityRuntime:
                 context_window_source=context_window_source,
                 context_window_confidence=context_window_confidence,
             )
-            if plan.current_sha256 and current_sha == plan.current_sha256:
+            if plan.current_sha256 and current_sha == plan.current_sha256 and (plan.marker or not indexed):
                 plan.current_identity = _current_identity_content(
-                    shape[1][_last_real_user_index(shape[1])].get("content")
+                    shape[1][last_real_user_index(shape[1])].get("content")
                 )
+            if indexed:
+                plan.workset_bytes += plan.serialized_bytes()
+            plan.created_at = self.monotonic()
+            with self._lock:
+                if self._closed:
+                    return _TurnPlan(current_sha, reason="runtime_unloaded")
+                if indexed:
+                    if plan.workset_bytes > 8*1024*1024:
+                        return _TurnPlan(current_sha, reason="workset_byte_limit_exceeded")
+                    ACTIVE_WORKSETS.acquire(self._budget_key(turn_key), plan.workset_bytes)
+                self._turns[turn_key] = plan
+                self._turns.move_to_end(turn_key)
+                if not self._trim_locked(protected_turns=(turn_key,)):
+                    if self._turns.get(turn_key) is plan:
+                        self._turns.pop(turn_key, None)
+                    return _TurnPlan(current_sha, reason="turn_capacity_exceeded")
+                transferred = True
+            return plan
         finally:
             with self._lock:
+                # Until installation succeeds, the compiler owns admission,
+                # including BaseException/cancellation and unload exits.
+                if indexed and not transferred:
+                    ACTIVE_WORKSETS.release(self._budget_key(turn_key))
                 self._compiling.discard(turn_key)
-        with self._lock:
-            self._turns[turn_key] = plan
-            self._turns.move_to_end(turn_key)
-            if not self._trim_locked(protected_turns=(turn_key,)):
-                if self._turns.get(turn_key) is plan:
-                    self._turns.pop(turn_key, None)
-                return _TurnPlan(current_sha, reason="turn_capacity_exceeded")
-        return plan
 
     def _attempt_budget(
         self,
@@ -851,29 +1012,9 @@ class ContinuityRuntime:
         return window, usable_window, reserve, source, confidence
 
     @staticmethod
-    def _content_sha256(content: Any) -> str:
-        try:
-            return _request_sha256({"content": content})
-        except (TypeError, ValueError):
-            return ""
-
-    @classmethod
-    def _carrier_material(cls, content: Any) -> tuple[str, int, str]:
-        if isinstance(content, str):
-            kind, length = "string", len(content)
-        elif isinstance(content, list):
-            kind, length = "list", len(content)
-        else:
-            return "", 0, ""
-        digest = cls._content_sha256(content)
-        if not digest:
-            return "", 0, ""
-        return digest, length, kind
-
-    @staticmethod
     def _request_model_sha256(request: Mapping[str, Any]) -> str:
         try:
-            return _request_sha256(
+            return canonical_request_sha256(
                 {
                     "present": "model" in request,
                     "model": request.get("model"),
@@ -882,98 +1023,15 @@ class ContinuityRuntime:
         except (TypeError, ValueError):
             return ""
 
-    def _bound_projection_removal(
-        self,
-        request: Mapping[str, Any],
-        projection: _Projection,
-        plan: _TurnPlan,
+    @staticmethod
+    def _native_request(
+        request: Mapping[str, Any], projection: _Projection
     ) -> dict[str, Any] | None:
-        """Verify the adjacent original carrier and remove our block once."""
-
-        proof = projection.proof
-        shape = _request_messages(request)
-        if not isinstance(proof, Mapping) or shape is None:
-            return None
-        request_key, messages = shape
-        carrier_index = proof.get("carrier_index")
-        carrier_kind = str(proof.get("carrier_kind") or "")
-        if (
-            type(carrier_index) is not int
-            or not 0 <= carrier_index < len(messages)
-            or proof.get("message_count") != len(messages)
-            or not carrier_kind.startswith(f"{request_key}:")
-        ):
-            return None
-        message = messages[carrier_index]
-        if not isinstance(message, Mapping) or message.get("role") != "user":
-            return None
-        block = f"{plan.marker}\n{plan.bridge_body}"
-        if (
-            _request_text_occurrences(request, plan.marker) != 1
-            or _request_text_occurrences(request, CONTINUITY_END_BOUNDARY) != 1
-            or _request_text_occurrences(request, plan.bridge_body) != 1
-            or _request_text_occurrences(request, block) != 1
-            or proof.get("bridge_body_sha256")
-            != hashlib.sha256(plan.bridge_body.encode("utf-8")).hexdigest()
-        ):
-            return None
-        content = message.get("content")
-        projected_message = dict(message)
-        if carrier_kind.endswith(":string"):
-            token = f"{block}\n\n"
-            if not isinstance(content, str) or content.count(token) != 1:
-                return None
-            length = projection.carrier_material_length
-            if projection.carrier_material_kind != "string" or length < 1:
-                return None
-            position = content.find(token)
-            material_start = position + len(token)
-            if (
-                material_start + length > len(content)
-                or self._content_sha256(
-                    content[material_start : material_start + length]
-                )
-                != projection.carrier_material_sha256
-            ):
-                return None
-            projected_message["content"] = (
-                content[:position] + content[material_start:]
-            )
-        else:
-            if (
-                not isinstance(content, list)
-                or projection.carrier_material_kind != "list"
-            ):
-                return None
-            block_type = carrier_kind.rsplit(":", 1)[-1]
-            expected_block = (
-                {"text": block}
-                if block_type == "bedrock_text"
-                else {"type": block_type, "text": block}
-            )
-            if sum(item == expected_block for item in content) != 1:
-                return None
-            position = content.index(expected_block)
-            length = projection.carrier_material_length
-            material_start = position + 1
-            if (
-                length < 1
-                or material_start + length > len(content)
-                or self._content_sha256(
-                    content[material_start : material_start + length]
-                )
-                != projection.carrier_material_sha256
-            ):
-                return None
-            projected_message["content"] = [
-                *content[:position],
-                *content[material_start:],
-            ]
-        next_messages = list(messages)
-        next_messages[carrier_index] = projected_message
-        native_request = dict(request)
-        native_request[request_key] = next_messages
-        return native_request
+        return (
+            projection.overlay.native_request(request)
+            if projection.overlay is not None
+            else None
+        )
 
     def _scoped_projection_exact(
         self,
@@ -983,7 +1041,7 @@ class ContinuityRuntime:
         *,
         provider_key: tuple[str, str, str],
     ) -> bool:
-        native_request = self._bound_projection_removal(request, projection, plan)
+        native_request = self._native_request(request, projection)
         if (
             provider_key != projection.provider_key
             or self._request_model_sha256(request)
@@ -1013,19 +1071,24 @@ class ContinuityRuntime:
             != projection.request_model_sha256
         ):
             return False
-        if projection.proof is None:
+        if projection.overlay is None:
             return _request_has_user_anchor(
                 request,
                 plan.current_sha256,
                 plan.current_identity,
             )
-        # The execution-stage proof already bound the original carrier before
-        # downstream final-body transforms ran.  At the SDK boundary, exact
-        # adjacent-material removal is the ownership proof; requiring the
-        # entire user carrier identity again would reject legitimate suffixes
-        # added by a later transform and prevent this final guard from
-        # removing its own bridge on overflow.
-        return self._bound_projection_removal(request, projection, plan) is not None
+        native_request = projection.overlay.native_request(
+            request,
+            require_original_material=False,
+        )
+        return bool(
+            native_request is not None
+            and _request_has_user_anchor(
+                native_request,
+                plan.current_sha256,
+                plan.current_identity,
+            )
+        )
 
     def _register_provider_budget_filter(
         self,
@@ -1034,59 +1097,25 @@ class ContinuityRuntime:
         plan: _TurnPlan,
         provider_key: tuple[str, str, str],
     ) -> bool:
-        """Gate our block against the host's final provider-body estimate."""
+        """Delegate the one final-body budget decision to the host overlay."""
 
-        register_filter = getattr(
-            transport_record, "register_provider_body_filter", None
+        overlay = projection.overlay
+        if overlay is None:
+            return False
+        return overlay.register_final_budget_guard(
+            transport_record,
+            context_window_tokens=projection.usable_context_window_tokens,
+            reserve_tokens=_reserved_output_tokens,
+            validator=lambda body, native: bool(
+                provider_key == projection.provider_key
+                and self._request_model_sha256(body) == projection.request_model_sha256
+                and _request_has_user_anchor(
+                    native,
+                    plan.current_sha256,
+                    plan.current_identity,
+                )
+            ),
         )
-        if (
-            getattr(transport_record, "schema_version", None)
-            != _TRANSPORT_SCHEMA_VERSION
-            or not callable(register_filter)
-        ):
-            return False
-
-        def continuity_budget_filter(
-            body: dict[str, Any],
-            *,
-            estimated_tokens: Any = None,
-            estimate_source: Any = None,
-            estimate_confidence: Any = None,
-        ) -> dict[str, Any]:
-            if not self._provider_projection_exact(
-                body,
-                projection,
-                plan,
-                provider_key=provider_key,
-            ):
-                raise ValueError("continuity_final_body_drift")
-            reserve = _reserved_output_tokens(
-                body, projection.usable_context_window_tokens
-            )
-            estimate_valid = bool(
-                type(estimated_tokens) is int
-                and estimated_tokens >= 0
-                and str(estimate_source or "")
-                == "hermes.provider_body.rough.v1"
-                and str(estimate_confidence or "")
-                == "heuristic_with_margin"
-            )
-            if (
-                estimate_valid
-                and estimated_tokens + reserve
-                <= projection.usable_context_window_tokens
-            ):
-                return body
-            native = self._bound_projection_removal(body, projection, plan)
-            if native is None:
-                raise ValueError("continuity_final_budget_unverifiable")
-            return native
-
-        try:
-            register_filter(continuity_budget_filter, phase="final_guard")
-        except Exception:
-            return False
-        return True
 
     def _stage_provider_transport(
         self,
@@ -1105,6 +1134,10 @@ class ContinuityRuntime:
                 != _TRANSPORT_SCHEMA_VERSION
                 or bool(getattr(transport_record, "ambiguous"))
                 or getattr(transport_record, "capture_count") != 1
+                or (
+                    projection.overlay is not None
+                    and projection.overlay.disposition != OVERLAY_KEPT
+                )
             ):
                 return
             provider_body = getattr(transport_record, "provider_body")
@@ -1136,7 +1169,7 @@ class ContinuityRuntime:
                 > projection.usable_context_window_tokens
             ):
                 return
-            request_digest = _request_sha256(provider_body)
+            request_digest = canonical_request_sha256(provider_body)
         except Exception:
             return
         with self._lock:
@@ -1170,7 +1203,6 @@ class ContinuityRuntime:
         context_window_confidence: str = "unknown",
         **_kwargs: Any,
     ) -> dict[str, Any] | None:
-        del original_request
         session_id = str(session_id or "").strip()
         turn_id = str(turn_id or "").strip()
         api_request_id = str(api_request_id or "").strip()
@@ -1186,8 +1218,11 @@ class ContinuityRuntime:
         with self._lock:
             self._projections.pop(attempt_key, None)
             self._transport.pop(attempt_key, None)
+        plan_request = (
+            original_request if isinstance(original_request, Mapping) else request
+        )
         plan = self._plan_for_request(
-            request,
+            plan_request,
             session_id=session_id,
             turn_id=turn_id,
             model=str(model or ""),
@@ -1227,7 +1262,7 @@ class ContinuityRuntime:
                 self._projections[attempt_key] = _Projection(
                     turn_key=(session_id, turn_id),
                     attempt_seq=self._attempt_seq,
-                    proof=None,
+                    overlay=None,
                     provider_key=provider_key,
                     request_model_sha256=self._request_model_sha256(request),
                     context_window_tokens=window,
@@ -1238,39 +1273,22 @@ class ContinuityRuntime:
                     last_touch=self.monotonic(),
                 )
             return None
-        shape = _request_messages(request)
-        if shape is None:
-            return None
-        carrier_index = _last_real_user_index(shape[1])
-        if carrier_index < 0 or not isinstance(shape[1][carrier_index], Mapping):
-            return None
-        carrier_digest, carrier_length, carrier_material_kind = self._carrier_material(
-            shape[1][carrier_index].get("content")
-        )
-        if not carrier_digest:
-            return None
-        projected = self.projector(
+        overlay = self.projector(
             request,
+            marker_namespace=CONTINUITY_MARKER_NAMESPACE,
+            end_boundary=CONTINUITY_END_BOUNDARY,
             marker=plan.marker,
-            bridge_body=plan.bridge_body,
+            body=plan.bridge_body,
             max_projection_chars=self.max_projection_chars,
         )
-        proof = projected.get("proof") if isinstance(projected, Mapping) else None
-        next_request = projected.get("request") if isinstance(projected, Mapping) else None
         if (
-            not isinstance(proof, Mapping)
-            or proof.get("status") != "projected"
-            or not isinstance(next_request, dict)
+            not isinstance(overlay, RequestOverlay)
+            or overlay.status != "projected"
+            or not isinstance(overlay.request, dict)
+            or not overlay.verify_exact(overlay.request)
         ):
             return None
-        initial_verification = self.verifier(
-            next_request,
-            proof,
-            marker=plan.marker,
-            bridge_body=plan.bridge_body,
-        )
-        if initial_verification.get("status") != "verified":
-            return None
+        next_request = overlay.request
         with self._lock:
             if self._turns.get((session_id, turn_id)) is not plan:
                 return None
@@ -1280,10 +1298,7 @@ class ContinuityRuntime:
             self._projections[attempt_key] = _Projection(
                 turn_key=(session_id, turn_id),
                 attempt_seq=self._attempt_seq,
-                proof=dict(proof),
-                carrier_material_sha256=carrier_digest,
-                carrier_material_length=carrier_length,
-                carrier_material_kind=carrier_material_kind,
+                overlay=overlay,
                 provider_key=provider_key,
                 request_model_sha256=self._request_model_sha256(next_request),
                 context_window_tokens=window,
@@ -1338,7 +1353,7 @@ class ContinuityRuntime:
         if projection is None or plan is None:
             return next_call(request)
         if not projection_active:
-            native_request = self._bound_projection_removal(request, projection, plan)
+            native_request = self._native_request(request, projection)
             return next_call(native_request if native_request is not None else request)
         supplied_provider_key = (
             str(model or ""),
@@ -1367,17 +1382,25 @@ class ContinuityRuntime:
             str(transport_schema_version or "") == _TRANSPORT_SCHEMA_VERSION
             and transport_record is not None
             and context_matches
-            and self._register_provider_budget_filter(
-                transport_record,
-                projection,
-                plan,
-                provider_key,
+            and (
+                projection.overlay is None
+                or self._register_provider_budget_filter(
+                    transport_record,
+                    projection,
+                    plan,
+                    provider_key,
+                )
             )
         )
+        if transport_ready and plan.recall_proof is not None:
+            try:
+                self.adapter.history_index.validate_recall(plan.recall_proof, session_id=attempt_key[0])
+            except Exception:
+                transport_ready = False
         if not transport_ready:
             native_request = (
-                self._bound_projection_removal(request, projection, plan)
-                if projection.proof is not None
+                self._native_request(request, projection)
+                if projection.overlay is not None
                 else request
             )
             with self._lock:
@@ -1385,7 +1408,7 @@ class ContinuityRuntime:
                 self._projections.pop(attempt_key, None)
                 self._transport.pop(attempt_key, None)
             return next_call(native_request if native_request is not None else request)
-        if projection.proof is None:
+        if projection.overlay is None:
             candidate_bound = bool(
                 provider_key == projection.provider_key
                 and self._request_model_sha256(request)
@@ -1423,11 +1446,7 @@ class ContinuityRuntime:
             plan,
             provider_key=provider_key,
         ):
-            native_request = self._bound_projection_removal(
-                request,
-                projection,
-                plan,
-            )
+            native_request = self._native_request(request, projection)
             with self._lock:
                 self._executing.discard(attempt_key)
                 self._projections.pop(attempt_key, None)
@@ -1492,19 +1511,37 @@ class ContinuityRuntime:
         receipt_id = "hcr_" + _sha256(
             [*attempt_key, stage.attempt_seq, stage.request_sha256]
         )
+        hashes = {
+            "request_sha256": stage.request_sha256,
+            "bridge_body_sha256": hashlib.sha256(plan.bridge_body.encode("utf-8")).hexdigest(),
+            "source_snapshot": plan.expected_source_snapshot,
+        }
+        if plan.recall_proof is not None:
+            hashes["recall_source_sha256"] = _sha256(plan.recall_proof)
         return (
             receipt_id,
-            {
-                "request_sha256": stage.request_sha256,
-                "bridge_body_sha256": hashlib.sha256(
-                    plan.bridge_body.encode("utf-8")
-                ).hexdigest(),
-                "source_snapshot": plan.expected_source_snapshot,
-            },
+            hashes,
             {"represented_source_group_count": len(plan.source_ids)},
         )
 
     def post_api_request(
+        self, *, session_id: str, turn_id: str, api_request_id: str,
+        transport_record: Any = None, transport_schema_version: str = "", **kwargs: Any,
+    ) -> None:
+        try:
+            return self._settle_api_request(
+                session_id=session_id, turn_id=turn_id, api_request_id=api_request_id,
+                transport_record=transport_record, transport_schema_version=transport_schema_version,
+                **kwargs,
+            )
+        finally:
+            turn_key = (str(session_id or "").strip(), str(turn_id or "").strip())
+            with self._lock:
+                active = {value.turn_key for value in (*self._projections.values(), *self._transport.values())}
+                if turn_key not in active:
+                    self._release_workset(turn_key)
+
+    def _settle_api_request(
         self,
         *,
         session_id: str,
@@ -1547,12 +1584,22 @@ class ContinuityRuntime:
                 and getattr(transport_record, "capture_count") == 1
                 and bool(getattr(transport_record, "settled"))
                 and isinstance(provider_body, Mapping)
-                and _request_sha256(provider_body) == stage.request_sha256
+                and canonical_request_sha256(provider_body) == stage.request_sha256
             )
         except Exception:
             transport_verified = False
         if not transport_verified:
             return None
+
+        if plan.recall_proof is not None:
+            try:
+                self.adapter.history_index.validate_recall(plan.recall_proof, session_id=attempt_key[0])
+            except Exception:
+                self._record_receipt(attempt_key, stage, plan, "delivered_recall_source_changed")
+                return None
+            if plan.checkpoint_candidate is None and plan.source_checkpoint is None:
+                self._record_receipt(attempt_key, stage, plan, "delivered_recall")
+                return None
 
         candidate = plan.checkpoint_candidate
         cached = ""
@@ -1564,12 +1611,40 @@ class ContinuityRuntime:
                 if not cached:
                     plan.publish_status = "in_progress"
         if cached:
-            status = {
-                "applied": "delivered_checkpoint_unchanged",
-                "conflict": "delivered_checkpoint_conflict",
-                "failed": "delivered_checkpoint_failed",
-            }.get(cached, "delivered_checkpoint_failed")
-            self._record_receipt(attempt_key, stage, plan, status)
+            if (
+                getattr(self.adapter, "history_index", None) is not None
+                and str(candidate.get("schema") or "")
+                == "thread_continuity_checkpoint.v3"
+            ):
+                from .checkpoint_store_v3 import record_checkpoint_delivery_v3
+
+                receipt_id, hashes, counts = self._receipt_material(
+                    attempt_key, stage, plan
+                )
+                record_checkpoint_delivery_v3(
+                    self.adapter.metadata_store,
+                    attempt_key[0],
+                    checkpoint=candidate,
+                    receipt_id=receipt_id,
+                    outcome=(
+                        "unchanged"
+                        if cached in {"applied", "stored_unvalidated"}
+                        else cached
+                        if cached in {"conflict", "failed"}
+                        else "failed"
+                    ),
+                    source_ids=plan.source_ids,
+                    hashes=hashes,
+                    counts=counts,
+                )
+            else:
+                status = {
+                    "applied": "delivered_checkpoint_unchanged",
+                    "stored_unvalidated": "delivered_checkpoint_unchanged",
+                    "conflict": "delivered_checkpoint_conflict",
+                    "failed": "delivered_checkpoint_failed",
+                }.get(cached, "delivered_checkpoint_failed")
+                self._record_receipt(attempt_key, stage, plan, status)
             return None
 
         receipt_id, hashes, counts = self._receipt_material(
@@ -1577,6 +1652,27 @@ class ContinuityRuntime:
             stage,
             plan,
         )
+        stored_checkpoint = plan.source_checkpoint
+        if (
+            candidate is None
+            and getattr(self.adapter, "history_index", None) is not None
+            and isinstance(stored_checkpoint, Mapping)
+            and str(stored_checkpoint.get("schema") or "")
+            == "thread_continuity_checkpoint.v3"
+        ):
+            from .checkpoint_store_v3 import record_checkpoint_delivery_v3
+
+            record_checkpoint_delivery_v3(
+                self.adapter.metadata_store,
+                attempt_key[0],
+                checkpoint=stored_checkpoint,
+                receipt_id=receipt_id,
+                outcome="unchanged",
+                source_ids=plan.source_ids,
+                hashes=hashes,
+                counts=counts,
+            )
+            return None
         settler = getattr(self.adapter, "settle_checkpoint_delivery", None)
         if not callable(settler):
             settled: Mapping[str, Any] = {
@@ -1604,10 +1700,10 @@ class ContinuityRuntime:
                 "receipt_recorded": False,
             }
         outcome = str(settled.get("status") or "failed")
-        if outcome not in {"applied", "unchanged", "conflict", "failed"}:
+        if outcome not in {"applied", "stored_unvalidated", "unchanged", "conflict", "failed"}:
             outcome = "failed"
         if candidate is not None:
-            terminal = outcome if outcome in {"applied", "conflict"} else "failed"
+            terminal = outcome if outcome in {"applied", "stored_unvalidated", "conflict"} else "failed"
             with self._publish_condition:
                 plan.publish_status = terminal
                 self._publish_condition.notify_all()
@@ -1633,6 +1729,9 @@ class ContinuityRuntime:
             self._trim_locked(
                 protected_turns=(projection.turn_key,) if projection else ()
             )
+            active = {value.turn_key for value in (*self._projections.values(), *self._transport.values())}
+            if attempt_key[:2] not in active:
+                self._release_workset(attempt_key[:2])
         return None
 
     def status_command(self, raw_args: str = "") -> str:
@@ -1647,9 +1746,15 @@ class ContinuityRuntime:
                 if not session_filter or turn_key[0] == session_filter
             ]
             reason_counts: dict[str, int] = {}
+            recall_counts: dict[str, int] = {}
+            recall_reasons: dict[str, int] = {}
             for _turn_key, plan in plans:
                 if plan.reason:
                     reason_counts[plan.reason] = reason_counts.get(plan.reason, 0) + 1
+                if plan.recall_status:
+                    recall_counts[plan.recall_status] = recall_counts.get(plan.recall_status, 0) + 1
+                if plan.recall_reason:
+                    recall_reasons[plan.recall_reason] = recall_reasons.get(plan.recall_reason, 0) + 1
             context_source_counts: dict[str, int] = {}
             context_confidence_counts: dict[str, int] = {}
             for _turn_key, plan in plans:
@@ -1686,9 +1791,11 @@ class ContinuityRuntime:
                     status: sum(
                         1 for _key, plan in plans if plan.publish_status == status
                     )
-                    for status in ("applied", "conflict", "failed", "in_progress")
+                    for status in ("applied", "stored_unvalidated", "conflict", "failed", "in_progress")
                 },
                 "reason_counts": reason_counts,
+                "recall_status_counts": recall_counts,
+                "recall_reason_counts": recall_reasons,
                 "context_window_source_counts": context_source_counts,
                 "context_window_confidence_counts": context_confidence_counts,
                 "final_provider_estimate": {
@@ -1714,12 +1821,20 @@ class ContinuityRuntime:
                     "status": "unavailable",
                     "body_included": False,
                 }
+        if store is not None and getattr(self.adapter, "history_index", None) is not None:
+            from .checkpoint_store_v3 import checkpoint_v3_status
+            payload["durable_v3"] = checkpoint_v3_status(store, session_filter)
+            payload["history_preparation"] = self.adapter.history_index.status(session_filter)
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     def clear(self) -> None:
         """Drop process-private frozen plans; durable checkpoints stay intact."""
 
         with self._lock:
+            self._closed = True
+            for turn_key in self._turns:
+                ACTIVE_WORKSETS.release(self._budget_key(turn_key))
+                COLD_PLANS.release(self._budget_key(turn_key))
             self._turns.clear()
             self._compiling.clear()
             self._projections.clear()

@@ -1,0 +1,1116 @@
+From ccd7bf350ca54a44b7351904e079f5ffdb64eec0 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 20:17:05 +0800
+Subject: [PATCH] feat(plugins): add shared request overlay proofs
+
+---
+ hermes_cli/request_overlay.py | 698 ++++++++++++++++++++++++++++++++++
+ tests/test_request_overlay.py | 391 +++++++++++++++++++
+ 2 files changed, 1089 insertions(+)
+ create mode 100644 hermes_cli/request_overlay.py
+ create mode 100644 tests/test_request_overlay.py
+
+diff --git a/hermes_cli/request_overlay.py b/hermes_cli/request_overlay.py
+new file mode 100644
+index 0000000..52deeba
+--- /dev/null
++++ b/hermes_cli/request_overlay.py
+@@ -0,0 +1,698 @@
++"""Generic request-only overlays for plugin-owned provider context.
++
++An overlay is inserted into the last real user carrier without creating a new
++message or changing role alternation.  The returned proof stays process-local:
++it can verify the exact projected request, recognize later additive middleware
++changes, remove only its own block, and register the final provider-budget
++guard against Hermes transport truth.
++"""
++
++from __future__ import annotations
++
++import copy
++import hashlib
++import struct
++from collections.abc import Callable, Mapping
++from threading import Lock
++from typing import Any
++
++
++REQUEST_OVERLAY_SCHEMA_VERSION = "hermes.request_overlay.v1"
++OVERLAY_PENDING = "pending"
++OVERLAY_KEPT = "kept"
++OVERLAY_REMOVED_FINAL_BUDGET = "removed_final_budget"
++OVERLAY_REMOVED_ESTIMATE_UNPROVEN = "removed_estimate_unproven"
++OVERLAY_DRIFTED = "drifted"
++
++_TEXT_BLOCK_TYPES = {"text", "input_text"}
++_STANDARD_VISIBLE_BLOCK_TYPES = {"image", "image_url", "document"}
++_RESPONSES_VISIBLE_BLOCK_TYPES = {"input_image", "input_file"}
++_BEDROCK_VISIBLE_BLOCK_KEYS = {"image", "document"}
++_BEDROCK_TEXT_BLOCK = "bedrock_text"
++
++
++def _frame(kind: bytes, payload: bytes) -> bytes:
++    return kind + len(payload).to_bytes(8, "big") + payload
++
++
++def _canonical_bytes(value: Any) -> bytes:
++    if value is None:
++        return _frame(b"n", b"")
++    if type(value) is bool:
++        return _frame(b"b", b"1" if value else b"0")
++    if type(value) is int:
++        return _frame(b"i", str(value).encode("ascii"))
++    if type(value) is float:
++        return _frame(b"f", struct.pack("!d", value))
++    if isinstance(value, str):
++        return _frame(b"s", value.encode("utf-8"))
++    if isinstance(value, bytes):
++        return _frame(b"y", value)
++    if isinstance(value, (list, tuple)):
++        return _frame(b"l", b"".join(_canonical_bytes(item) for item in value))
++    if isinstance(value, Mapping):
++        pairs = sorted(
++            (_canonical_bytes(key), _canonical_bytes(item))
++            for key, item in value.items()
++        )
++        return _frame(
++            b"d",
++            b"".join(_frame(b"k", key) + _frame(b"v", item) for key, item in pairs),
++        )
++    raise TypeError(f"unsupported request value: {type(value).__name__}")
++
++
++def canonical_request_sha256(request: Mapping[str, Any]) -> str:
++    """Hash ordinary provider kwargs without JSON type coercion."""
++
++    return hashlib.sha256(_canonical_bytes(request)).hexdigest()
++
++
++def request_messages(
++    request: Mapping[str, Any],
++) -> tuple[str, list[Any]] | None:
++    """Return the one provider dialogue carrier, or ``None`` if ambiguous."""
++
++    candidates = [
++        (key, request.get(key))
++        for key in ("messages", "input")
++        if isinstance(request.get(key), list)
++    ]
++    return candidates[0] if len(candidates) == 1 else None
++
++
++def _clone_request(provider_kwargs: Mapping[str, Any]) -> dict[str, Any]:
++    try:
++        return copy.deepcopy(dict(provider_kwargs))
++    except Exception:
++        request = dict(provider_kwargs)
++    for key in ("messages", "input"):
++        if isinstance(request.get(key), list):
++            request[key] = list(request[key])
++    return request
++
++
++def _has_visible_non_tool_content(content: Any) -> bool:
++    if isinstance(content, str):
++        return bool(content.strip())
++    if not isinstance(content, list):
++        return False
++    for part in content:
++        if not isinstance(part, Mapping):
++            continue
++        part_type = part.get("type")
++        if part_type in _TEXT_BLOCK_TYPES:
++            text = part.get("text")
++        elif "type" not in part and set(part) == {"text"}:
++            text = part.get("text")
++        elif (
++            part_type in _STANDARD_VISIBLE_BLOCK_TYPES | _RESPONSES_VISIBLE_BLOCK_TYPES
++        ):
++            return True
++        elif "type" not in part and _BEDROCK_VISIBLE_BLOCK_KEYS.intersection(part):
++            return True
++        else:
++            continue
++        if isinstance(text, str) and text.strip():
++            return True
++    return False
++
++
++def last_real_user_index(messages: list[Any]) -> int:
++    """Locate the last visible user carrier, excluding tool-result-only rows."""
++
++    for index in range(len(messages) - 1, -1, -1):
++        message = messages[index]
++        if (
++            isinstance(message, Mapping)
++            and message.get("role") == "user"
++            and _has_visible_non_tool_content(message.get("content"))
++        ):
++            return index
++    return -1
++
++
++def _list_block_type(content: list[Any]) -> str:
++    kinds: set[str] = set()
++    for part in content:
++        if not isinstance(part, Mapping):
++            continue
++        if (
++            part.get("type") in _TEXT_BLOCK_TYPES
++            and isinstance(part.get("text"), str)
++            and part["text"].strip()
++        ):
++            kinds.add(str(part["type"]))
++        elif (
++            "type" not in part
++            and set(part) == {"text"}
++            and isinstance(part.get("text"), str)
++            and part["text"].strip()
++        ):
++            kinds.add(_BEDROCK_TEXT_BLOCK)
++        elif part.get("type") in _STANDARD_VISIBLE_BLOCK_TYPES:
++            kinds.add("text")
++        elif part.get("type") in _RESPONSES_VISIBLE_BLOCK_TYPES:
++            kinds.add("input_text")
++        elif "type" not in part and _BEDROCK_VISIBLE_BLOCK_KEYS.intersection(part):
++            kinds.add(_BEDROCK_TEXT_BLOCK)
++    return next(iter(kinds)) if len(kinds) == 1 else ""
++
++
++def _projection_block(block_type: str, text: str) -> dict[str, str]:
++    return (
++        {"text": text}
++        if block_type == _BEDROCK_TEXT_BLOCK
++        else {"type": block_type, "text": text}
++    )
++
++
++def _carrier_kind(request_key: str, content: Any) -> str:
++    if isinstance(content, str):
++        return f"{request_key}:string"
++    if isinstance(content, list):
++        block_type = _list_block_type(content)
++        return f"{request_key}:{block_type}" if block_type else ""
++    return ""
++
++
++def _text_occurrences(value: Any, needle: str) -> int:
++    if isinstance(value, str):
++        return value.count(needle)
++    if isinstance(value, Mapping):
++        return sum(_text_occurrences(item, needle) for item in value.values())
++    if isinstance(value, (list, tuple)):
++        return sum(_text_occurrences(item, needle) for item in value)
++    return 0
++
++
++def _content_binding(content: Any) -> tuple[str, int, str]:
++    if isinstance(content, str):
++        kind, length = "string", len(content)
++    elif isinstance(content, list):
++        kind, length = "list", len(content)
++    else:
++        return "", 0, ""
++    try:
++        digest = canonical_request_sha256({"content": content})
++    except (TypeError, ValueError):
++        return "", 0, ""
++    return digest, length, kind
++
++
++def _existing_material(
++    content: Any,
++    *,
++    carrier_kind: str,
++    block: str,
++) -> Any:
++    if carrier_kind.endswith(":string"):
++        token = f"{block}\n\n"
++        if isinstance(content, str) and content.startswith(token):
++            return content[len(token) :]
++        return None
++    if not isinstance(content, list) or not content:
++        return None
++    block_type = carrier_kind.rsplit(":", 1)[-1]
++    if content[0] != _projection_block(block_type, block):
++        return None
++    return content[1:]
++
++
++class RequestOverlay:
++    """One process-private request projection and its ownership proof."""
++
++    schema_version = REQUEST_OVERLAY_SCHEMA_VERSION
++
++    def __init__(
++        self,
++        *,
++        request: dict[str, Any],
++        status: str,
++        reason: str,
++        marker_namespace: str,
++        end_boundary: str,
++        marker: str,
++        body: str,
++        carrier_index: int = -1,
++        carrier_kind: str = "",
++        message_count: int = 0,
++        carrier_material_sha256: str = "",
++        carrier_material_length: int = 0,
++        carrier_material_kind: str = "",
++    ) -> None:
++        self.request = request
++        self.status = status
++        self.reason = reason
++        self.carrier_index = carrier_index
++        self.carrier_kind = carrier_kind
++        self.message_count = message_count
++        self.body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
++        try:
++            self.request_sha256 = canonical_request_sha256(request)
++        except (TypeError, ValueError):
++            self.request_sha256 = ""
++        self.body_included = False
++        self._marker_namespace = marker_namespace
++        self._end_boundary = end_boundary
++        self._marker = marker
++        self._body = body
++        self._carrier_material_sha256 = carrier_material_sha256
++        self._carrier_material_length = carrier_material_length
++        self._carrier_material_kind = carrier_material_kind
++        self._disposition = OVERLAY_PENDING
++        self._guard_registered = False
++        self._lock = Lock()
++
++    @property
++    def proof(self) -> dict[str, Any]:
++        """Return the closed body-free proof used by receipts and diagnostics."""
++
++        return {
++            "schema": self.schema_version,
++            "status": self.status,
++            "reason": self.reason,
++            "carrier_index": self.carrier_index,
++            "carrier_kind": self.carrier_kind,
++            "request_sha256": self.request_sha256,
++            "overlay_body_sha256": self.body_sha256,
++            "message_count": self.message_count,
++            "body_included": False,
++        }
++
++    @property
++    def disposition(self) -> str:
++        with self._lock:
++            return self._disposition
++
++    def _set_disposition(self, value: str) -> None:
++        with self._lock:
++            if self._disposition in {OVERLAY_PENDING, value}:
++                self._disposition = value
++            else:
++                self._disposition = OVERLAY_DRIFTED
++
++    def _projection_exact(self, request: Mapping[str, Any]) -> bool:
++        shape = request_messages(request)
++        if self.status != "projected" or shape is None:
++            return False
++        _request_key, messages = shape
++        native = self.native_request(request)
++        return bool(
++            native is not None
++            and _text_occurrences(request, self._marker_namespace) == 1
++            and _text_occurrences(request, self._end_boundary) == 1
++            and _text_occurrences(request, self._marker) == 1
++            and _text_occurrences(request, self._body) == 1
++            and len(messages) == self.message_count
++        )
++
++    def verify_exact(self, request: Mapping[str, Any]) -> bool:
++        """Verify the untouched request returned by the projection call."""
++
++        try:
++            return bool(
++                self.request_sha256
++                and canonical_request_sha256(request) == self.request_sha256
++                and self._projection_exact(request)
++            )
++        except (TypeError, ValueError):
++            return False
++
++    def native_request(
++        self,
++        request: Mapping[str, Any],
++        *,
++        require_original_material: bool = True,
++    ) -> dict[str, Any] | None:
++        """Remove this exact overlay while preserving independent additions."""
++
++        shape = request_messages(request)
++        if self.status != "projected" or shape is None:
++            return None
++        request_key, messages = shape
++        if (
++            not 0 <= self.carrier_index < len(messages)
++            or len(messages) != self.message_count
++            or not self.carrier_kind.startswith(f"{request_key}:")
++        ):
++            return None
++        message = messages[self.carrier_index]
++        if not isinstance(message, Mapping) or message.get("role") != "user":
++            return None
++        block = f"{self._marker}\n{self._body}"
++        if (
++            _text_occurrences(request, self._marker_namespace) != 1
++            or _text_occurrences(request, self._end_boundary) != 1
++            or _text_occurrences(request, self._marker) != 1
++            or _text_occurrences(request, self._body) != 1
++            or _text_occurrences(request, block) != 1
++        ):
++            return None
++        content = message.get("content")
++        projected_message = dict(message)
++        if self.carrier_kind.endswith(":string"):
++            token = f"{block}\n\n"
++            if not isinstance(content, str) or content.count(token) != 1:
++                return None
++            position = content.find(token)
++            material_start = position + len(token)
++            if require_original_material:
++                length = self._carrier_material_length
++                if self._carrier_material_kind != "string" or length < 1:
++                    return None
++                if material_start + length > len(content):
++                    return None
++                material = content[material_start : material_start + length]
++                try:
++                    digest = canonical_request_sha256({"content": material})
++                except (TypeError, ValueError):
++                    return None
++                if digest != self._carrier_material_sha256:
++                    return None
++            projected_message["content"] = content[:position] + content[material_start:]
++        else:
++            if not isinstance(content, list) or self._carrier_material_kind != "list":
++                return None
++            block_type = self.carrier_kind.rsplit(":", 1)[-1]
++            expected_block = _projection_block(block_type, block)
++            if sum(item == expected_block for item in content) != 1:
++                return None
++            position = content.index(expected_block)
++            material_start = position + 1
++            if require_original_material:
++                length = self._carrier_material_length
++                if length < 1 or material_start + length > len(content):
++                    return None
++                material = content[material_start : material_start + length]
++                try:
++                    digest = canonical_request_sha256({"content": material})
++                except (TypeError, ValueError):
++                    return None
++                if digest != self._carrier_material_sha256:
++                    return None
++            projected_message["content"] = [
++                *content[:position],
++                *content[material_start:],
++            ]
++        next_messages = list(messages)
++        next_messages[self.carrier_index] = projected_message
++        native_request = dict(request)
++        native_request[request_key] = next_messages
++        return native_request
++
++    def register_final_budget_guard(
++        self,
++        transport_record: Any,
++        *,
++        context_window_tokens: int,
++        reserve_tokens: Callable[[Mapping[str, Any], int], int],
++        validator: Callable[[Mapping[str, Any], Mapping[str, Any]], bool],
++    ) -> bool:
++        """Remove only this overlay when the final provider estimate cannot fit."""
++
++        from hermes_cli.middleware import (
++            PROVIDER_BODY_FILTER_FINAL_GUARD,
++            TRANSPORT_SCHEMA_VERSION,
++        )
++
++        register = getattr(transport_record, "register_provider_body_filter", None)
++        if (
++            getattr(transport_record, "schema_version", None)
++            != TRANSPORT_SCHEMA_VERSION
++            or type(context_window_tokens) is not int
++            or context_window_tokens <= 0
++            or not callable(reserve_tokens)
++            or not callable(validator)
++            or not callable(register)
++        ):
++            return False
++        with self._lock:
++            if self._guard_registered:
++                return False
++            self._guard_registered = True
++
++        def final_budget_guard(
++            body: dict[str, Any],
++            *,
++            estimated_tokens: Any = None,
++            estimate_source: Any = None,
++            estimate_confidence: Any = None,
++        ) -> dict[str, Any]:
++            native = self.native_request(body, require_original_material=False)
++            if native is None or not validator(body, native):
++                self._set_disposition(OVERLAY_DRIFTED)
++                raise ValueError("request_overlay_final_body_drift")
++            try:
++                reserve = reserve_tokens(body, context_window_tokens)
++            except Exception:
++                reserve = None
++            estimate_valid = bool(
++                type(estimated_tokens) is int
++                and estimated_tokens >= 0
++                and str(estimate_source or "") == "hermes.provider_body.rough.v1"
++                and str(estimate_confidence or "") == "heuristic_with_margin"
++                and type(reserve) is int
++                and reserve >= 0
++            )
++            if not estimate_valid:
++                self._set_disposition(OVERLAY_REMOVED_ESTIMATE_UNPROVEN)
++                return native
++            if estimated_tokens + reserve > context_window_tokens:
++                self._set_disposition(OVERLAY_REMOVED_FINAL_BUDGET)
++                return native
++            self._set_disposition(OVERLAY_KEPT)
++            return body
++
++        try:
++            register(final_budget_guard, phase=PROVIDER_BODY_FILTER_FINAL_GUARD)
++        except Exception:
++            with self._lock:
++                self._guard_registered = False
++            return False
++        return True
++
++
++def _blocked(
++    request: dict[str, Any],
++    *,
++    reason: str,
++    marker_namespace: str,
++    end_boundary: str,
++    marker: str,
++    body: str,
++    message_count: int = 0,
++) -> RequestOverlay:
++    return RequestOverlay(
++        request=request,
++        status="blocked",
++        reason=reason,
++        marker_namespace=marker_namespace,
++        end_boundary=end_boundary,
++        marker=marker,
++        body=body,
++        message_count=message_count,
++    )
++
++
++def project_request_overlay(
++    provider_kwargs: Mapping[str, Any],
++    *,
++    marker_namespace: str,
++    end_boundary: str,
++    marker: str,
++    body: str,
++    max_projection_chars: int = 24_000,
++) -> RequestOverlay:
++    """Clone a provider request and prepend one exact plugin-owned overlay."""
++
++    if not isinstance(provider_kwargs, Mapping):
++        raise TypeError("provider_kwargs must be a mapping")
++    request = _clone_request(provider_kwargs)
++    namespace = marker_namespace if isinstance(marker_namespace, str) else ""
++    boundary = end_boundary if isinstance(end_boundary, str) else ""
++    marker_text = marker if isinstance(marker, str) else ""
++    body_text = body if isinstance(body, str) else ""
++    shape = request_messages(request)
++    message_count = len(shape[1]) if shape else 0
++    try:
++        canonical_request_sha256(request)
++    except (TypeError, ValueError):
++        return _blocked(
++            request,
++            reason="request_hash_unavailable",
++            marker_namespace=namespace,
++            end_boundary=boundary,
++            marker=marker_text,
++            body=body_text,
++            message_count=message_count,
++        )
++    if (
++        not namespace
++        or not boundary
++        or not marker_text.startswith(namespace)
++        or marker_text.count(namespace) != 1
++        or not body_text.strip()
++        or not body_text.endswith(boundary)
++        or body_text.count(boundary) != 1
++        or namespace in body_text
++        or marker_text in body_text
++        or body_text in marker_text
++        or boundary in marker_text
++    ):
++        return _blocked(
++            request,
++            reason="projection_material_invalid",
++            marker_namespace=namespace,
++            end_boundary=boundary,
++            marker=marker_text,
++            body=body_text,
++            message_count=message_count,
++        )
++    block = f"{marker_text}\n{body_text}"
++    if (
++        type(max_projection_chars) is not int
++        or max_projection_chars < 1
++        or len(block) > max_projection_chars
++    ):
++        return _blocked(
++            request,
++            reason="projection_too_large",
++            marker_namespace=namespace,
++            end_boundary=boundary,
++            marker=marker_text,
++            body=body_text,
++            message_count=message_count,
++        )
++    if shape is None:
++        return _blocked(
++            request,
++            reason="request_carrier_ambiguous",
++            marker_namespace=namespace,
++            end_boundary=boundary,
++            marker=marker_text,
++            body=body_text,
++        )
++    request_key, messages = shape
++    carrier_index = last_real_user_index(messages)
++    if carrier_index < 0:
++        return _blocked(
++            request,
++            reason="real_user_carrier_missing",
++            marker_namespace=namespace,
++            end_boundary=boundary,
++            marker=marker_text,
++            body=body_text,
++            message_count=len(messages),
++        )
++    message = messages[carrier_index]
++    content = message.get("content")
++    carrier_kind = _carrier_kind(request_key, content)
++    if not carrier_kind:
++        return _blocked(
++            request,
++            reason="real_user_carrier_ambiguous",
++            marker_namespace=namespace,
++            end_boundary=boundary,
++            marker=marker_text,
++            body=body_text,
++            message_count=len(messages),
++        )
++
++    namespace_count = _text_occurrences(request, namespace)
++    boundary_count = _text_occurrences(request, boundary)
++    marker_count = _text_occurrences(request, marker_text)
++    body_count = _text_occurrences(request, body_text)
++    if (namespace_count or boundary_count) and not (
++        namespace_count == boundary_count == marker_count == 1
++    ):
++        return _blocked(
++            request,
++            reason="projection_namespace_conflict",
++            marker_namespace=namespace,
++            end_boundary=boundary,
++            marker=marker_text,
++            body=body_text,
++            message_count=len(messages),
++        )
++    if marker_count:
++        material = _existing_material(
++            content,
++            carrier_kind=carrier_kind,
++            block=block,
++        )
++        material_digest, material_length, material_kind = _content_binding(material)
++        overlay = RequestOverlay(
++            request=request,
++            status="projected",
++            reason="",
++            marker_namespace=namespace,
++            end_boundary=boundary,
++            marker=marker_text,
++            body=body_text,
++            carrier_index=carrier_index,
++            carrier_kind=carrier_kind,
++            message_count=len(messages),
++            carrier_material_sha256=material_digest,
++            carrier_material_length=material_length,
++            carrier_material_kind=material_kind,
++        )
++        if material_digest and overlay.verify_exact(request):
++            return overlay
++        return _blocked(
++            request,
++            reason="projection_marker_conflict",
++            marker_namespace=namespace,
++            end_boundary=boundary,
++            marker=marker_text,
++            body=body_text,
++            message_count=len(messages),
++        )
++    if body_count:
++        return _blocked(
++            request,
++            reason="bridge_body_conflict",
++            marker_namespace=namespace,
++            end_boundary=boundary,
++            marker=marker_text,
++            body=body_text,
++            message_count=len(messages),
++        )
++
++    material_digest, material_length, material_kind = _content_binding(content)
++    if not material_digest:
++        return _blocked(
++            request,
++            reason="real_user_carrier_ambiguous",
++            marker_namespace=namespace,
++            end_boundary=boundary,
++            marker=marker_text,
++            body=body_text,
++            message_count=len(messages),
++        )
++
++    projected_message = dict(message)
++    if isinstance(content, str):
++        projected_message["content"] = f"{block}\n\n{content}"
++    else:
++        block_type = carrier_kind.rsplit(":", 1)[-1]
++        projected_message["content"] = [
++            _projection_block(block_type, block),
++            *content,
++        ]
++    messages[carrier_index] = projected_message
++    return RequestOverlay(
++        request=request,
++        status="projected",
++        reason="",
++        marker_namespace=namespace,
++        end_boundary=boundary,
++        marker=marker_text,
++        body=body_text,
++        carrier_index=carrier_index,
++        carrier_kind=carrier_kind,
++        message_count=len(messages),
++        carrier_material_sha256=material_digest,
++        carrier_material_length=material_length,
++        carrier_material_kind=material_kind,
++    )
+diff --git a/tests/test_request_overlay.py b/tests/test_request_overlay.py
+new file mode 100644
+index 0000000..2c5f155
+--- /dev/null
++++ b/tests/test_request_overlay.py
+@@ -0,0 +1,391 @@
++from __future__ import annotations
++
++import copy
++import unittest
++from unittest.mock import patch
++
++from hermes_cli import middleware
++from hermes_cli import request_overlay as request_overlay_module
++from hermes_cli.request_overlay import (
++    OVERLAY_DRIFTED,
++    OVERLAY_KEPT,
++    OVERLAY_REMOVED_ESTIMATE_UNPROVEN,
++    OVERLAY_REMOVED_FINAL_BUDGET,
++    REQUEST_OVERLAY_SCHEMA_VERSION,
++    project_request_overlay,
++)
++
++
++NAMESPACE = "[TEST QUOTED REFERENCE"
++END = "[END TEST QUOTED REFERENCE]"
++MARKER = f"{NAMESPACE} marker=one]"
++BODY = f"quoted material\n{END}"
++BLOCK = f"{MARKER}\n{BODY}"
++
++
++def project(request, **kwargs):
++    return project_request_overlay(
++        request,
++        marker_namespace=NAMESPACE,
++        end_boundary=END,
++        marker=MARKER,
++        body=BODY,
++        **kwargs,
++    )
++
++
++class _FilterRecord:
++    schema_version = middleware.TRANSPORT_SCHEMA_VERSION
++
++    def __init__(self) -> None:
++        self.callback = None
++        self.phase = ""
++
++    def register_provider_body_filter(self, callback, *, phase="transform"):
++        self.callback = callback
++        self.phase = phase
++
++
++class RequestOverlayProjectionTests(unittest.TestCase):
++    def assert_projected(self, overlay) -> None:
++        self.assertEqual(overlay.status, "projected")
++        self.assertEqual(overlay.schema_version, REQUEST_OVERLAY_SCHEMA_VERSION)
++        self.assertTrue(overlay.verify_exact(overlay.request))
++        self.assertFalse(overlay.proof["body_included"])
++        self.assertNotIn(BODY, repr(overlay.proof))
++
++    def test_string_carrier_is_cloned_and_exact(self) -> None:
++        original = {
++            "model": "test",
++            "messages": [
++                {"role": "system", "content": "fixed"},
++                {"role": "user", "content": "current exact user body"},
++            ],
++        }
++        before = copy.deepcopy(original)
++
++        overlay = project(original)
++
++        self.assert_projected(overlay)
++        self.assertEqual(original, before)
++        self.assertEqual(
++            overlay.request["messages"][1]["content"],
++            f"{BLOCK}\n\ncurrent exact user body",
++        )
++        self.assertEqual(overlay.carrier_kind, "messages:string")
++        self.assertEqual(overlay.native_request(overlay.request), original)
++
++    def test_multimodal_and_image_only_carriers_preserve_provider_shape(self) -> None:
++        cases = (
++            (
++                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
++                "messages:text",
++                {"type": "text", "text": BLOCK},
++            ),
++            (
++                {"type": "input_image", "image_url": "data:image/png;base64,AA"},
++                "input:input_text",
++                {"type": "input_text", "text": BLOCK},
++            ),
++            (
++                {"image": {"format": "png", "source": {"bytes": b"x"}}},
++                "messages:bedrock_text",
++                {"text": BLOCK},
++            ),
++            (
++                {"type": "document", "source": {"data": "AA"}},
++                "messages:text",
++                {"type": "text", "text": BLOCK},
++            ),
++        )
++        for attachment, carrier_kind, expected_block in cases:
++            with self.subTest(carrier_kind=carrier_kind):
++                key = "input" if carrier_kind.startswith("input:") else "messages"
++                request = {key: [{"role": "user", "content": [attachment]}]}
++                overlay = project(request)
++                self.assert_projected(overlay)
++                self.assertEqual(overlay.carrier_kind, carrier_kind)
++                self.assertEqual(
++                    overlay.request[key][0]["content"],
++                    [expected_block, attachment],
++                )
++                self.assertEqual(overlay.native_request(overlay.request), request)
++
++    def test_tool_result_only_tail_does_not_steal_anthropic_carrier(self) -> None:
++        request = {
++            "messages": [
++                {"role": "user", "content": [{"type": "text", "text": "current"}]},
++                {"role": "assistant", "content": [{"type": "tool_use", "id": "t"}]},
++                {
++                    "role": "user",
++                    "content": [{"type": "tool_result", "tool_use_id": "t"}],
++                },
++            ]
++        }
++        overlay = project(request)
++        self.assert_projected(overlay)
++        self.assertEqual(overlay.carrier_index, 0)
++
++    def test_ambiguous_or_missing_carrier_fails_closed(self) -> None:
++        cases = (
++            ({"messages": [], "input": []}, "request_carrier_ambiguous"),
++            (
++                {"messages": [{"role": "assistant", "content": "answer"}]},
++                "real_user_carrier_missing",
++            ),
++            (
++                {"messages": [{"role": "user", "content": 7}]},
++                "real_user_carrier_missing",
++            ),
++        )
++        for request, reason in cases:
++            with self.subTest(reason=reason):
++                overlay = project(request)
++                self.assertEqual(overlay.status, "blocked")
++                self.assertEqual(overlay.reason, reason)
++                self.assertEqual(overlay.request, request)
++
++    def test_size_and_projection_material_are_closed(self) -> None:
++        request = {"messages": [{"role": "user", "content": "current"}]}
++        too_large = project(request, max_projection_chars=1)
++        self.assertEqual(too_large.reason, "projection_too_large")
++        invalid = project_request_overlay(
++            request,
++            marker_namespace=NAMESPACE,
++            end_boundary=END,
++            marker="wrong",
++            body=BODY,
++        )
++        self.assertEqual(invalid.reason, "projection_material_invalid")
++
++    def test_namespace_collision_in_any_provider_visible_field_fails_closed(
++        self,
++    ) -> None:
++        for field in ("system", "instructions"):
++            with self.subTest(field=field):
++                request = {
++                    field: f"user-authored {NAMESPACE}",
++                    "messages": [{"role": "user", "content": "current"}],
++                }
++                overlay = project(request)
++                self.assertEqual(overlay.status, "blocked")
++                self.assertEqual(overlay.reason, "projection_namespace_conflict")
++
++    def test_same_projection_is_idempotent_but_another_marker_is_blocked(self) -> None:
++        request = {"messages": [{"role": "user", "content": "current"}]}
++        first = project(request)
++        second = project(first.request)
++        self.assert_projected(second)
++        self.assertEqual(second.request, first.request)
++
++        other = project_request_overlay(
++            first.request,
++            marker_namespace=NAMESPACE,
++            end_boundary=END,
++            marker=f"{NAMESPACE} marker=two]",
++            body=f"other\n{END}",
++        )
++        self.assertEqual(other.status, "blocked")
++        self.assertEqual(other.reason, "projection_namespace_conflict")
++
++    def test_exact_verification_rejects_any_request_or_proof_material_drift(
++        self,
++    ) -> None:
++        overlay = project({"messages": [{"role": "user", "content": "current"}]})
++        changed = copy.deepcopy(overlay.request)
++        changed["model"] = "other"
++        self.assertFalse(overlay.verify_exact(changed))
++
++        replaced = copy.deepcopy(overlay.request)
++        replaced["messages"][0]["content"] = f"{BLOCK}\n\nreplacement"
++        self.assertIsNone(overlay.native_request(replaced))
++
++    def test_scoped_removal_preserves_independent_string_and_list_additions(
++        self,
++    ) -> None:
++        string_request = {"messages": [{"role": "user", "content": "current"}]}
++        string_overlay = project(string_request)
++        string_changed = copy.deepcopy(string_overlay.request)
++        string_changed["messages"][0]["content"] += "\n\n<other>keep</other>"
++        string_changed["other_proof"] = {"status": "keep"}
++        native = string_overlay.native_request(string_changed)
++        self.assertEqual(native["other_proof"], {"status": "keep"})
++        self.assertEqual(
++            native["messages"][0]["content"],
++            "current\n\n<other>keep</other>",
++        )
++
++        original_parts = [{"type": "text", "text": "current"}]
++        list_request = {"messages": [{"role": "user", "content": original_parts}]}
++        list_overlay = project(list_request)
++        list_changed = copy.deepcopy(list_overlay.request)
++        downstream = {"type": "text", "text": "downstream"}
++        list_changed["messages"][0]["content"].append(downstream)
++        self.assertEqual(
++            list_overlay.native_request(list_changed)["messages"][0]["content"],
++            [*original_parts, downstream],
++        )
++
++    def test_canonical_hash_distinguishes_mapping_key_types(self) -> None:
++        left = project({"messages": [{"role": "user", "content": "x"}], 1: "v"})
++        right = project({"messages": [{"role": "user", "content": "x"}], "1": "v"})
++        self.assertNotEqual(left.request_sha256, right.request_sha256)
++
++    def test_canonical_hash_is_stable_across_mapping_key_order(self) -> None:
++        left = {"model": "test", "messages": [{"role": "user", "content": "x"}]}
++        right = {"messages": [{"content": "x", "role": "user"}], "model": "test"}
++        self.assertEqual(
++            request_overlay_module.canonical_request_sha256(left),
++            request_overlay_module.canonical_request_sha256(right),
++        )
++
++    def test_large_carrier_proof_hashes_one_adjacent_slice_per_check(self) -> None:
++        carriers = (
++            "x" * 1_000_000,
++            [
++                {"type": "input_text", "text": f"part-{index}"}
++                for index in range(10_000)
++            ],
++        )
++        for content in carriers:
++            with self.subTest(kind=type(content).__name__):
++                overlay = project({"messages": [{"role": "user", "content": content}]})
++                calls = 0
++                original_hash = request_overlay_module.canonical_request_sha256
++
++                def counted(value):
++                    nonlocal calls
++                    calls += 1
++                    return original_hash(value)
++
++                with patch.object(
++                    request_overlay_module,
++                    "canonical_request_sha256",
++                    side_effect=counted,
++                ):
++                    for _ in range(3):
++                        self.assertIsNotNone(overlay.native_request(overlay.request))
++                self.assertEqual(calls, 3)
++
++
++class RequestOverlayBudgetTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.overlay = project({
++            "messages": [{"role": "user", "content": "current"}],
++            "max_tokens": 32,
++        })
++
++    def register(self, record, *, window):
++        token = middleware._CURRENT_MIDDLEWARE_OWNER.set("test-plugin")
++        try:
++            return self.overlay.register_final_budget_guard(
++                record,
++                context_window_tokens=window,
++                reserve_tokens=lambda body, _window: body.get("max_tokens", 32),
++                validator=lambda _body, native: (
++                    native["messages"][0]["content"] == "current"
++                ),
++            )
++        finally:
++            middleware._CURRENT_MIDDLEWARE_OWNER.reset(token)
++
++    def test_final_budget_guard_keeps_fitting_overlay(self) -> None:
++        record = middleware.TransportRecord()
++        self.assertTrue(self.register(record, window=100_000))
++        filtered = record.filter_provider_body(self.overlay.request)
++        self.assertEqual(filtered, self.overlay.request)
++        self.assertEqual(self.overlay.disposition, OVERLAY_KEPT)
++
++    def test_final_budget_guard_removes_only_owned_overlay_on_overflow(self) -> None:
++        record = middleware.TransportRecord()
++        self.assertTrue(self.register(record, window=1))
++        filtered = record.filter_provider_body(self.overlay.request)
++        self.assertEqual(filtered["messages"][0]["content"], "current")
++        self.assertEqual(self.overlay.disposition, OVERLAY_REMOVED_FINAL_BUDGET)
++
++    def test_unproven_estimate_has_a_distinct_removal_disposition(self) -> None:
++        record = _FilterRecord()
++        self.assertTrue(self.register(record, window=100_000))
++        filtered = record.callback(
++            copy.deepcopy(self.overlay.request),
++            estimated_tokens=None,
++            estimate_source="unknown",
++            estimate_confidence="unknown",
++        )
++        self.assertEqual(filtered["messages"][0]["content"], "current")
++        self.assertEqual(
++            self.overlay.disposition,
++            OVERLAY_REMOVED_ESTIMATE_UNPROVEN,
++        )
++
++    def test_final_carrier_drift_is_visible_and_provider_is_not_blocked(self) -> None:
++        record = middleware.TransportRecord()
++        self.assertTrue(self.register(record, window=100_000))
++        changed = copy.deepcopy(self.overlay.request)
++        changed["messages"][0]["content"] = f"{BLOCK}\n\nreplacement"
++        filtered = record.filter_provider_body(changed)
++        self.assertEqual(filtered, changed)
++        self.assertTrue(record.ambiguous)
++        self.assertEqual(self.overlay.disposition, OVERLAY_DRIFTED)
++
++    def test_composed_overlays_can_both_shrink_in_either_guard_order(self) -> None:
++        native = {
++            "messages": [{"role": "user", "content": "current"}],
++            "max_tokens": 32,
++        }
++        for owners in (("first", "second"), ("second", "first")):
++            with self.subTest(owners=owners):
++                first = project_request_overlay(
++                    native,
++                    marker_namespace="[FIRST QUOTED REFERENCE",
++                    end_boundary="[END FIRST QUOTED REFERENCE]",
++                    marker="[FIRST QUOTED REFERENCE marker=one]",
++                    body="first\n[END FIRST QUOTED REFERENCE]",
++                )
++                second = project_request_overlay(
++                    first.request,
++                    marker_namespace="[SECOND QUOTED REFERENCE",
++                    end_boundary="[END SECOND QUOTED REFERENCE]",
++                    marker="[SECOND QUOTED REFERENCE marker=two]",
++                    body="second\n[END SECOND QUOTED REFERENCE]",
++                )
++                overlays = {"first": first, "second": second}
++                record = middleware.TransportRecord()
++                for owner in owners:
++                    token = middleware._CURRENT_MIDDLEWARE_OWNER.set(owner)
++                    try:
++                        self.assertTrue(
++                            overlays[owner].register_final_budget_guard(
++                                record,
++                                context_window_tokens=1,
++                                reserve_tokens=lambda _body, _window: 32,
++                                validator=lambda _body, candidate: candidate[
++                                    "messages"
++                                ][0]["content"].endswith("current"),
++                            )
++                        )
++                    finally:
++                        middleware._CURRENT_MIDDLEWARE_OWNER.reset(token)
++
++                first_removed = first.native_request(
++                    second.request,
++                    require_original_material=False,
++                )
++                self.assertIsNotNone(first_removed)
++                self.assertIsNone(second.native_request(first_removed))
++
++                filtered = record.filter_provider_body(second.request)
++                self.assertEqual(filtered, native)
++                self.assertFalse(record.ambiguous)
++                self.assertEqual(
++                    first.disposition,
++                    OVERLAY_REMOVED_FINAL_BUDGET,
++                )
++                self.assertEqual(
++                    second.disposition,
++                    OVERLAY_REMOVED_FINAL_BUDGET,
++                )
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.50.1 (Apple Git-155)
+

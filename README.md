@@ -4,9 +4,9 @@ Hermes Continuity gives a Hermes conversation a bounded rolling bridge across
 context compression. It reads Hermes's canonical session history, builds an
 exact-source checkpoint, and inserts only the recent bridge into the current
 provider request. It also exposes a profile-local, read-only canonical-window
-service so a separate Global Hot plugin can assemble recent complete dialogue
-from other Hermes mouths without reading `state.db` or this plugin's metadata
-schema directly.
+service so a separate Global Hot plugin can assemble recent complete visible
+interaction groups from other Hermes mouths without reading `state.db` or this
+plugin's metadata schema directly.
 
 The first policy is intentionally conservative:
 
@@ -23,7 +23,9 @@ and retrievable through Hermes `state.db` and native `session_search`.
 
 For each supported request, the plugin:
 
-1. reads the canonical `SessionDB` view through a read-only handle;
+1. on the optional Block 3 host, reads a bounded complete-group window over a
+   validated incremental prefix; on the twelve-patch host, retains the Block 1
+   row/byte-gated full-prefix reader;
 2. compiles a bounded checkpoint and recent bridge;
 3. projects that bridge into the current real user carrier;
 4. accepts only a host-resolved context window with explicit provenance,
@@ -36,6 +38,11 @@ For each supported request, the plugin:
    body has physically reached the provider path.
 
 Checkpoints and receipts live in a separate plugin-data SQLite database.
+Both database paths are fixed by the active Hermes profile: canonical reads
+use that profile's `state.db`, while Continuity metadata uses
+`plugin-data/<host-owned-plugin-namespace>/continuity.sqlite3`. Neither path is
+a plugin setting, so one profile cannot be configured to borrow another
+profile's transcript or checkpoint realm.
 Checkpoint v2 stores the generated rolling-bridge body together with source
 IDs, fingerprints, hashes, and revision state. It does not copy canonical
 transcript sentences. Delivery receipts and public traces contain only IDs,
@@ -43,15 +50,114 @@ hashes, counts, status, and timestamps. Ambiguous clone history, source
 rewrites, unsupported carriers, and incomplete scans fail closed to the
 unchanged Hermes request.
 
+`max_full_prefix_physical_rows` defaults to 2,048. A session with more
+physical rows is left on Hermes's native request path before Continuity asks
+`SessionDB` to decode the complete compacted history. This is a latency and
+memory guard, not a replacement for the compact prefix-proof design required
+to provide Continuity bridges for arbitrarily long sessions.
+
+### Block 3 long-history implementation candidate
+
+The additive `hermes-0.20.5-incremental-history.patch` enables body-free host
+change capture/canonical indexing and compact checkpoint v3. It applies after
+the original twelve patches, followed by `hermes-0.20.5-history-value-guard.patch`
+to bound SQLite value materialization during probes and reads. The original
+fourteen artifacts are unchanged by the additional Block 4
+`hermes-0.20.5-history-quantum-progress.patch`: it closes preparation pages
+between complete rows with time reserved for cursor publication, retaining
+the original SQL deadline, row/byte ceilings and proof rules. Without the indexed host seam the
+accepted Block 1/v2 protection remains active.
+
+`hermes-0.20.5-history-origin-recovery.patch` additionally preserves producer
+tags in Gateway replay and recovers a proven lost notification tag in indexed
+clone views. It does not discard dialogue groups, rewrite canonical rows or
+infer human origin from text. All other signature conflicts remain errors;
+old index proofs are revalidated under canonical rule v2. This indexed repair
+does not relax the separate legacy/recent-window reader used by Global Hot.
+
+The additional `hermes-0.20.5-history-streamed-values.patch` permits giant
+stored values to be verified in 64-KiB chunks without loading their full
+body. Complete identity hashes and checksummed range descriptors stay private;
+foreground fragments revalidate their source before reading. The 4-MiB page
+and complete-group limits remain. Recorded image meanings enter the bridge,
+not historical pixels. Giant text still requires bounded fragments and may
+explicitly exceed the current summary workset; this is not unlimited decoding.
+Canonical rule v3 rebuilds derived proofs, not canonical messages. This source
+candidate still requires target qualification and review before deployment.
+
+One background worker validates history in finite pages without calling a
+model. The foreground reads only a bounded recent complete-group window;
+index completion does not summarize all history or grant retirement authority.
+V3 uses a separate table in the same plugin database, preserving v2 rows and
+receipts. Successful post-delivery CAS means `stored_unvalidated`, not reusable:
+each subsequent use verifies its compact proof against the canonical source.
+
+### Question-selected recall (additive host patch 18)
+
+The nineteen-patch candidate also delivers an ephemeral historical reference
+selected for the current question. It can cross an old live hole without
+retiring it. One bounded host auxiliary call extracts up to three keyword
+queries; Hermes native FTS/LIKE returns body-free positions, then up to 24
+complete verified groups are hydrated within 2,048 rows / 4 MiB. A second
+bounded call selects relevant groups and summarizes only admitted material.
+The recall shares the 2,048-token overlay output ceiling with any rolling
+bridge, and the existing final-provider budget guard remains authoritative.
+Auxiliary input is bounded by `source_token_limit`; each native query has a
+50-ms SQL progress deadline and at most 64 hits. These are work limits, not
+exact tokenizer or hard I/O wall-clock guarantees.
+FTS candidates use native newest-posting order rather than scoring every
+matching physical clone; relevance is decided over the admitted complete groups.
+
+This is automatic question-driven **selection and semantic delivery**, not
+merely permission to use a search tool. It is not embedding similarity search
+or a promise to find every paraphrase: native keyword candidates remain the
+retrieval ceiling; optional date filtering applies to those bounded candidates.
+There is no transcript copy, new search tool, background whole-history summary
+or persisted recall body. Selected source IDs/hashes are recorded only after
+verified post-settlement. Recall-only delivery never CASes a checkpoint or
+advances retirement. Empty, unproven, failed or over-budget recall leaves the
+native request / valid rolling bridge intact. `/continuity-status` distinguishes
+`selected`, `empty`, `failed`, and a missing search seam. Planning adds one
+bounded auxiliary call per new indexed turn; nonempty candidates can add a
+second, besides any existing rolling summary. Retries reuse the frozen plan;
+next turns plan afresh. Natural relevance and live latency still need a canary.
+Both recall auxiliary calls share `summary_timeout_seconds`, rather than each
+adding a fresh full timeout. A timeout cannot erase an already valid rolling
+bridge; it is visible in status and does not create a delivery receipt.
+Additive correction 19 keeps streamed-value proofs subordinate to real
+canonical members: a rewound giant row remains on disk but creates neither
+member nor child proof; restore/redo revalidates it normally. It does not
+change recall, checkpoint retirement, foreign keys or byte/time budgets.
+
+This is a **0.20.5 compatibility-lane source candidate**, not a deployed release
+or a requalification of the separate accepted 0.21.3 lane. Scope, test commands,
+resource measurements and rollback procedure are in
+[LONG_HISTORY_IMPLEMENTATION.md](LONG_HISTORY_IMPLEMENTATION.md).
+
+The full-prefix reader additionally caps encoded message-column bytes at
+`max_full_prefix_bytes` (default 4 MiB), before transferring rows or calling
+the host decoder. The row probe, byte probe and fetch share one short host
+read snapshot. API content, tool calls, reasoning and display metadata count
+toward this budget, including compacted clones. An unavailable source never
+loads its checkpoint. Stored checkpoint plus prefix-ID JSON is limited by
+`max_checkpoint_bytes` (default 1 MiB), on both read and publication; an
+oversized existing checkpoint is left intact. These are serialized-payload
+budgets, not absolute Python RSS ceilings. See `RESOURCE_GUARD.md` for the
+full-chain benchmark and the remaining long-history work.
+
 The metadata file is claimed by one plugin owner before any Continuity table is
 created. Registration/store initialization rejects Hermes canonical tables,
 foreign owners, and unclaimed nonempty SQLite schema rather than mixing stores.
 
 The `canonical-source.v2` service uses bounded physical reads, follows
-compression lineages from ancestor to tip, returns only complete
-user/final-assistant groups, and blocks the whole window on ambiguous source
-history. Every group carries one closed source class: `human`, `scheduled`,
-`internal`, `delegated`, `tool`, or `unknown`. Wakeups qualify as scheduled
+compression lineages from ancestor to tip, and blocks the whole window on
+ambiguous source history. Consecutive plain-text user rows are merged with the
+same double-newline rule as Hermes's provider replay; the first following
+assistant closes that dialogue group, and later visible assistant rows become
+typed proactive-assistant groups. API-only scaffolds and host metadata never
+become source material, while an unverified assistant at the start of a full
+session still fails closed. Every group carries one closed source class:
+`human`, `scheduled`, `internal`, `delegated`, `tool`, or `unknown`. Wakeups qualify as scheduled
 only when the durable user row carries host-proven wakeup provenance; an
 arbitrary platform label is not enough. Response bodies exist only in the
 synchronous in-process response; service traces and receipts remain body-free.
@@ -68,7 +174,10 @@ confidence class, checkpoint publication outcomes, and unsupported host paths.
 The host estimate covers messages/input, system/instructions, tools and image
 allowances with a 15% + 64-token margin, but it remains a heuristic rather than
 an exact tokenizer upper bound. The status output contains no bridge or
-transcript body.
+transcript body. Session status reads checkpoint metadata only, never its
+JSON: `stored_unvalidated` means present, not proven reusable;
+`byte_limit_exceeded` means it cannot be loaded within the configured budget.
+Source/checkpoint validation remains on the request path.
 
 `api_mode=codex_app_server` is unsupported in v1 and is left unmodified. MoA
 prepared requests are currently transport-ambiguous and therefore never
@@ -95,23 +204,39 @@ The reviewed host baseline and additive host seams are:
   `hermes.transport.v3`:
   `7a5c6ca23b544d73fb37a3a1c7d8b08d1a82938c`;
 - verified durable wakeup provenance:
-  `7c183e81832c81e29f6d095a15bb7c8cd080ee5c`.
+  `7c183e81832c81e29f6d095a15bb7c8cd080ee5c`;
+- installer manifest-v2 alignment:
+  `113b4ab5285f92a1013c6a494eb33260a7f70140`;
+- joint plugin Doctor:
+  `969cf5bdbc3a110e475c02ed8e4ee84f64be32ed`;
+- shared request overlay ownership, scoped proof, and final-budget disposition:
+  `ccd7bf350ca54a44b7351904e079f5ffdb64eec0`;
+- host-accepted overlay dispositions, zero-filter provider-body estimates, and
+  no byte-derived ownership reminting:
+  `5a680e5e38625fb3275b4bf6973a40d089ec11a7`.
 
-Apply the eight ordered patches in [`patches/`](patches/) to the compatible
-Hermes core before registration. They are generic host capabilities, not
-plugin-specific monkey patches. Registration fails visibly if any required
-schema or API is absent.
+Apply the twelve ordered patches in [`patches/`](patches/) to the compatible
+Hermes core. The first eight are runtime prerequisites, the next two align
+the official installer with manifest v2 and let Doctor load dependency sets in
+one initialized temporary profile, and the final two own generic
+request-overlay carrier/proof behavior and host acceptance. They are generic
+host capabilities, not plugin-specific monkey patches. Registration fails
+visibly if a required runtime schema or API is absent.
 
 The order is: `plugin-llm-finish-reason`, `request-middleware-v2`,
 `plugin-service-registry`, `bounded-session-message-reads`,
 `provider-transport-truth`, `closed-finish-state-truth`,
-`final-provider-budget-controls`, then `verified-wakeup-provenance`.
+`final-provider-budget-controls`, `verified-wakeup-provenance`,
+`installer-manifest-v2`, `joint-plugin-doctor`, `request-overlay-proofs`, then
+`request-overlay-acceptance`.
 
 ## Test
 
-The default suite uses only the Python standard library:
+The default suite uses the Python standard library plus the shared overlay
+module from the compatible Hermes tree:
 
 ```bash
+PYTHONPATH=/path/to/patched/hermes \
 python -B -m unittest discover -s tests -v
 ```
 
@@ -124,22 +249,22 @@ HERMES_SOURCE_ROOT=/path/to/hermes \
 python -B -m unittest discover -s tests -v
 ```
 
-All committed fixtures are synthetic. Public GitHub Actions runs only the
-standard-library Python 3.11/3.12 unit suite. Compatible-Hermes, transport,
-gateway, and dual-middleware counts recorded in `PROGRESS.md` are separately
-run local exact-revision integration evidence; they are not implied by a Green
-public workflow. Optional real-Hermes integration requires
-`HERMES_SOURCE_ROOT`.
+All committed fixtures are synthetic. Public GitHub Actions first replays the
+twelve baseline patches from pure upstream `fcbd1076`, installs that host and
+runs the overlay plus product suite on Python 3.11/3.12. Additive lanes apply
+patches 13–17, native-search patch 18 and lifecycle correction 19, rerun retained contracts and
+resource benchmarks, and exercise real `AIAgent.run_conversation` with question
+recall and the pinned Global Hot pair. Providers and auxiliary responses in
+this proof remain synthetic; it does not authorize production deployment.
 
 ## Current status
 
-The first public replacement candidate received external review. Its
-source-policy findings are incorporated in this next exact-revision candidate.
-The current v2 source/checkpoint path still performs work and stores proof
-material proportional to full session history; formal use on a long-lived
-profile remains blocked until a stable host prefix-proof seam and compact
-checkpoint v3 exist. The plugin is not installed, enabled, deployed, or
-observed in a live conversation; see [`PROGRESS.md`](PROGRESS.md).
+Blocks 1–3 are source-accepted. The additive streamed-value and question-recall
+candidate extends Block 4 target qualification: the former crosses giant
+canonical values, the latter can quote verified relevant groups without
+claiming retirement past live holes. The original twelve-patch v2 path remains
+full-history-proportional. This current candidate has not been installed,
+enabled, deployed or naturally observed; see [`PROGRESS.md`](PROGRESS.md).
 
 The extraction lineage and deliberate omissions are recorded in
 [`PROVENANCE.md`](PROVENANCE.md). Security and privacy boundaries are in

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import fields
-from pathlib import Path
 from typing import Any
 
 from .hermes_adapter import (
@@ -12,28 +11,6 @@ from .hermes_adapter import (
     HermesSessionAdapter,
 )
 from .runtime import ContinuityRuntime
-
-
-def _path_setting(ctx: Any, key: str, fallback: Path | None = None) -> Path | None:
-    value = str(ctx.get_config(key, default="") or "").strip()
-    if value:
-        return Path(value).expanduser()
-    return fallback
-
-
-def _same_database(left: str | Path, right: str | Path) -> bool:
-    left_path = Path(left).expanduser()
-    right_path = Path(right).expanduser()
-    try:
-        if left_path.resolve(strict=False) == right_path.resolve(strict=False):
-            return True
-        return bool(
-            left_path.exists()
-            and right_path.exists()
-            and left_path.samefile(right_path)
-        )
-    except (OSError, RuntimeError):
-        return False
 
 
 def _string_list_setting(ctx: Any, key: str) -> list[str]:
@@ -62,10 +39,11 @@ def _require_compatible_host(ctx: Any) -> None:
             MIDDLEWARE_SCHEMA_VERSION,
             TRANSPORT_SCHEMA_VERSION,
         )
+        from hermes_cli.request_overlay import REQUEST_OVERLAY_SCHEMA_VERSION
     except ImportError as exc:
         raise RuntimeError(
             "Hermes Continuity requires hermes.middleware.v2 and "
-            "hermes.transport.v3"
+            "hermes.transport.v3 with hermes.request_overlay.v2"
         ) from exc
 
     if "finish_reason" not in {field.name for field in fields(PluginLlmCompleteResult)}:
@@ -79,6 +57,8 @@ def _require_compatible_host(ctx: Any) -> None:
         raise RuntimeError("Hermes Continuity requires hermes.middleware.v2")
     if TRANSPORT_SCHEMA_VERSION != "hermes.transport.v3":
         raise RuntimeError("Hermes Continuity requires hermes.transport.v3")
+    if REQUEST_OVERLAY_SCHEMA_VERSION != "hermes.request_overlay.v2":
+        raise RuntimeError("Hermes Continuity requires hermes.request_overlay.v2")
 
 
 def register(ctx: Any) -> None:
@@ -90,37 +70,42 @@ def register(ctx: Any) -> None:
     additional_human_sources = _string_list_setting(
         ctx, "additional_human_sources"
     )
-    session_db_path = _path_setting(ctx, "state_db")
+    # Hermes owns this layout: <profile>/plugin-data/<plugin namespace>.
+    plugin_data_dir = ctx.state.data_dir
+    profile_home = plugin_data_dir.parent.parent
+    session_db_path = profile_home / "state.db"
     session_db = SessionDB(db_path=session_db_path, read_only=True)
     # Register resource cleanup at acquisition time. The host disposes its
     # ownership ledger in reverse order, so the service registered last below
     # becomes unreachable before runtime cleanup and SessionDB.close().
     ctx.on_unload(session_db.close)
-    if not callable(getattr(session_db, "get_messages_time_window", None)):
+    if any(not callable(getattr(session_db, name, None)) for name in (
+        "get_messages_time_window", "_read_ctx", "_decode_message_rows",
+        "_dedupe_compacted_message_rows",
+    )):
         session_db.close()
         raise RuntimeError(
             "Hermes Continuity requires "
-            "SessionDB.get_messages_time_window()"
+            "SessionDB.get_messages_time_window() and the compatible 0.20.5 reader/decoder seams"
         )
-    metadata_path = _path_setting(
-        ctx,
-        "metadata_db",
-        Path(ctx.state.data_dir) / "continuity.sqlite3",
-    )
-    state_path = getattr(session_db, "db_path", None)
-    if metadata_path is None or (
-        state_path is not None and _same_database(state_path, metadata_path)
-    ):
-        session_db.close()
-        raise RuntimeError(
-            "Hermes Continuity metadata_db must not alias Hermes state.db"
-        )
+    metadata_path = plugin_data_dir / "continuity.sqlite3"
     try:
-        metadata_store = ContinuityMetadataStore(metadata_path)
+        metadata_store = ContinuityMetadataStore(
+            metadata_path,
+            max_checkpoint_bytes=ctx.get_config("max_checkpoint_bytes", default=1_048_576),
+        )
     except Exception:
         session_db.close()
         raise
-    adapter = HermesSessionAdapter(session_db, metadata_store)
+    adapter = HermesSessionAdapter(
+        session_db,
+        metadata_store,
+        max_full_prefix_physical_rows=ctx.get_config(
+            "max_full_prefix_physical_rows", default=2_048
+        ),
+        max_full_prefix_bytes=ctx.get_config("max_full_prefix_bytes", default=4_194_304),
+    )
+    ctx.on_unload(adapter.close)
     canonical_source_service = ContinuityCanonicalSourceService(
         adapter,
         additional_human_sources=additional_human_sources,

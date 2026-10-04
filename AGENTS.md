@@ -15,7 +15,7 @@ Preserve these owner and provenance boundaries:
   AsherieSystem revision
   `ddfb1e9aeb7c6f7797912e959a0970c621875c83`.
 - Keep the Hermes baseline explicit: upstream `fcbd1076`, owner overlay
-  `c7c36f36`, and ordered generic seams `201fe77` through `7c183e8`.
+  `c7c36f36`, and ordered generic seams `201fe77` through `5a680e5`.
 - Do not weaken physical request verification or move checkpoint CAS before
   `post_api_request`.
 - Verify delivery against `hermes.transport.v3` final `provider_body`, not the
@@ -29,13 +29,34 @@ Preserve these owner and provenance boundaries:
   reviewed.
 - Keep MoA checkpoint publication disabled while its final provider body is
   transport-ambiguous.
-- Runtime dependencies remain standard-library-only. Test with
-  `python -B -m unittest discover -s tests -v`; use `HERMES_SOURCE_ROOT` for the
-  optional real `SessionDB` integration.
+- Runtime dependencies remain standard-library-only beyond the compatible
+  Hermes host. Test with that host on `PYTHONPATH`; use `HERMES_SOURCE_ROOT` for
+  the optional real `SessionDB` integration.
 - Never commit real owner/channel IDs, private paths, secrets, config, logs,
   databases, SQLite sidecars, or conversation fixtures.
 - Do not describe the plugin as published, installed, enabled, deployed, or
   live-verified until that exact state has been demonstrated and recorded.
+
+## Integration and audit truth
+
+- A unit, runtime-helper, or registry test cannot prove host wiring. Claims
+  about delivery, settlement, restart, or cross-mouth behavior require the
+  real Hermes discovery path and `AIAgent.run_conversation`, the final SDK
+  provider body, the production post/error hooks, and the real SQLite stores.
+- Report only the highest proven layer: code-correct -> discovered/registered
+  -> request projected -> final provider body -> post-settled -> next-turn
+  readback -> restart readback -> surface-observed. Never promote an earlier
+  Green layer into a later one.
+- Reproduce an alleged Hermes ordering or carrier bug against the exact host
+  revision before editing production code. A hand-written helper sequence or
+  stale review excerpt is not evidence of the current host order.
+- Once code correctness and the real-host gate are Green, review should move
+  to practical integration: patch application, config/doctor behavior,
+  upgrade overwrite risk, latency, failure visibility, rollback, and actual
+  CLI/gateway canaries. Reopen algorithm design only for a new reproducible
+  regression or an owner-requested product change.
+- The cross-repo gate is `tests.test_real_host_entrypoint`; run it with both
+  `HERMES_SOURCE_ROOT` and `HERMES_GLOBAL_HOT_ROOT` set to exact trees.
 
 Use the smallest compatible change. Update `PROGRESS.md` only when a release or
 deployment gate actually changes.

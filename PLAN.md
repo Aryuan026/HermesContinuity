@@ -6,7 +6,8 @@ Hermes remains the owner of canonical transcript storage, original-sentence
 retrieval, native `session_search`, and context compression. Hermes Continuity
 owns only:
 
-- a read-only projection from `SessionDB` into complete dialogue groups;
+- a read-only projection from `SessionDB` into complete visible interaction
+  groups;
 - bounded checkpoint and recent-bridge construction;
 - request-only bridge projection and physical-delivery proof; and
 - a profile-local canonical-window service for trusted peer plugins; and
@@ -40,29 +41,89 @@ provider, or a replacement compressor.
 - Leave `codex_app_server` unchanged in v1.
 - Leave MoA prepared requests unchanged and unpublished until Hermes can expose
   an unambiguous final provider body for that path.
-- Require all eight generic Hermes host seams documented in `README.md`.
+- Require all twelve generic Hermes host seams documented in `README.md`.
 - Keep attempts that miss both post/error hooks under a strict count cap and
   TTL. Expiry revokes settlement authority. Execution may remove an expired
   carrier only while it still holds the exact bound proof; if another entry
   point has already swept that proof, it preserves the request unchanged
   rather than guessing that user-authored text is plugin-owned.
-- Reject `metadata_db` aliases of `state.db`, Hermes canonical schema, metadata
-  files claimed by a different plugin owner, and unclaimed nonempty SQLite.
+- Bind the read-only canonical handle to the active profile's `state.db` and
+  metadata to that profile's Hermes-owned plugin-data realm. Reject Hermes
+  canonical schema, files claimed by a different plugin owner, and unclaimed
+  nonempty SQLite rather than accepting path overrides.
 
 ## Long-history gate
 
+Block 1 is **complete-entry transitional protection and resource baseline**:
+guard full-prefix messages and checkpoint loading before payload transfer,
+preserve small-session compile/settlement, and measure the full plugin chain in
+disposable processes. Source overflow may still leave native Hermes unchanged.
+It does not prove continuity for sessions exceeding 2,048 physical rows.
+
+Block 2 must freeze the writer census, host pagination/source-validity protocol,
+publication guarantee and checkpoint-v3 format before Block 3 implements them.
+The accepted specification is [LONG_HISTORY_PROTOCOL.md](LONG_HISTORY_PROTOCOL.md):
+host-owned change capture and bounded indexes, conditional checkpoint storage
+with validation on every use. The owner accepted Block 2 at `e54472f2` and
+authorized Block 3 implementation. Current work adds the thirteenth host patch
+and its fourteenth value-guard correction,
+compact v3 storage/compiler input and bounded preparation; implementation
+review and deployment remain distinct. See LONG_HISTORY_IMPLEMENTATION.md.
+Index progress, provider delivery and checkpoint publication remain separate
+facts. Index completion must not trigger whole-history model summarization.
+Block 3 must positively prove a >2,048-row bridge, actual settlement and next-turn
+reuse. The accepted Block 1 exact SHA becomes the preferred v3 rollback target;
+`34780f0` / 0.4.1 remains a historical recovery point, not an equivalent guard.
+The accepted source rollback SHA is now
+`1d6f502f2c21636d9f75b31fcc46f109c3bfece6`; this does not select a deployed pin.
+Retained v3 data alone cannot prove writes performed by an older host.
+
+This block changes neither the accepted 0.21.3 migration lane nor Global Hot's
+product algorithm. Its byte guard applies to the full-prefix Continuity entry;
+the separate canonical time-window service retains its existing row budget.
+
 Checkpoint v2 still reads and proves the complete canonical prefix and stores
 full-prefix identity/fingerprint arrays. Work, memory, and checkpoint bytes
-therefore grow with total history. A formal long-lived-profile release
-requires a Hermes-owned stable logical anchor/prefix digest seam and a compact
-checkpoint v3 that proves bounded suffix growth and detects prefix rewrite.
-The existing bounded time-window API is sufficient for the cross-mouth window
-service, but cannot honestly replace this full-prefix contract.
+therefore grow with total history while the physical row count remains within
+the configured full-prefix budget. Larger sessions leave the request on the
+native Hermes path before the complete compacted view is decoded. Providing
+Continuity bridges for those sessions still requires a Hermes-owned stable
+logical anchor/prefix digest seam and a compact checkpoint v3 that proves
+bounded suffix growth and detects prefix rewrite. The existing bounded
+time-window API is sufficient for the cross-mouth window service, but cannot
+honestly replace this full-prefix contract.
+
+## Owner-approved independent recall repair
+
+The owner approved separating bounded question-driven recall from the continuous
+retirement cursor on 2026-10-02. The current source checkpoint is `c0a0d607`;
+the primary worktree is HermesContinuity's existing Block 4 review branch.
+The actual owner copy reaches index-ready but 139 live groups block 3,153 later
+compacted groups behind the retirement prefix. The new request-only path may
+select verified complete groups across those holes. It must not retire, relabel,
+quarantine or copy them into another transcript/search store.
+
+Reuse Hermes's native FTS routing for body-free bounded candidate locators,
+the existing host canonical page/proof seam for hydration, and this runtime's
+overlay, final-body budget and post-settled receipt. A bounded host auxiliary
+call extracts search terms; a bounded second call selects relevant groups and
+summarizes only that admitted workset. No embedding runtime or memory-provider
+slot is added. Checkpoint v2/v3 and their CAS remain the rolling path's property.
+Recall output is ephemeral and cannot update their retirement cursor.
+
+Acceptance must cover complete-group relevance, unrelated/empty queries,
+source rewrite, shared token/byte budgets, final provider delivery, post/error,
+next-turn and manager reload, and the protected real copy. Stop at a published
+source candidate with these evidence layers distinct; deployment still requires
+the existing review/target qualification conditions. Global Hot, donor source,
+0.21.x migration, original databases and production configuration are untouched.
 
 ## Release gates
 
-1. Keep the full standard-library test suite Green, including optional real
-   Hermes integration when `HERMES_SOURCE_ROOT` is available.
+1. Keep the full standard-library suite Green and pass the opt-in real-host
+   entrypoint proof: actual plugin discovery, `AIAgent.run_conversation`, final
+   provider body, post/error settlement, SQLite readback, and manager
+   unload/reload.
 2. Replace the obsolete repository history before public push.
 3. Push the reviewed revision for external web review.
 4. Address external findings and record the exact reviewed revision.

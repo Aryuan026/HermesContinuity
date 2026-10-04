@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import hashlib, json
+import hashlib
+import json
 from typing import Any, Callable, Dict, List, Mapping
 
 from .context_compactor import (
-    _mint_thread_continuity_prompt_plan_owner,
-    _read_thread_continuity_fixed_prompt_selection,
+    THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA,
+    THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA,
+    SUMMARY_CONSTRUCTION_TOKEN_LIMIT,
     accept_summary_attempt,
     accept_summary_chunk_attempt,
     build_thread_continuity_checkpoint_from_attempts,
@@ -13,10 +15,14 @@ from .context_compactor import (
     plan_next_summary_chunk_attempt,
     plan_thread_continuity_fold,
     render_thread_continuity_checkpoint_message,
-    SUMMARY_CONSTRUCTION_TOKEN_LIMIT,
     thread_continuity_bridge_projection,
     thread_continuity_retirement_source_group_ids,
     validate_thread_continuity_input,
+)
+from .checkpoint_v3 import (
+    THREAD_CONTINUITY_COMPACT_SOURCE_SCHEMA,
+    normalize_thread_continuity_compact_source,
+    normalize_thread_continuity_revision_id,
 )
 
 
@@ -27,21 +33,13 @@ _TRACE_SAMPLE_LIMIT, _ID_SAMPLE_LIMIT = 17, 8
 def _result(trace: Dict[str, Any], status: str, *, reason: str, revision: int, snapshot: str,
             mode: str = "raw", messages: List[Dict[str, Any]] | None = None,
             checkpoint: Mapping[str, Any] | None = None,
-            physical_owner_sidecar: Mapping[str, Any] | None = None,
-            selected_prompt_assembly: Any = None,
-            fixed_prompt_selection: Any = None) -> Dict[str, Any]:
+            physical_owner_sidecar: Mapping[str, Any] | None = None) -> Dict[str, Any]:
     trace.update(final_status=status, reason=reason)
     return {
         "schema": _SCHEMA, "status": status, "mode": mode,
         "physical_provider_messages": list(messages or []) if status == "ready" else [],
         "private_physical_owner_sidecar": (
             physical_owner_sidecar if status == "ready" and physical_owner_sidecar else None
-        ),
-        "private_selected_prompt_assembly": (
-            selected_prompt_assembly if status == "ready" else None
-        ),
-        "private_fixed_prompt_selection": (
-            fixed_prompt_selection if status == "ready" else None
         ),
         "checkpoint_candidate": dict(checkpoint) if status == "ready" and checkpoint else None,
         "expected_revision": revision, "expected_pre_turn_source_snapshot": snapshot, "trace": trace,
@@ -118,366 +116,9 @@ def _project_cache(trace: Dict[str, Any], sample: Dict[str, Any] | None, project
     if status == "observed":
         trace["cache_read_input_tokens_total"] += values["cache_read_input_tokens"]
         trace["cache_creation_input_tokens_total"] += values["cache_creation_input_tokens"]
-    if sample: sample["cache"] = projected
+    if sample:
+        sample["cache"] = projected
 
-
-def resolve_thread_continuity_fixed_prompt_plan(
-    groups: List[Dict[str, Any]],
-    *,
-    current_ephemeral: Mapping[str, Any],
-    context_window_tokens: Any,
-    reserved_output_tokens: Any,
-    fixed_non_message_tokens: Any,
-    fixed_prompt_messages: Any,
-    post_current_messages: Any = None,
-    previous_state: Mapping[str, Any] | None = None,
-    minimum_fold_source_group_ids: List[str] | None = None,
-    bridge_reference_at: Any = None,
-    bridge_recent_horizon_hours: Any = 72,
-    bridge_source_token_limit: Any = 24_000,
-    bridge_output_token_limit: Any = 2_048,
-    estimate_messages: Callable[[List[Dict[str, Any]]], int],
-    fixed_prompt_finalizer: Callable[[Any], Any] | None = None,
-    plan_fold: Callable[..., Dict[str, Any]] = plan_thread_continuity_fold,
-) -> Dict[str, Any]:
-    """Resolve one pure fixed-prompt/fold fixed point without provider work."""
-
-    original_fixed_prompt_messages = fixed_prompt_messages
-    resolved_fixed_prompt_messages = fixed_prompt_messages
-    selected_prompt_assembly: Any = None
-    fixed_prompt_selection: Any = None
-    prepared_fold_plan: Dict[str, Any] | None = None
-    status = "absent" if fixed_prompt_finalizer is None else "candidate"
-    pass_count = 0
-    if fixed_prompt_finalizer is not None:
-        converged = False
-        for _pass_index in range(4):
-            pass_count += 1
-            prepared_fold_plan = plan_fold(
-                groups,
-                current_ephemeral=current_ephemeral,
-                context_window_tokens=context_window_tokens,
-                reserved_output_tokens=reserved_output_tokens,
-                fixed_non_message_tokens=fixed_non_message_tokens,
-                fixed_prompt_messages=resolved_fixed_prompt_messages,
-                post_current_messages=post_current_messages,
-                source_complete=True,
-                estimate_messages=estimate_messages,
-                previous_state=previous_state,
-                minimum_fold_source_group_ids=minimum_fold_source_group_ids,
-                bridge_reference_at=bridge_reference_at,
-                bridge_recent_horizon_hours=bridge_recent_horizon_hours,
-                bridge_source_token_limit=bridge_source_token_limit,
-                bridge_output_token_limit=bridge_output_token_limit,
-            )
-            plan_owner = _mint_thread_continuity_prompt_plan_owner(
-                prepared_fold_plan
-            )
-            try:
-                selected = _read_thread_continuity_fixed_prompt_selection(
-                    fixed_prompt_finalizer(plan_owner),
-                    expected_plan_owner=plan_owner,
-                )
-            except Exception:
-                selected = {}
-            if not selected:
-                status = "legacy_fallback_invalid"
-                resolved_fixed_prompt_messages = original_fixed_prompt_messages
-                selected_prompt_assembly = None
-                fixed_prompt_selection = None
-                prepared_fold_plan = None
-                converged = True
-                break
-            next_fixed_prompt_messages = selected["fixed_prompt_messages"]
-            selected_prompt_assembly = selected["prompt_assembly"]
-            fixed_prompt_selection = selected["selection"]
-            if next_fixed_prompt_messages == resolved_fixed_prompt_messages:
-                status = "selected"
-                converged = True
-                break
-            resolved_fixed_prompt_messages = next_fixed_prompt_messages
-        if not converged:
-            status = "legacy_fallback_nonconvergent"
-            resolved_fixed_prompt_messages = original_fixed_prompt_messages
-            selected_prompt_assembly = None
-            fixed_prompt_selection = None
-            prepared_fold_plan = None
-    if prepared_fold_plan is None:
-        prepared_fold_plan = plan_fold(
-            groups,
-            current_ephemeral=current_ephemeral,
-            context_window_tokens=context_window_tokens,
-            reserved_output_tokens=reserved_output_tokens,
-            fixed_non_message_tokens=fixed_non_message_tokens,
-            fixed_prompt_messages=resolved_fixed_prompt_messages,
-            post_current_messages=post_current_messages,
-            source_complete=True,
-            estimate_messages=estimate_messages,
-            previous_state=previous_state,
-            minimum_fold_source_group_ids=minimum_fold_source_group_ids,
-            bridge_reference_at=bridge_reference_at,
-            bridge_recent_horizon_hours=bridge_recent_horizon_hours,
-            bridge_source_token_limit=bridge_source_token_limit,
-            bridge_output_token_limit=bridge_output_token_limit,
-        )
-    return {
-        "fold_plan": prepared_fold_plan,
-        "resolved_fixed_prompt_messages": resolved_fixed_prompt_messages,
-        "private_selected_prompt_assembly": selected_prompt_assembly,
-        "private_fixed_prompt_selection": fixed_prompt_selection,
-        "status": status,
-        "pass_count": pass_count,
-    }
-
-
-def resolve_thread_continuity_context_epoch_plan(
-    groups: List[Dict[str, Any]],
-    *,
-    current_ephemeral: Mapping[str, Any],
-    context_window_tokens: Any,
-    reserved_output_tokens: Any,
-    soft_high_input_tokens: Any,
-    soft_low_input_tokens: Any,
-    context_epoch_policy: Any,
-    fixed_prompt_messages: Any,
-    estimate_messages: Callable[[List[Dict[str, Any]]], int],
-    post_current_messages: Any = None,
-    previous_state: Mapping[str, Any] | None = None,
-    minimum_fold_source_group_ids: List[str] | None = None,
-    bridge_reference_at: Any = None,
-    bridge_recent_horizon_hours: Any = 72,
-    bridge_source_token_limit: Any = 24_000,
-    bridge_output_token_limit: Any = 2_048,
-    fixed_prompt_finalizer: Callable[[Any], Any] | None = None,
-    plan_fold: Callable[..., Dict[str, Any]] = plan_thread_continuity_fold,
-) -> Dict[str, Any]:
-    """Plan one API-owned token-watermark epoch without provider work."""
-
-    trace: Dict[str, Any] = {
-        "schema": "thread_continuity_context_epoch_plan.v1",
-        "status": "blocked",
-        "rollover_reason": "budget_unknown",
-        "context_epoch_policy": str(context_epoch_policy or ""),
-        "hard_context_window_tokens": context_window_tokens,
-        "reserved_output_tokens": reserved_output_tokens,
-        "soft_high_input_tokens": soft_high_input_tokens,
-        "soft_low_input_tokens": soft_low_input_tokens,
-        "estimated_pre_input_tokens": 0,
-        "estimated_target_input_tokens": 0,
-        "soft_low_reached": False,
-        "irreducible_input_tokens": 0,
-        "eligible_retired_count": 0,
-        "minimum_fold_source_group_ids": [],
-        "maintenance_call_count": 0,
-        "body_included": False,
-    }
-    if (
-        context_epoch_policy != "token_watermark_v1"
-        or type(context_window_tokens) is not int
-        or type(reserved_output_tokens) is not int
-        or type(soft_high_input_tokens) is not int
-        or type(soft_low_input_tokens) is not int
-        or context_window_tokens <= 0
-        or reserved_output_tokens < 0
-        or reserved_output_tokens >= context_window_tokens
-        or not 0
-        <= soft_low_input_tokens
-        < soft_high_input_tokens
-        <= context_window_tokens - reserved_output_tokens
-    ):
-        return trace
-
-    hard_resolution = resolve_thread_continuity_fixed_prompt_plan(
-        groups,
-        current_ephemeral=current_ephemeral,
-        context_window_tokens=context_window_tokens,
-        reserved_output_tokens=reserved_output_tokens,
-        fixed_non_message_tokens=0,
-        fixed_prompt_messages=fixed_prompt_messages,
-        post_current_messages=post_current_messages,
-        previous_state=previous_state,
-        minimum_fold_source_group_ids=minimum_fold_source_group_ids,
-        estimate_messages=estimate_messages,
-        fixed_prompt_finalizer=fixed_prompt_finalizer,
-        plan_fold=plan_fold,
-        bridge_reference_at=bridge_reference_at,
-        bridge_recent_horizon_hours=bridge_recent_horizon_hours,
-        bridge_source_token_limit=bridge_source_token_limit,
-        bridge_output_token_limit=bridge_output_token_limit,
-    )
-    hard_plan = dict(hard_resolution.get("fold_plan") or {})
-    pre_tokens = int(hard_plan.get("estimated_main_input_tokens") or 0)
-    current_name = str(current_ephemeral.get("name") or "")
-    irreducible_messages = [
-        *list(hard_plan.get("base_messages") or []),
-        *list(hard_plan.get("previous_continuity_messages") or []),
-        {
-            "role": "user",
-            "content": current_ephemeral.get("content"),
-            **({"name": current_name} if current_name else {}),
-        },
-        *list(hard_plan.get("post_current_messages") or []),
-    ]
-    try:
-        irreducible_tokens = int(estimate_messages(irreducible_messages))
-    except Exception:
-        irreducible_tokens = 0
-    trace.update(
-        estimated_pre_input_tokens=pre_tokens,
-        irreducible_input_tokens=irreducible_tokens,
-        hard_plan_status=str(hard_plan.get("status") or ""),
-        hard_plan_reason=str(hard_plan.get("reason") or ""),
-    )
-    if hard_plan.get("status") == "blocked":
-        trace["rollover_reason"] = str(
-            hard_plan.get("reason") or "hard_plan_blocked"
-        )
-        return trace
-    hard_requires_fold = hard_plan.get("status") == "fold_required"
-    if (
-        hard_requires_fold
-        and hard_plan.get("reason") == "currentness_expiry"
-        and pre_tokens <= soft_high_input_tokens
-    ):
-        target_ids = list(
-            hard_plan.get("covered_source_group_ids") or []
-        )
-        trace.update(
-            status="rollover_required",
-            rollover_reason="currentness_expiry",
-            estimated_target_input_tokens=pre_tokens,
-            soft_low_reached=pre_tokens <= soft_low_input_tokens,
-            eligible_retired_count=int(
-                hard_plan.get("currentness_expired_raw_count") or 0
-            ),
-            minimum_fold_source_group_ids=target_ids,
-            target_plan_status="fold_required",
-            target_plan_reason="currentness_expiry",
-        )
-        return trace
-    if (
-        not hard_requires_fold
-        and pre_tokens <= soft_high_input_tokens
-    ):
-        trace.update(
-            status="append_only",
-            rollover_reason="below_soft_high",
-            estimated_target_input_tokens=pre_tokens,
-            soft_low_reached=pre_tokens <= soft_low_input_tokens,
-        )
-        return trace
-
-    target_headroom = (
-        context_window_tokens
-        - reserved_output_tokens
-        - soft_low_input_tokens
-    )
-    target_resolution = resolve_thread_continuity_fixed_prompt_plan(
-        groups,
-        current_ephemeral=current_ephemeral,
-        context_window_tokens=context_window_tokens,
-        reserved_output_tokens=reserved_output_tokens,
-        fixed_non_message_tokens=target_headroom,
-        fixed_prompt_messages=fixed_prompt_messages,
-        post_current_messages=post_current_messages,
-        previous_state=previous_state,
-        minimum_fold_source_group_ids=minimum_fold_source_group_ids,
-        estimate_messages=estimate_messages,
-        fixed_prompt_finalizer=fixed_prompt_finalizer,
-        plan_fold=plan_fold,
-        bridge_reference_at=bridge_reference_at,
-        bridge_recent_horizon_hours=bridge_recent_horizon_hours,
-        bridge_source_token_limit=bridge_source_token_limit,
-        bridge_output_token_limit=bridge_output_token_limit,
-    )
-    target_plan = dict(target_resolution.get("fold_plan") or {})
-    covered_ids = [
-        str(value or "")
-        for value in list(hard_plan.get("covered_source_group_ids") or [])
-    ]
-    raw_suffix_ids = [
-        str(value or "")
-        for value in list(hard_plan.get("raw_suffix_group_ids") or [])
-    ]
-    all_ids = [*covered_ids, *raw_suffix_ids]
-    previous_ids = thread_continuity_retirement_source_group_ids(previous_state)
-    accepted_previous_ids = (
-        previous_ids
-        if previous_ids == all_ids[: len(previous_ids)]
-        else []
-    )
-    eligible_ids = all_ids[len(accepted_previous_ids):]
-    if target_plan.get("status") != "fold_required":
-        hard_safe_plan = hard_plan
-        if eligible_ids:
-            hard_safe_resolution = resolve_thread_continuity_fixed_prompt_plan(
-                groups,
-                current_ephemeral=current_ephemeral,
-                context_window_tokens=context_window_tokens,
-                reserved_output_tokens=reserved_output_tokens,
-                fixed_non_message_tokens=0,
-                fixed_prompt_messages=fixed_prompt_messages,
-                post_current_messages=post_current_messages,
-                previous_state=previous_state,
-                minimum_fold_source_group_ids=all_ids,
-                estimate_messages=estimate_messages,
-                fixed_prompt_finalizer=fixed_prompt_finalizer,
-                plan_fold=plan_fold,
-                bridge_reference_at=bridge_reference_at,
-                bridge_recent_horizon_hours=bridge_recent_horizon_hours,
-                bridge_source_token_limit=bridge_source_token_limit,
-                bridge_output_token_limit=bridge_output_token_limit,
-            )
-            candidate = dict(hard_safe_resolution.get("fold_plan") or {})
-            if candidate.get("status") == "fold_required":
-                hard_safe_plan = candidate
-        hard_safe_target_ids = list(
-            hard_safe_plan.get("covered_source_group_ids") or []
-        )
-        hard_safe_target_id_set = set(hard_safe_target_ids)
-        hard_safe_retired_count = sum(
-            source_id in hard_safe_target_id_set
-            for source_id in eligible_ids
-        )
-        hard_safe_requires_rollover = (
-            hard_safe_plan.get("status") == "fold_required"
-        )
-        trace.update(
-            status=(
-                "rollover_required"
-                if hard_safe_requires_rollover
-                else "append_only"
-            ),
-            rollover_reason="hard_safe_above_soft_low",
-            estimated_target_input_tokens=irreducible_tokens,
-            soft_low_reached=False,
-            eligible_retired_count=hard_safe_retired_count,
-            minimum_fold_source_group_ids=(
-                hard_safe_target_ids if hard_safe_requires_rollover else []
-            ),
-            target_plan_status=str(target_plan.get("status") or ""),
-            target_plan_reason=str(target_plan.get("reason") or ""),
-        )
-        return trace
-    target_ids = list(target_plan.get("covered_source_group_ids") or [])
-    target_id_set = set(target_ids)
-    trace.update(
-        status="rollover_required",
-        rollover_reason=(
-            "hard_ceiling_pressure"
-            if hard_requires_fold
-            else "soft_high_exceeded"
-        ),
-        estimated_target_input_tokens=soft_low_input_tokens,
-        soft_low_reached=True,
-        eligible_retired_count=sum(
-            source_id in target_id_set for source_id in eligible_ids
-        ),
-        minimum_fold_source_group_ids=target_ids,
-        target_plan_status="fold_required",
-        target_plan_reason=str(target_plan.get("reason") or ""),
-    )
-    return trace
 
 
 async def compile_thread_continuity_turn(
@@ -489,7 +130,6 @@ async def compile_thread_continuity_turn(
     physical_owner_generation: object,
     post_current_messages: Any = None,
     minimum_fold_source_group_ids: Any = None,
-    fixed_prompt_finalizer: Callable[[Any], Any] | None = None,
     bridge_reference_at: Any = None,
     bridge_recent_horizon_hours: Any = 72,
     bridge_source_token_limit: Any = 24_000,
@@ -510,10 +150,6 @@ async def compile_thread_continuity_turn(
         ) if type(context_window_tokens) is int and context_window_tokens > 0 else 0,
         "attempt_samples": [], "attempt_sample_truncated": False,
         "plan_generations": [], "seen_descriptor_ids": set(),
-        "fixed_prompt_finalizer_status": (
-            "candidate" if fixed_prompt_finalizer is not None else "absent"
-        ),
-        "fixed_prompt_finalizer_pass_count": 0,
     }
     source_row = bundle.get("source") if isinstance(bundle, Mapping) else None
     continuity_row = bundle.get("continuity") if isinstance(bundle, Mapping) else None
@@ -533,7 +169,15 @@ async def compile_thread_continuity_turn(
             trace["plan_generations"][-1].update(final_disposition="fallback", failure_reason=reason)
         return _result(_public_trace(trace), "fallback", reason=reason, revision=revision, snapshot=snapshot)
 
-    if (
+    source_schema = str(source.get("schema") or "")
+    compact_v3 = source_schema == THREAD_CONTINUITY_COMPACT_SOURCE_SCHEMA
+    if compact_v3:
+        try:
+            source = normalize_thread_continuity_compact_source(source)
+            snapshot = source["source_snapshot"]
+        except (TypeError, ValueError):
+            return fail("source_unavailable")
+    elif (
         source.get("status") != "ready"
         or source.get("scan_complete") is not True
         or not isinstance(source.get("stats"), Mapping)
@@ -545,17 +189,78 @@ async def compile_thread_continuity_turn(
     groups = list(source["groups"])
     continuity_status = str(continuity.get("status") or "")
     previous: Mapping[str, Any] | None = None
-    if continuity_status == "ready":
+    checkpoint_validation: Mapping[str, Any] | None = None
+    stored_predecessor_revision: int | None = None
+    stored_predecessor_revision_id: str | None = None
+    identity_only_v3 = bool(
+        compact_v3
+        and continuity_status == "unavailable"
+        and continuity.get("error")
+        == "thread_continuity_checkpoint_source_invalid"
+    )
+    if continuity_status == "ready" or identity_only_v3:
         state = continuity.get("state") if isinstance(continuity.get("state"), Mapping) else {}
         previous = state.get("checkpoint") if isinstance(state.get("checkpoint"), Mapping) else None
-        if previous is None or type(state.get("revision")) is not int or state["revision"] < 1:
+        if type(state.get("revision")) is not int or state["revision"] < 1:
             return fail("continuity_state_unavailable")
         revision = state["revision"]
+        stored_predecessor_revision = revision
+        stored_predecessor_revision_id = str(
+            state.get("revision_id")
+            or dict(previous or {}).get("revision_id")
+            or ""
+        )
+        validation_row = state.get("checkpoint_validation")
+        if not isinstance(validation_row, Mapping):
+            validation_row = continuity.get("checkpoint_validation")
+        checkpoint_validation = (
+            dict(validation_row) if isinstance(validation_row, Mapping) else None
+        )
+        if compact_v3:
+            previous_schema = str(dict(previous or {}).get("schema") or "")
+            if identity_only_v3:
+                if previous is not None or checkpoint_validation is not None:
+                    return fail("continuity_state_unavailable")
+                try:
+                    stored_predecessor_revision_id = (
+                        normalize_thread_continuity_revision_id(
+                            stored_predecessor_revision_id
+                        )
+                    )
+                except ValueError:
+                    return fail("continuity_state_unavailable")
+                previous_schema = ""
+            elif previous is None:
+                return fail("continuity_state_unavailable")
+            if previous is not None and previous_schema not in {
+                THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA,
+                THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA,
+            }:
+                return fail("continuity_checkpoint_unsupported")
+            if previous_schema == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
+                # v2 and v3 have independent SQLite rows and revision chains.
+                # A source-validated v2 body can inform no v3 predecessor: the
+                # first v3 checkpoint is revision 1 rebuilt by contract.
+                revision = 0
+                stored_predecessor_revision = None
+                stored_predecessor_revision_id = None
+                checkpoint_validation = None
+            elif not stored_predecessor_revision_id:
+                return fail("continuity_state_unavailable")
+        elif previous is None or str(previous.get("schema") or "") != THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
+            return fail("continuity_checkpoint_unsupported")
     elif continuity_status != "absent":
         return fail("continuity_state_unavailable")
     trace.update(
         continuity_revision=revision,
-        continuity_revision_id=str(dict(previous or {}).get("revision_id") or ""),
+        continuity_revision_id=(
+            stored_predecessor_revision_id
+            or (
+                str(dict(previous or {}).get("revision_id") or "")
+                if not compact_v3
+                else ""
+            )
+        ),
     )
     current_row = current_ephemeral if isinstance(current_ephemeral, Mapping) else {}
     current_id = str(current_row.get("message_id") or "")
@@ -565,14 +270,18 @@ async def compile_thread_continuity_turn(
     requested_minimum = [
         str(value or "") for value in list(minimum_fold_source_group_ids or [])
     ]
-    if requested_minimum != canonical_ids[: len(requested_minimum)]:
+    if not compact_v3 and requested_minimum != canonical_ids[: len(requested_minimum)]:
         return fail("minimum_fold_prefix_invalid")
-    previous_covered = thread_continuity_retirement_source_group_ids(previous)
-    minimum_fold_ids = canonical_ids[
-        : max(len(requested_minimum), len(previous_covered))
-    ]
+    previous_covered = (
+        [] if compact_v3 else thread_continuity_retirement_source_group_ids(previous)
+    )
+    minimum_fold_ids = (
+        []
+        if compact_v3
+        else canonical_ids[: max(len(requested_minimum), len(previous_covered))]
+    )
 
-    fixed_resolution = resolve_thread_continuity_fixed_prompt_plan(
+    prepared_fold_plan = plan_thread_continuity_fold(
         groups,
         current_ephemeral=current_ephemeral,
         context_window_tokens=context_window_tokens,
@@ -580,44 +289,20 @@ async def compile_thread_continuity_turn(
         fixed_non_message_tokens=fixed_non_message_tokens,
         fixed_prompt_messages=fixed_prompt_messages,
         post_current_messages=post_current_messages,
+        source_complete=True,
         previous_state=previous,
         minimum_fold_source_group_ids=minimum_fold_ids,
         estimate_messages=estimate_messages,
-        fixed_prompt_finalizer=fixed_prompt_finalizer,
         bridge_reference_at=bridge_reference_at,
         bridge_recent_horizon_hours=bridge_recent_horizon_hours,
         bridge_source_token_limit=bridge_source_token_limit,
         bridge_output_token_limit=bridge_output_token_limit,
+        compact_source=source if compact_v3 else None,
+        checkpoint_validation=checkpoint_validation,
     )
-    prepared_fold_plan = dict(fixed_resolution["fold_plan"])
-    resolved_fixed_prompt_messages = fixed_resolution[
-        "resolved_fixed_prompt_messages"
-    ]
-    selected_prompt_assembly = fixed_resolution[
-        "private_selected_prompt_assembly"
-    ]
-    fixed_prompt_selection = fixed_resolution["private_fixed_prompt_selection"]
-    trace["fixed_prompt_finalizer_status"] = fixed_resolution["status"]
-    trace["fixed_prompt_finalizer_pass_count"] = fixed_resolution["pass_count"]
 
-    owner = {
-        "current_ephemeral": current_ephemeral,
-        "context_window_tokens": context_window_tokens,
-        "reserved_output_tokens": reserved_output_tokens,
-        "fixed_non_message_tokens": fixed_non_message_tokens,
-        "fixed_prompt_messages": resolved_fixed_prompt_messages,
-        "post_current_messages": post_current_messages,
-        "source_complete": True,
-        "estimate_messages": estimate_messages,
-        "previous_state": previous,
-        "minimum_fold_source_group_ids": minimum_fold_ids,
-        "bridge_reference_at": bridge_reference_at,
-        "bridge_recent_horizon_hours": bridge_recent_horizon_hours,
-        "bridge_source_token_limit": bridge_source_token_limit,
-        "bridge_output_token_limit": bridge_output_token_limit,
-    }
     for generation in (1,):
-        fold_plan = prepared_fold_plan or plan_thread_continuity_fold(groups, **owner)
+        fold_plan = prepared_fold_plan
         target_ids = [str(value or "") for value in list(fold_plan.get("covered_source_group_ids") or [])]
         generation_trace = {
             "generation": generation, "fold_plan_id": str(fold_plan.get("fold_plan_id") or ""),
@@ -649,8 +334,6 @@ async def compile_thread_continuity_turn(
                 _public_trace(trace), "ready", reason="", mode="raw",
                 messages=list(physical["provider_messages"]),
                 physical_owner_sidecar=physical["physical_owner_sidecar"],
-                selected_prompt_assembly=selected_prompt_assembly,
-                fixed_prompt_selection=fixed_prompt_selection,
                 revision=revision, snapshot=snapshot,
             )
         if fold_plan.get("status") not in {"fold_required", "blocked"} or not fold_plan.get("fold_plan_id"):
@@ -662,7 +345,7 @@ async def compile_thread_continuity_turn(
             "context_window_tokens": context_window_tokens,
             "reserved_output_tokens": reserved_output_tokens,
             "fixed_non_message_tokens": fixed_non_message_tokens,
-            "fixed_prompt_messages": resolved_fixed_prompt_messages,
+            "fixed_prompt_messages": fixed_prompt_messages,
             "post_current_messages": post_current_messages,
             "source_complete": True,
             "estimate_messages": estimate_messages,
@@ -672,6 +355,8 @@ async def compile_thread_continuity_turn(
             "bridge_recent_horizon_hours": bridge_recent_horizon_hours,
             "bridge_source_token_limit": bridge_source_token_limit,
             "bridge_output_token_limit": bridge_output_token_limit,
+            "compact_source": source if compact_v3 else None,
+            "checkpoint_validation": checkpoint_validation,
         }
         accepted: List[Mapping[str, Any]] = []
         chunk_completions: List[List[Mapping[str, Any]]] = []
@@ -704,7 +389,8 @@ async def compile_thread_continuity_turn(
                         accepted_attempts=accepted, accepted_chunk_completions=chunk_completions,
                         **attempt_owner,
                     )
-                except (TypeError, ValueError): accepted_result = {"status": "rejected"}
+                except (TypeError, ValueError):
+                    accepted_result = {"status": "rejected"}
                 _note_result(trace, sample, "summary", descriptor, accepted_result)
                 if accepted_result.get("status") != "accepted" or int(accepted_result.get("progress_source_group_count") or 0) < 1:
                     return fail(str(accepted_result.get("reason") or "summary_result_invalid"))
@@ -751,7 +437,8 @@ async def compile_thread_continuity_turn(
                             accepted_chunk_completions=chunk_completions,
                             accepted_chunk_attempts=chunk_attempts, **attempt_owner,
                         )
-                    except (TypeError, ValueError): accepted_chunk = {"status": "rejected"}
+                    except (TypeError, ValueError):
+                        accepted_chunk = {"status": "rejected"}
                     _note_result(trace, sample, "chunk", descriptor, accepted_chunk)
                     if accepted_chunk.get("status") != "accepted":
                         return fail(str(accepted_chunk.get("reason") or "chunk_result_invalid"))
@@ -766,10 +453,23 @@ async def compile_thread_continuity_turn(
             try:
                 checkpoint = build_thread_continuity_checkpoint_from_attempts(
                     source_groups=groups, accepted_summary_attempts=accepted,
-                    accepted_chunk_completions=chunk_completions, **attempt_owner,
+                    accepted_chunk_completions=chunk_completions,
+                    stored_predecessor_revision=stored_predecessor_revision,
+                    stored_predecessor_revision_id=stored_predecessor_revision_id,
+                    **attempt_owner,
                 )
                 segment = render_thread_continuity_checkpoint_message(
-                    checkpoint, source_groups=groups, previous_state=previous,
+                    checkpoint,
+                    source_groups=groups,
+                    previous_state=(
+                        previous
+                        if previous
+                        and str(previous.get("schema") or "")
+                        == str(checkpoint.get("schema") or "")
+                        and checkpoint.get("lineage_status") == "continued"
+                        else None
+                    ),
+                    compact_source=source if compact_v3 else None,
                 )
             except (TypeError, ValueError):
                 return fail("checkpoint_invalid")
@@ -796,8 +496,6 @@ async def compile_thread_continuity_turn(
                     _public_trace(trace), "ready", reason="", mode="compacted",
                     messages=list(physical["provider_messages"]), checkpoint=checkpoint,
                     physical_owner_sidecar=physical["physical_owner_sidecar"],
-                    selected_prompt_assembly=selected_prompt_assembly,
-                    fixed_prompt_selection=fixed_prompt_selection,
                     revision=revision, snapshot=snapshot,
                 )
             return fail(

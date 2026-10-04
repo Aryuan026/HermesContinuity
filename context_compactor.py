@@ -7,6 +7,20 @@ from collections.abc import Mapping as MappingABC
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Tuple
 
+try:
+    from hermes_history_content import HistoryValue, HistoryString
+except ImportError:
+    # The accepted non-indexed and sixteen-patch hosts remain supported.
+    HistoryValue = HistoryString = ()
+
+from .checkpoint_v3 import (
+    THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA,
+    build_thread_continuity_checkpoint_v3,
+    normalize_thread_continuity_checkpoint_v3,
+    normalize_thread_continuity_compact_source,
+    validate_thread_continuity_checkpoint_v3_source,
+)
+
 
 _PHYSICAL_OWNER_SIDECAR_SCHEMA = "thread_continuity_physical_owner_sidecar.v1"
 _PHYSICAL_OWNER_SIDECAR_KEYS = {
@@ -36,8 +50,6 @@ _PHYSICAL_OWNER_ROW_KEYS = {
 _PHYSICAL_OWNER_CARRIERS = {"fixed", "checkpoint", "raw", "current", "postcurrent"}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PHYSICAL_OWNER_AUTHORITY = object()
-_PROMPT_PLAN_AUTHORITY = object()
-_FIXED_PROMPT_SELECTION_AUTHORITY = object()
 
 
 class _ThreadContinuityPhysicalOwnerSidecar(MappingABC):
@@ -89,90 +101,11 @@ class _ThreadContinuityPhysicalOwnerSidecar(MappingABC):
         return json.loads(self._payload_json)
 
 
-class _ThreadContinuityPromptPlanOwner:
-    __slots__ = ("_payload_json", "_authority")
-
-    def __init__(self, payload: Mapping[str, Any], authority: object) -> None:
-        if authority is not _PROMPT_PLAN_AUTHORITY:
-            raise ValueError("thread_continuity_prompt_plan_authority_invalid")
-        object.__setattr__(
-            self,
-            "_payload_json",
-            json.dumps(
-                dict(payload),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
-        object.__setattr__(self, "_authority", authority)
-
-    def __setattr__(self, key: str, value: Any) -> None:
-        raise AttributeError("thread_continuity_prompt_plan_owner_frozen")
-
-    def __copy__(self) -> Dict[str, Any]:
-        return {}
-
-    def __deepcopy__(self, memo: Dict[int, Any]) -> Dict[str, Any]:
-        return {}
-
-    def __repr__(self) -> str:
-        return "<thread_continuity_prompt_plan_owner body_included=False>"
-
-    def _snapshot(self) -> Dict[str, Any]:
-        return json.loads(self._payload_json)
-
-
-class _ThreadContinuityFixedPromptSelection:
-    __slots__ = (
-        "_authority",
-        "_plan_owner",
-        "_fixed_prompt_json",
-        "_prompt_assembly",
-    )
-
-    def __init__(
-        self,
-        *,
-        authority: object,
-        plan_owner: _ThreadContinuityPromptPlanOwner,
-        fixed_prompt_messages: List[Dict[str, Any]],
-        prompt_assembly: Any,
-    ) -> None:
-        if (
-            authority is not _FIXED_PROMPT_SELECTION_AUTHORITY
-            or type(plan_owner) is not _ThreadContinuityPromptPlanOwner
-            or plan_owner._authority is not _PROMPT_PLAN_AUTHORITY
-        ):
-            raise ValueError("thread_continuity_fixed_prompt_authority_invalid")
-        object.__setattr__(self, "_authority", authority)
-        object.__setattr__(self, "_plan_owner", plan_owner)
-        object.__setattr__(
-            self,
-            "_fixed_prompt_json",
-            json.dumps(
-                fixed_prompt_messages,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
-        object.__setattr__(self, "_prompt_assembly", prompt_assembly)
-
-    def __setattr__(self, key: str, value: Any) -> None:
-        raise AttributeError("thread_continuity_fixed_prompt_selection_frozen")
-
-    def __copy__(self) -> Dict[str, Any]:
-        return {}
-
-    def __deepcopy__(self, memo: Dict[int, Any]) -> Dict[str, Any]:
-        return {}
-
-    def __repr__(self) -> str:
-        return "<thread_continuity_fixed_prompt_selection body_included=False>"
-
-
 def _content_to_text(content: Any) -> str:
+    if isinstance(content, HistoryValue):
+        content = content.root
+    if isinstance(content, HistoryString):
+        return "[verified text; bounded fragment required]" if content.nonblank else ""
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
@@ -184,6 +117,9 @@ def _content_to_text(content: Any) -> str:
             item_type = str(item.get("type", "")).strip()
             if item_type in {"text", "input_text"}:
                 text = item.get("text")
+                if isinstance(text, HistoryString):
+                    parts.append("[verified text; bounded fragment required]" if text.nonblank else "")
+                    continue
                 if not isinstance(text, str):
                     return ""
                 parts.append(text.strip())
@@ -192,6 +128,7 @@ def _content_to_text(content: Any) -> str:
                 image_url = image.get("url") if isinstance(image, Mapping) else image
                 if not (
                     isinstance(image_url, str) and image_url.strip()
+                    or isinstance(image_url, HistoryString) and image_url.nonblank
                     or isinstance(item.get("file_id"), str) and item["file_id"].strip()
                 ):
                     return ""
@@ -211,7 +148,6 @@ def _normalize(text: str) -> str:
     return text
 
 
-THREAD_CONTINUITY_CHECKPOINT_SCHEMA = "thread_continuity_checkpoint.v1"
 THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA = "thread_continuity_checkpoint.v2"
 THREAD_CONTINUITY_RETIREMENT_CURSOR_SCHEMA = "thread_continuity_retirement_cursor.v1"
 THREAD_CONTINUITY_RECENT_BRIDGE_SCHEMA = "thread_continuity_recent_bridge.v1"
@@ -241,6 +177,8 @@ def _group_fingerprint(group: Mapping[str, Any]) -> str:
 
 
 def _content_hash(value: Any) -> str:
+    if isinstance(value, HistoryValue):
+        return value.utf8_sha256
     try:
         serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     except (TypeError, ValueError) as exc:
@@ -270,10 +208,11 @@ def thread_continuity_retirement_source_group_ids(
     checkpoint: Mapping[str, Any] | None,
 ) -> List[str]:
     row = dict(checkpoint or {})
-    if str(row.get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
-        cursor = row.get("retirement_cursor")
-    else:
-        cursor = row.get("covered_through")
+    if str(row.get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA:
+        return list(dict(row.get("recent_bridge") or {}).get("source_group_ids") or [])
+    if str(row.get("schema") or "") != THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
+        return []
+    cursor = row.get("retirement_cursor")
     return [
         str(value or "").strip()
         for value in list(dict(cursor or {}).get("source_prefix_ids") or [])
@@ -285,7 +224,10 @@ def thread_continuity_bridge_projection(
     checkpoint: Mapping[str, Any] | None,
 ) -> Dict[str, Any]:
     row = dict(checkpoint or {})
-    if str(row.get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
+    if str(row.get("schema") or "") in {
+        THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA,
+        THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA,
+    }:
         bridge = dict(row.get("recent_bridge") or {})
         return {
             "status": str(bridge.get("status") or ""),
@@ -306,12 +248,11 @@ def thread_continuity_bridge_projection(
             "source_token_limit": bridge.get("source_token_limit"),
             "output_token_limit": bridge.get("output_token_limit"),
         }
-    body = str(row.get("summary_text") or "")
     return {
-        "status": "legacy_unverified" if body else "empty",
-        "relation": "legacy_unverified" if body else "no_visible_representation",
-        "body": body,
-        "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        "status": "empty",
+        "relation": "no_visible_representation",
+        "body": "",
+        "body_sha256": hashlib.sha256(b"").hexdigest(),
         "represented_source_group_ids": [],
         "source_group_fingerprints": [],
         "source_slice_fingerprint": "",
@@ -368,7 +309,7 @@ def select_thread_continuity_recent_bridge(
         provider_messages = [
             {
                 "role": message["role"],
-                "content": message["content"],
+                "content": _summary_source_content(message["content"]),
                 **({"name": message["name"]} if message.get("name") else {}),
             }
             for message in group["messages"]
@@ -558,23 +499,12 @@ def _thread_continuity_currentness_plan(
             "excluded_by_token_count": 0,
         }
     previous_bridge = thread_continuity_bridge_projection(previous)
-    previous_schema = str(dict(previous or {}).get("schema") or "")
     bridge_refresh_required = bool(
         previous
         and (
-            (
-                reference_at is not None
-                and previous_schema == THREAD_CONTINUITY_CHECKPOINT_SCHEMA
-                and previous_bridge["status"] == "legacy_unverified"
-            )
-            or (
-                previous_schema == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA
-                and (
-                    previous_bridge["status"] != selected["status"]
-                    or list(previous_bridge["represented_source_group_ids"])
-                    != list(selected["source_group_ids"])
-                )
-            )
+            previous_bridge["status"] != selected["status"]
+            or list(previous_bridge["represented_source_group_ids"])
+            != list(selected["source_group_ids"])
         )
     )
     return {
@@ -600,137 +530,6 @@ def _canonical_owner_aliases(*values: Any) -> List[str]:
 def _physical_owner_body_sha256(content: Any) -> str:
     text = _content_to_text(content).replace("\r\n", "\n").replace("\r", "\n").strip()
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _mint_thread_continuity_prompt_plan_owner(
-    plan: Mapping[str, Any],
-) -> _ThreadContinuityPromptPlanOwner:
-    return _ThreadContinuityPromptPlanOwner(plan, _PROMPT_PLAN_AUTHORITY)
-
-
-def read_thread_continuity_prompt_plan_carriers(
-    plan_owner: Any,
-) -> List[Dict[str, Any]]:
-    """Read exact raw/current carrier authority from one private fold plan."""
-
-    if (
-        type(plan_owner) is not _ThreadContinuityPromptPlanOwner
-        or plan_owner._authority is not _PROMPT_PLAN_AUTHORITY
-    ):
-        return []
-    plan = plan_owner._snapshot()
-    base_count = len(list(plan.get("base_messages") or []))
-    continuity_count = int(
-        bool(plan.get("previous_continuity_messages"))
-        or str(plan.get("status") or "") in {"fold_required", "blocked"}
-    )
-    physical_index = base_count + continuity_count
-    carriers: List[Dict[str, Any]] = []
-    for group in list(plan.get("raw_suffix_groups") or []):
-        if not isinstance(group, Mapping):
-            return []
-        group_aliases = _canonical_owner_aliases(
-            group.get("source_prefix_id"),
-            group.get("logical_turn_id"),
-            group.get("record_id"),
-            group.get("canonical_ids"),
-        )
-        for message in list(group.get("messages") or []):
-            if not isinstance(message, Mapping):
-                return []
-            message_aliases = _canonical_owner_aliases(
-                message.get("message_id"),
-                message.get("canonical_ids"),
-            )
-            role = str(message.get("role") or "").strip()
-            content = _content_to_text(message.get("content"))
-            if role not in {"user", "assistant"} or not message_aliases or not content:
-                return []
-            carriers.append(
-                {
-                    "physical_index": physical_index,
-                    "role": role,
-                    "message_aliases": message_aliases,
-                    "group_aliases": group_aliases,
-                    "body_sha256": _physical_owner_body_sha256(
-                        message.get("content")
-                    ),
-                    "carrier_kind": "final_raw_suffix",
-                    "alias_source": "canonical_source_message",
-                }
-            )
-            physical_index += 1
-    current = dict(plan.get("current_ephemeral") or {})
-    current_aliases = _canonical_owner_aliases(
-        current.get("message_id"),
-        current.get("canonical_ids"),
-    )
-    if current_aliases and _content_to_text(current.get("content")):
-        carriers.append(
-            {
-                "physical_index": physical_index,
-                "role": "user",
-                "message_aliases": current_aliases,
-                "group_aliases": [],
-                "body_sha256": _physical_owner_body_sha256(
-                    current.get("content")
-                ),
-                "carrier_kind": "current_ephemeral",
-                "alias_source": "current_ephemeral_message",
-            }
-        )
-    return carriers
-
-
-def bind_thread_continuity_fixed_prompt_selection(
-    plan_owner: Any,
-    *,
-    fixed_prompt_messages: Any,
-    prompt_assembly: Any,
-) -> _ThreadContinuityFixedPromptSelection:
-    if (
-        type(plan_owner) is not _ThreadContinuityPromptPlanOwner
-        or plan_owner._authority is not _PROMPT_PLAN_AUTHORITY
-        or prompt_assembly is None
-    ):
-        raise TypeError("thread_continuity_prompt_plan_owner_invalid")
-    messages = _continuity_messages(fixed_prompt_messages)
-    assembly_text = getattr(prompt_assembly, "text", None)
-    if (
-        not isinstance(assembly_text, str)
-        or messages != [{"role": "system", "content": assembly_text}]
-    ):
-        raise ValueError("thread_continuity_fixed_prompt_messages_invalid")
-    return _ThreadContinuityFixedPromptSelection(
-        authority=_FIXED_PROMPT_SELECTION_AUTHORITY,
-        plan_owner=plan_owner,
-        fixed_prompt_messages=messages,
-        prompt_assembly=prompt_assembly,
-    )
-
-
-def _read_thread_continuity_fixed_prompt_selection(
-    value: Any,
-    *,
-    expected_plan_owner: _ThreadContinuityPromptPlanOwner,
-) -> Dict[str, Any]:
-    if (
-        type(value) is not _ThreadContinuityFixedPromptSelection
-        or value._authority is not _FIXED_PROMPT_SELECTION_AUTHORITY
-        or value._plan_owner is not expected_plan_owner
-    ):
-        return {}
-    messages = json.loads(value._fixed_prompt_json)
-    if not messages or any(
-        not isinstance(message, Mapping) or message.get("role") != "system"
-        for message in messages
-    ):
-        return {}
-    return {
-        "fixed_prompt_messages": [dict(message) for message in messages],
-        "prompt_assembly": value._prompt_assembly,
-        "selection": value,
-    }
 
 
 def _physical_owner_message_vector(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -792,12 +591,7 @@ def _project_thread_continuity_physical_owner_sidecar(
             )
         )
         index += 1
-    checkpoint_kind = (
-        "legacy_bridge"
-        if (plan.get("status"), plan.get("reason")) == ("no_fold", "within_budget")
-        and plan.get("previous_bridge_status") == "legacy_unverified"
-        else "recent_bridge"
-    )
+    checkpoint_kind = "recent_bridge"
     for message in checkpoint_messages:
         rows.append(
             _physical_owner_row(
@@ -833,11 +627,7 @@ def _project_thread_continuity_physical_owner_sidecar(
                         ),
                     }
                 ),
-                relation=(
-                    "legacy_bridge_unverified"
-                    if checkpoint_kind == "legacy_bridge"
-                    else "represented_in_recent_bridge"
-                ),
+                relation="represented_in_recent_bridge",
             )
         )
         index += 1
@@ -1015,9 +805,7 @@ def _physical_owner_sidecar_payload_valid(
                 False,
                 False,
                 row.get("source_fingerprint"),
-                "legacy_bridge_unverified"
-                if checkpoint_kind == "legacy_bridge"
-                else "represented_in_recent_bridge",
+                "represented_in_recent_bridge",
             ),
             "raw": ("none", True, True, row.get("source_fingerprint"), "same_canonical_body"),
             "current": ("none", False, True, row.get("source_fingerprint"), "same_canonical_body"),
@@ -1028,7 +816,7 @@ def _physical_owner_sidecar_payload_valid(
             checkpoint_kind != expected_checkpoint
             or (
                 carrier == "checkpoint"
-                and checkpoint_kind not in {"legacy_bridge", "recent_bridge"}
+                and checkpoint_kind != "recent_bridge"
             )
             or bool(group_aliases) is not requires_group
             or bool(message_aliases) is not requires_message
@@ -1200,197 +988,6 @@ def thread_continuity_prefix_fingerprint(groups: List[Dict[str, Any]]) -> str:
     ).hexdigest()
 
 
-def _revision_id(
-    predecessor_revision_id: str,
-    covered_ids: List[str],
-    covered_fingerprints: List[str],
-    summary_sha256: str,
-) -> str:
-    binding = [
-        predecessor_revision_id,
-        [[source_id, fingerprint] for source_id, fingerprint in zip(covered_ids, covered_fingerprints)],
-        summary_sha256,
-    ]
-    digest = hashlib.sha256(
-        json.dumps(binding, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return f"tcr_{digest}"
-
-
-def _state_revision_identity_valid(state: Mapping[str, Any]) -> bool:
-    covered = state.get("covered_through") if isinstance(state.get("covered_through"), Mapping) else {}
-    covered_ids = [str(value or "").strip() for value in list(covered.get("source_prefix_ids") or [])]
-    covered_fingerprints = [
-        str(value or "").strip() for value in list(covered.get("source_group_fingerprints") or [])
-    ]
-    expected = _revision_id(
-        str(state.get("predecessor_revision_id") or "").strip(),
-        covered_ids,
-        covered_fingerprints,
-        str(state.get("summary_sha256") or "").strip(),
-    )
-    return bool(
-        covered_ids
-        and len(covered_ids) == len(covered_fingerprints)
-        and str(state.get("revision_id") or "").strip() == expected
-    )
-
-
-def _build_thread_continuity_checkpoint(
-    *,
-    previous_state: Mapping[str, Any] | None,
-    source_groups: List[Dict[str, Any]],
-    covered_source_group_ids: List[str],
-    summary_text: Any,
-    owner_rebuild: bool = False,
-) -> Dict[str, Any]:
-    normalized = normalize_complete_thread_groups(source_groups)
-    if not normalized["complete"]:
-        raise ValueError("thread_continuity_source_incomplete")
-    groups = list(normalized["groups"])
-    available_ids = [group["source_prefix_id"] for group in groups]
-    covered_ids = [str(value or "").strip() for value in covered_source_group_ids]
-    if not covered_ids or covered_ids != available_ids[: len(covered_ids)]:
-        raise ValueError("thread_continuity_covered_prefix_invalid")
-    if not isinstance(summary_text, str) or not _normalize(summary_text):
-        raise ValueError("thread_continuity_summary_invalid")
-    summary = _normalize(summary_text)
-    try:
-        previous_revision = int(dict(previous_state or {}).get("revision") or 0)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("thread_continuity_predecessor_invalid") from exc
-    if previous_revision < 0:
-        raise ValueError("thread_continuity_predecessor_invalid")
-    previous = dict(previous_state or {})
-    lineage_valid = False
-    if previous:
-        try:
-            normalize_thread_continuity_checkpoint(previous, source_groups=groups)
-            previous_source_ids = [str(value or "").strip() for value in list(previous.get("source_group_ids") or [])]
-            lineage_valid = previous_source_ids == available_ids[: len(previous_source_ids)]
-        except ValueError:
-            lineage_valid = False
-    previous_covered = [
-        str(value or "").strip()
-        for value in list(dict(previous.get("covered_through") or {}).get("source_prefix_ids") or [])
-    ] if lineage_valid else []
-    if lineage_valid and covered_ids[: len(previous_covered)] != previous_covered:
-        raise ValueError("thread_continuity_covered_prefix_regression")
-    lineage_status = "continued" if previous and lineage_valid else "rebuilt" if previous else "initial"
-    if owner_rebuild and previous and lineage_valid:
-        lineage_status = "rebuilt"
-    summary_hash = hashlib.sha256(summary.encode("utf-8")).hexdigest()
-    covered_groups = groups[: len(covered_ids)]
-    covered_fingerprints = [_group_fingerprint(group) for group in covered_groups]
-    prefix_fingerprint = thread_continuity_prefix_fingerprint(covered_groups)
-    predecessor_revision_id = (
-        str(previous.get("revision_id") or "").strip() if lineage_status == "continued" else ""
-    )
-    checkpoint = {
-        "schema": THREAD_CONTINUITY_CHECKPOINT_SCHEMA,
-        "revision": previous_revision + 1,
-        "predecessor_revision": previous_revision,
-        "source_group_ids": available_ids,
-        "source_fingerprint": thread_continuity_prefix_fingerprint(groups),
-        "revision_id": _revision_id(
-            predecessor_revision_id, covered_ids, covered_fingerprints, summary_hash
-        ),
-        "predecessor_revision_id": predecessor_revision_id,
-        "lineage_status": lineage_status,
-        "summary_text": summary,
-        "summary_sha256": summary_hash,
-        "covered_through": {
-            "source_prefix_ids": covered_ids,
-            "source_group_fingerprints": covered_fingerprints,
-            "prefix_fingerprint": prefix_fingerprint,
-        },
-    }
-    return normalize_thread_continuity_checkpoint(
-        checkpoint, source_groups=groups, previous_state=previous_state if lineage_valid else None
-    )
-
-
-def build_thread_continuity_checkpoint(
-    *, previous_state: Mapping[str, Any] | None, source_groups: List[Dict[str, Any]],
-    covered_source_group_ids: List[str], summary_text: Any,
-) -> Dict[str, Any]:
-    return _build_thread_continuity_checkpoint(
-        previous_state=previous_state, source_groups=source_groups,
-        covered_source_group_ids=covered_source_group_ids, summary_text=summary_text,
-    )
-
-
-def _normalize_thread_continuity_checkpoint_v1(
-    state: Mapping[str, Any],
-    *,
-    source_groups: List[Dict[str, Any]],
-    previous_state: Mapping[str, Any] | None = None,
-) -> Dict[str, Any]:
-    normalized = normalize_complete_thread_groups(source_groups)
-    if not normalized["complete"]:
-        raise ValueError("thread_continuity_source_incomplete")
-    row = dict(state or {})
-    if str(row.get("schema") or "") != THREAD_CONTINUITY_CHECKPOINT_SCHEMA:
-        raise ValueError("thread_continuity_checkpoint_invalid")
-    summary_value = row.get("summary_text")
-    if not isinstance(summary_value, str) or not _normalize(summary_value):
-        raise ValueError("thread_continuity_checkpoint_invalid")
-    summary = _normalize(summary_value)
-    summary_hash = hashlib.sha256(summary.encode("utf-8")).hexdigest()
-    covered = dict(row.get("covered_through") or {}) if isinstance(row.get("covered_through"), Mapping) else {}
-    covered_ids = [str(value or "").strip() for value in list(covered.get("source_prefix_ids") or [])]
-    covered_fingerprints = [
-        str(value or "").strip() for value in list(covered.get("source_group_fingerprints") or [])
-    ]
-    groups = list(normalized["groups"])
-    available_ids = [group["source_prefix_id"] for group in groups]
-    source_ids = [str(value or "").strip() for value in list(row.get("source_group_ids") or [])]
-    source_groups = groups[: len(source_ids)]
-    expected_covered_fingerprints = [_group_fingerprint(group) for group in groups[: len(covered_ids)]]
-    if (
-        type(row.get("revision")) is not int
-        or type(row.get("predecessor_revision")) is not int
-        or row["revision"] < 1
-        or row["predecessor_revision"] != row["revision"] - 1
-        or not source_ids
-        or source_ids != available_ids[: len(source_ids)]
-        or str(row.get("source_fingerprint") or "").strip()
-        != thread_continuity_prefix_fingerprint(source_groups)
-        or not covered_ids
-        or covered_ids != source_ids[: len(covered_ids)]
-        or covered_fingerprints != expected_covered_fingerprints
-        or str(covered.get("prefix_fingerprint") or "").strip()
-        != thread_continuity_prefix_fingerprint(groups[: len(covered_ids)])
-        or str(row.get("summary_sha256") or "").strip() != summary_hash
-        or not _state_revision_identity_valid(row)
-    ):
-        raise ValueError("thread_continuity_checkpoint_invalid")
-    lineage_status = str(row.get("lineage_status") or "").strip()
-    predecessor_id = str(row.get("predecessor_revision_id") or "").strip()
-    if lineage_status == "continued":
-        if not predecessor_id:
-            raise ValueError("thread_continuity_lineage_invalid")
-        if previous_state is not None:
-            previous = _normalize_thread_continuity_checkpoint_v1(
-                previous_state, source_groups=groups
-            )
-            previous_covered = dict(previous.get("covered_through") or {})
-            previous_ids = [
-                str(value or "").strip()
-                for value in list(previous_covered.get("source_prefix_ids") or [])
-            ]
-            if (
-                predecessor_id != str(previous.get("revision_id") or "").strip()
-                or covered_ids[: len(previous_ids)] != previous_ids
-                or row["predecessor_revision"] != previous["revision"]
-            ):
-                raise ValueError("thread_continuity_lineage_invalid")
-    elif lineage_status not in {"initial", "rebuilt"} or predecessor_id:
-        raise ValueError("thread_continuity_lineage_invalid")
-    row["summary_text"] = summary
-    return row
-
-
 def _v2_revision_id(
     predecessor_revision_id: str,
     retirement_cursor: Mapping[str, Any],
@@ -1516,19 +1113,27 @@ def _normalize_thread_continuity_checkpoint_v2(
 def normalize_thread_continuity_checkpoint(
     state: Mapping[str, Any],
     *,
-    source_groups: List[Dict[str, Any]],
+    source_groups: List[Dict[str, Any]] | None = None,
     previous_state: Mapping[str, Any] | None = None,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    schema = str(dict(state or {}).get("schema") or "")
-    if schema == THREAD_CONTINUITY_CHECKPOINT_SCHEMA:
-        return _normalize_thread_continuity_checkpoint_v1(
-            state, source_groups=source_groups, previous_state=previous_state
+    if str(dict(state or {}).get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA:
+        if compact_source is None:
+            return normalize_thread_continuity_checkpoint_v3(
+                state, previous_state=previous_state
+            )
+        return validate_thread_continuity_checkpoint_v3_source(
+            state,
+            compact_source=compact_source,
+            previous_state=previous_state,
+            checkpoint_validation=checkpoint_validation,
         )
-    if schema == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
-        return _normalize_thread_continuity_checkpoint_v2(
-            state, source_groups=source_groups, previous_state=previous_state
-        )
-    raise ValueError("thread_continuity_checkpoint_invalid")
+    if source_groups is None:
+        raise ValueError("thread_continuity_source_incomplete")
+    return _normalize_thread_continuity_checkpoint_v2(
+        state, source_groups=source_groups, previous_state=previous_state
+    )
 
 
 def build_thread_continuity_checkpoint_v2(
@@ -1661,20 +1266,24 @@ def _thread_continuity_checkpoint_marker(
 
 
 def render_thread_continuity_checkpoint_message(
-    checkpoint: Mapping[str, Any], *, source_groups: List[Dict[str, Any]],
+    checkpoint: Mapping[str, Any], *, source_groups: List[Dict[str, Any]] | None = None,
     previous_state: Mapping[str, Any] | None = None,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, str]:
     row = normalize_thread_continuity_checkpoint(
-        checkpoint, source_groups=source_groups, previous_state=previous_state,
+        checkpoint,
+        source_groups=source_groups,
+        previous_state=previous_state,
+        compact_source=compact_source,
+        checkpoint_validation=checkpoint_validation,
     )
     bridge = thread_continuity_bridge_projection(row)
     if not bridge["body"]:
         return {}
     marker = _thread_continuity_checkpoint_marker(
         row["revision_id"], row["revision"], bridge["body_sha256"],
-    )
-    if str(row.get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V2_SCHEMA:
-        marker = marker.replace("Home Thread Continuity", "Home Recent Continuity")
+    ).replace("Home Thread Continuity", "Home Recent Continuity")
     return {"role": "system", "content": f"{marker}\n{bridge['body']}"}
 
 
@@ -1792,6 +1401,328 @@ def _fold_plan_id(plan: Mapping[str, Any], groups: List[Dict[str, Any]]) -> str:
     return "tcfp_" + _content_hash(material)
 
 
+def _select_compact_recent_bridge(
+    eligible_groups: List[Dict[str, Any]],
+    *,
+    reference_at: Any,
+    recent_horizon_hours: Any,
+    source_token_limit: Any,
+    estimate_messages: MessageEstimator,
+) -> Dict[str, Any]:
+    if (
+        type(recent_horizon_hours) is not int
+        or not 1 <= recent_horizon_hours <= 24 * 365
+        or type(source_token_limit) is not int
+        or source_token_limit < 1
+    ):
+        raise ValueError("thread_continuity_bridge_policy_invalid")
+    reference = _parse_bridge_reference_at(reference_at)
+    if not eligible_groups:
+        return {
+            "groups": [],
+            "source_group_ids": [],
+            "source_group_fingerprints": [],
+            "source_slice_fingerprint": "",
+            "reference_at": reference.isoformat(),
+            "estimated_source_tokens": 0,
+            "excluded_by_currentness_count": 0,
+            "excluded_by_token_count": 0,
+        }
+    selected = select_thread_continuity_recent_bridge(
+        eligible_groups,
+        retired_source_group_ids=[
+            group["source_prefix_id"] for group in eligible_groups
+        ],
+        reference_at=reference,
+        recent_horizon_hours=recent_horizon_hours,
+        source_token_limit=source_token_limit,
+        estimate_messages=estimate_messages,
+    )
+    selected_ids = list(selected["source_group_ids"])
+    selected_id_set = set(selected_ids)
+    return {
+        "groups": [
+            group
+            for group in eligible_groups
+            if group["source_prefix_id"] in selected_id_set
+        ],
+        "source_group_ids": selected_ids,
+        "source_group_fingerprints": list(
+            selected["source_group_fingerprints"]
+        ),
+        "source_slice_fingerprint": selected["source_slice_fingerprint"],
+        "reference_at": selected["reference_at"],
+        "estimated_source_tokens": selected["estimated_source_tokens"],
+        "excluded_by_currentness_count": selected[
+            "excluded_by_currentness_count"
+        ],
+        "excluded_by_token_count": selected["excluded_by_token_count"],
+    }
+
+
+def _v3_fold_plan_id(plan: Mapping[str, Any]) -> str:
+    current = dict(plan.get("current_ephemeral") or {})
+    return "tcfp_" + _content_hash(
+        {
+            "schema": "thread_continuity_fold_plan.v2",
+            "source_snapshot": plan.get("source_snapshot"),
+            "source_proof": plan.get("source_proof"),
+            "retirement_prefix": plan.get("retirement_prefix"),
+            "bounded_inventory": [
+                [group["source_prefix_id"], _group_fingerprint(group)]
+                for group in list(plan.get("bounded_source_groups") or [])
+            ],
+            "continuity_mode": plan.get("continuity_mode"),
+            "predecessor_revision_id": plan.get("predecessor_revision_id"),
+            "bridge_source_group_ids": plan.get("bridge_source_group_ids"),
+            "raw_suffix_group_ids": plan.get("raw_suffix_group_ids"),
+            "current": [current.get("message_id"), current.get("content_hash")],
+            "fixed_prompt_fingerprint": plan.get("fixed_prompt_fingerprint"),
+            "post_current": [
+                [row.get("role"), row.get("name", ""), row.get("message_id"), row.get("content_hash")]
+                for row in list(plan.get("post_current_messages") or [])
+            ],
+            "context_window_tokens": plan.get("context_window_tokens"),
+            "reserved_output_tokens": plan.get("reserved_output_tokens"),
+            "fixed_non_message_tokens": plan.get("fixed_non_message_tokens"),
+            "bridge_reference_at": plan.get("bridge_reference_at"),
+            "bridge_recent_horizon_hours": plan.get("bridge_recent_horizon_hours"),
+            "bridge_source_token_limit": plan.get("bridge_source_token_limit"),
+            "bridge_output_token_limit": plan.get("bridge_output_token_limit"),
+        }
+    )
+
+
+def _build_thread_continuity_fold_plan_v3(
+    compact_source: Mapping[str, Any],
+    *,
+    current_ephemeral: Mapping[str, Any],
+    context_window_tokens: Any,
+    reserved_output_tokens: Any,
+    fixed_non_message_tokens: Any,
+    fixed_prompt_messages: Any,
+    estimate_messages: MessageEstimator,
+    previous_state: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
+    post_current_messages: Any = None,
+    bridge_reference_at: Any = None,
+    bridge_recent_horizon_hours: Any = 72,
+    bridge_source_token_limit: Any = 24_000,
+    bridge_output_token_limit: Any = 2_048,
+) -> Dict[str, Any]:
+    base: Dict[str, Any] = {
+        "schema": "thread_continuity_fold_plan.v2",
+        "status": "blocked",
+        "reason": "source_incomplete",
+        "source_complete": False,
+        "budget_status": "unknown",
+        "fold_groups": [],
+        "fold_source_group_ids": [],
+        "raw_suffix_groups": [],
+        "raw_suffix_group_ids": [],
+        "covered_source_group_ids": [],
+        "retired_source_group_ids": [],
+        "current_user_raw": True,
+        "rebuild_required": False,
+        "summary_call_feasibility": "not_applicable",
+    }
+    try:
+        source = normalize_thread_continuity_compact_source(compact_source)
+        normalized = normalize_complete_thread_groups(
+            source["groups"], current_ephemeral=current_ephemeral
+        )
+        if not normalized["complete"] or not normalized["current_ephemeral"]:
+            return base
+        groups = list(normalized["groups"])
+        prefixes = [source["prefix_before_groups"], *[
+            item["prefix"] for item in source["group_prefixes"]
+        ]]
+        eligibility_prefix = source["retirement_eligibility"]["prefix"]
+        eligible_count = prefixes.index(eligibility_prefix)
+        eligible_groups = groups[:eligible_count]
+        raw_suffix_groups = groups[eligible_count:]
+        if (
+            type(context_window_tokens) is not int
+            or context_window_tokens <= 0
+            or type(reserved_output_tokens) is not int
+            or reserved_output_tokens < 0
+            or reserved_output_tokens >= context_window_tokens
+            or type(fixed_non_message_tokens) is not int
+            or fixed_non_message_tokens < 0
+            or type(bridge_output_token_limit) is not int
+            or bridge_output_token_limit < 1
+        ):
+            return {**base, "reason": "budget_unknown"}
+        base_messages = _continuity_messages(fixed_prompt_messages)
+        if any(message["role"] not in {"system", "developer"} for message in base_messages):
+            raise ValueError("thread_continuity_fixed_prompt_contains_dialogue")
+        current = normalized["current_ephemeral"]
+        current_id = str(current.get("message_id") or "")
+        if not current_id or any(
+            current_id in group.get("message_ids", []) for group in groups
+        ):
+            return {**base, "reason": "identity_unresolved"}
+        trailing_owner = _normalize_post_current_messages(
+            post_current_messages,
+            unavailable_ids={
+                current_id,
+                *(message_id for group in groups for message_id in group.get("message_ids", [])),
+            },
+        )
+        trailing_messages = _post_current_provider_messages(trailing_owner)
+        effective_reference = bridge_reference_at or next(
+            (
+                str(group.get("effective_event_at") or "")
+                for group in reversed(groups)
+                if str(group.get("effective_event_at") or "")
+            ),
+            "",
+        )
+        selected = _select_compact_recent_bridge(
+            eligible_groups,
+            reference_at=effective_reference,
+            recent_horizon_hours=bridge_recent_horizon_hours,
+            source_token_limit=bridge_source_token_limit,
+            estimate_messages=estimate_messages,
+        )
+    except (TypeError, ValueError):
+        return {**base, "reason": "source_incomplete"}
+
+    previous: Dict[str, Any] = {}
+    previous_segment: List[Dict[str, Any]] = []
+    if previous_state and str(previous_state.get("schema") or "") == THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA:
+        try:
+            previous = validate_thread_continuity_checkpoint_v3_source(
+                previous_state,
+                compact_source=source,
+                checkpoint_validation=checkpoint_validation,
+            )
+            rendered = render_thread_continuity_checkpoint_message(
+                previous,
+                compact_source=source,
+                checkpoint_validation=checkpoint_validation,
+            )
+            previous_segment = [rendered] if rendered else []
+        except (TypeError, ValueError):
+            previous = {}
+            previous_segment = []
+    selected_groups = list(selected["groups"])
+    selected_ids = list(selected["source_group_ids"])
+    selected_fingerprints = list(selected["source_group_fingerprints"])
+    previous_bridge = thread_continuity_bridge_projection(previous)
+    policy_matches = bool(previous) and (
+        previous_bridge["represented_source_group_ids"] == selected_ids
+        and previous_bridge["source_group_fingerprints"] == selected_fingerprints
+        and previous_bridge["recent_horizon_hours"] == bridge_recent_horizon_hours
+        and previous_bridge["source_token_limit"] == bridge_source_token_limit
+        and previous_bridge["output_token_limit"] == bridge_output_token_limit
+    )
+    raw_messages = [
+        {
+            "role": message["role"],
+            "content": message["content"],
+            **({"name": message["name"]} if message.get("name") else {}),
+        }
+        for group in raw_suffix_groups
+        for message in group["messages"]
+    ]
+    current_message = {
+        "role": "user",
+        "content": current["content"],
+        **({"name": current["name"]} if current.get("name") else {}),
+    }
+    available_input = context_window_tokens - reserved_output_tokens - fixed_non_message_tokens
+    marker = {
+        "role": "system",
+        "content": _thread_continuity_checkpoint_marker(
+            "tcr_" + "0" * 64,
+            int(previous.get("revision") or 0) + 1,
+            "0" * 64,
+        ) + "\n",
+    }
+    try:
+        raw_floor = _estimate(
+            estimate_messages,
+            [*base_messages, marker, *raw_messages, current_message, *trailing_messages],
+        )
+        previous_total = _estimate(
+            estimate_messages,
+            [*base_messages, *previous_segment, *raw_messages, current_message, *trailing_messages],
+        ) if previous else 0
+    except ValueError:
+        return {**base, "reason": "estimator_invalid"}
+    summary_output_limit = min(
+        reserved_output_tokens,
+        bridge_output_token_limit,
+        max(0, available_input - raw_floor),
+    )
+    base.update(
+        source_complete=True,
+        budget_status="known",
+        source_snapshot=source["source_snapshot"],
+        source_proof=source["source_proof"],
+        retirement_prefix=eligibility_prefix,
+        retirement_eligibility=source["retirement_eligibility"],
+        bounded_source_groups=groups,
+        context_window_tokens=context_window_tokens,
+        reserved_output_tokens=reserved_output_tokens,
+        fixed_non_message_tokens=fixed_non_message_tokens,
+        available_input_tokens=available_input,
+        base_messages=base_messages,
+        fixed_prompt_fingerprint=_content_hash(base_messages),
+        post_current_messages=trailing_owner,
+        current_ephemeral=current,
+        continuity_mode="incremental" if previous else "rebuild",
+        predecessor_revision_id=str(previous.get("revision_id") or ""),
+        previous_continuity_messages=previous_segment,
+        previous_bridge_status=previous_bridge["status"] if previous else "absent",
+        previous_bridge_source_group_ids=list(
+            previous_bridge.get("represented_source_group_ids") or []
+        ),
+        fold_groups=selected_groups,
+        fold_source_group_ids=selected_ids,
+        covered_source_group_ids=[group["source_prefix_id"] for group in eligible_groups],
+        retired_source_group_ids=[group["source_prefix_id"] for group in eligible_groups],
+        raw_suffix_groups=raw_suffix_groups,
+        raw_suffix_group_ids=[group["source_prefix_id"] for group in raw_suffix_groups],
+        bridge_status="ready" if selected_groups else "empty",
+        bridge_source_groups=selected_groups,
+        bridge_source_group_ids=selected_ids,
+        bridge_source_group_fingerprints=selected_fingerprints,
+        bridge_source_slice_fingerprint=selected["source_slice_fingerprint"],
+        bridge_reference_at=selected["reference_at"],
+        bridge_recent_horizon_hours=bridge_recent_horizon_hours,
+        bridge_source_token_limit=bridge_source_token_limit,
+        bridge_output_token_limit=bridge_output_token_limit,
+        bridge_estimated_source_tokens=selected["estimated_source_tokens"],
+        bridge_excluded_by_currentness_count=selected["excluded_by_currentness_count"],
+        bridge_excluded_by_token_count=selected["excluded_by_token_count"],
+        summary_output_token_limit=summary_output_limit if selected_groups else 0,
+        summary_call_feasibility="unverified" if selected_groups else "not_applicable",
+        reuse_bridge_body=(previous_bridge["body"] if policy_matches else ""),
+    )
+    if raw_floor > available_input or (selected_groups and summary_output_limit < 1):
+        return {**base, "reason": "foreground_exceeds_budget"}
+    if (
+        previous
+        and policy_matches
+        and previous["retirement_cursor"]
+        == {
+            "schema": "thread_continuity_retirement_cursor.v2",
+            "relation": "retired_from_foreground",
+            **{key: eligibility_prefix[key] for key in (
+                "through_anchor", "canonical_count", "group_count", "prefix_hash", "group_root"
+            )},
+        }
+        and previous_total <= available_input
+    ):
+        base.update(status="no_fold", reason="within_budget")
+        return base
+    base.update(status="fold_required", reason="compact_prefix_checkpoint")
+    base["fold_plan_id"] = _v3_fold_plan_id(base)
+    return base
+
+
 def normalize_thread_continuity_fold_plan(
     plan: Mapping[str, Any], *, source_groups: List[Dict[str, Any]],
     current_ephemeral: Mapping[str, Any], context_window_tokens: Any,
@@ -1805,7 +1736,38 @@ def normalize_thread_continuity_fold_plan(
     bridge_recent_horizon_hours: Any = 72,
     bridge_source_token_limit: Any = 24_000,
     bridge_output_token_limit: Any = 2_048,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    if compact_source is not None:
+        normalized_source = normalize_thread_continuity_compact_source(
+            compact_source
+        )
+        supplied = normalize_complete_thread_groups(source_groups)
+        if (
+            not supplied["complete"]
+            or supplied["groups"] != normalized_source["groups"]
+        ):
+            raise ValueError("thread_continuity_fold_plan_invalid")
+        expected = _build_thread_continuity_fold_plan_v3(
+            normalized_source,
+            current_ephemeral=current_ephemeral,
+            context_window_tokens=context_window_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            fixed_non_message_tokens=fixed_non_message_tokens,
+            fixed_prompt_messages=fixed_prompt_messages,
+            estimate_messages=estimate_messages,
+            previous_state=previous_state,
+            checkpoint_validation=checkpoint_validation,
+            post_current_messages=post_current_messages,
+            bridge_reference_at=bridge_reference_at,
+            bridge_recent_horizon_hours=bridge_recent_horizon_hours,
+            bridge_source_token_limit=bridge_source_token_limit,
+            bridge_output_token_limit=bridge_output_token_limit,
+        )
+        if expected.get("status") != "fold_required" or dict(plan or {}) != expected:
+            raise ValueError("thread_continuity_fold_plan_invalid")
+        return expected
     expected = _build_thread_continuity_fold_plan(
         source_groups,
         current_ephemeral=current_ephemeral,
@@ -2261,7 +2223,53 @@ def plan_thread_continuity_fold(
     bridge_recent_horizon_hours: Any = 72,
     bridge_source_token_limit: Any = 24_000,
     bridge_output_token_limit: Any = 2_048,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    if compact_source is not None:
+        try:
+            normalized_source = normalize_thread_continuity_compact_source(
+                compact_source
+            )
+            supplied = normalize_complete_thread_groups(groups)
+            if (
+                not supplied["complete"]
+                or supplied["groups"] != normalized_source["groups"]
+            ):
+                raise ValueError("thread_continuity_compact_groups_invalid")
+        except (TypeError, ValueError):
+            return {
+                "schema": "thread_continuity_fold_plan.v2",
+                "status": "blocked",
+                "reason": "source_incomplete",
+                "source_complete": False,
+                "fold_groups": [],
+                "fold_source_group_ids": [],
+                "raw_suffix_groups": [],
+                "raw_suffix_group_ids": [],
+                "covered_source_group_ids": [],
+                "retired_source_group_ids": [],
+                "current_user_raw": True,
+                "budget_status": "unknown",
+                "rebuild_required": False,
+                "summary_call_feasibility": "not_applicable",
+            }
+        return _build_thread_continuity_fold_plan_v3(
+            normalized_source,
+            current_ephemeral=current_ephemeral,
+            context_window_tokens=context_window_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            fixed_non_message_tokens=fixed_non_message_tokens,
+            fixed_prompt_messages=fixed_prompt_messages,
+            estimate_messages=estimate_messages,
+            previous_state=previous_state,
+            checkpoint_validation=checkpoint_validation,
+            post_current_messages=post_current_messages,
+            bridge_reference_at=bridge_reference_at,
+            bridge_recent_horizon_hours=bridge_recent_horizon_hours,
+            bridge_source_token_limit=bridge_source_token_limit,
+            bridge_output_token_limit=bridge_output_token_limit,
+        )
     return _build_thread_continuity_fold_plan(
         groups,
         current_ephemeral=current_ephemeral,
@@ -2414,6 +2422,32 @@ Do not reconstruct older history and do not treat any previous bridge or summary
 Source IDs are structural metadata only and need not appear in the prose. Return only the visible summary text."""
 
 
+def _summary_source_content(content: Any) -> Any:
+    """Keep recorded dialogue/interpretation, not recurrent historical pixels.
+
+    This is provider input only: canonical content, identities and fingerprints
+    remain untouched. No image category or saved-asset number is inferred.
+    """
+    if isinstance(content, HistoryValue):
+        content = content.root
+    if isinstance(content, HistoryString):
+        return content.slice(0,len(content))
+    if not isinstance(content, list):
+        return content
+    omitted = "[Image pixels omitted; use recorded dialogue, not unseen details.]"
+    parts = []
+    for part in content:
+        if isinstance(part, Mapping) and part.get("type") in {"image_url", "input_image"}:
+            parts.append({"type": "text", "text": omitted})
+        elif isinstance(part, Mapping) and "image" in part and not part.get("type"):
+            parts.append({"text": omitted})
+        else:
+            if isinstance(part, Mapping) and isinstance(part.get("text"), HistoryString):
+                part = {**part,"text":part["text"].slice(0,len(part["text"]))}
+            parts.append(part)
+    return parts
+
+
 def _summary_prompt(carry: str, groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     messages: List[Dict[str, Any]] = [{"role": "system", "content": SUMMARY_INSTRUCTION}]
     if carry:
@@ -2430,7 +2464,46 @@ def _summary_prompt(carry: str, groups: List[Dict[str, Any]]) -> List[Dict[str, 
         for message in group["messages"]:
             name = str(message.get("name") or "")
             messages.append(
-                {"role": message["role"], "content": message["content"], **({"name": name} if name else {})}
+                {"role": message["role"], "content": _summary_source_content(message["content"]), **({"name": name} if name else {})}
+            )
+    return messages
+
+
+def _compact_summary_prompt(
+    carry: str, groups: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Keep v3 provider input bounded without serializing long opaque IDs."""
+
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": SUMMARY_INSTRUCTION}]
+    if carry:
+        messages.append({"role": "system", "name": "continuity_carry", "content": carry})
+    inventory = [
+        [group["source_prefix_id"], _group_fingerprint(group)] for group in groups
+    ]
+    messages.append(
+        {
+            "role": "system",
+            "name": "continuity_source_metadata",
+            "content": json.dumps(
+                {
+                    "ordered_group_count": len(groups),
+                    "ordered_inventory_sha256": _content_hash(inventory),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+    )
+    for group in groups:
+        for message in group["messages"]:
+            name = str(message.get("name") or "")
+            messages.append(
+                {
+                    "role": message["role"],
+                    "content": _summary_source_content(message["content"]),
+                    **({"name": name} if name else {}),
+                }
             )
     return messages
 
@@ -2476,6 +2549,8 @@ def plan_next_summary_attempt(
     bridge_recent_horizon_hours: Any = 72,
     bridge_source_token_limit: Any = 24_000,
     bridge_output_token_limit: Any = 2_048,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     blocked = {"status": "blocked", "progress_source_group_count": 0}
     try:
@@ -2496,13 +2571,24 @@ def plan_next_summary_attempt(
             bridge_recent_horizon_hours=bridge_recent_horizon_hours,
             bridge_source_token_limit=bridge_source_token_limit,
             bridge_output_token_limit=bridge_output_token_limit,
+            compact_source=compact_source,
+            checkpoint_validation=checkpoint_validation,
         )
-        canonical = list(normalize_complete_thread_groups(groups)["groups"])
+        canonical = list(
+            normalize_thread_continuity_compact_source(compact_source)["groups"]
+            if compact_source is not None
+            else normalize_complete_thread_groups(groups)["groups"]
+        )
     except (TypeError, ValueError):
         return {**blocked, "reason": "fold_plan_invalid"}
     try:
         checkpoint = (
-            normalize_thread_continuity_checkpoint(previous_checkpoint, source_groups=canonical)
+            normalize_thread_continuity_checkpoint(
+                previous_checkpoint,
+                source_groups=canonical,
+                compact_source=compact_source,
+                checkpoint_validation=checkpoint_validation,
+            )
             if previous_checkpoint else {}
         )
     except (TypeError, ValueError):
@@ -2553,12 +2639,14 @@ def plan_next_summary_attempt(
             }
         )
 
+    summary_prompt = _compact_summary_prompt if compact_source is not None else _summary_prompt
+
     def fit_batch(start: int, summary: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         batch: List[Dict[str, Any]] = []
         prompt: List[Dict[str, Any]] = []
         for end in range(start + 1, len(target_groups) + 1):
             candidate = target_groups[start:end]
-            candidate_prompt = _summary_prompt(summary, candidate)
+            candidate_prompt = summary_prompt(summary, candidate)
             if (
                 _estimate(estimate_messages, candidate_prompt)
                 + summary_output_token_limit
@@ -2643,6 +2731,9 @@ def plan_next_summary_attempt(
 
     carry = ""
     processed: List[str] = []
+    if compact_source is not None and owner_plan.get("reuse_bridge_body"):
+        carry = str(owner_plan["reuse_bridge_body"])
+        processed = list(target_ids)
     chunk_completions = list(accepted_chunk_completions or [])
     chunk_index = 0
 
@@ -2788,6 +2879,8 @@ def accept_summary_attempt(
     bridge_recent_horizon_hours: Any = 72,
     bridge_source_token_limit: Any = 24_000,
     bridge_output_token_limit: Any = 2_048,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     rejected = {"status": "rejected", "progress_source_group_count": 0}
     expected = plan_next_summary_attempt(
@@ -2809,6 +2902,8 @@ def accept_summary_attempt(
         bridge_recent_horizon_hours=bridge_recent_horizon_hours,
         bridge_source_token_limit=bridge_source_token_limit,
         bridge_output_token_limit=bridge_output_token_limit,
+        compact_source=compact_source,
+        checkpoint_validation=checkpoint_validation,
     )
     row = dict(descriptor or {})
     if expected.get("status") != "ready" or row != expected.get("descriptor"):
@@ -2859,6 +2954,10 @@ def build_thread_continuity_checkpoint_from_attempts(
     bridge_recent_horizon_hours: Any = 72,
     bridge_source_token_limit: Any = 24_000,
     bridge_output_token_limit: Any = 2_048,
+    compact_source: Mapping[str, Any] | None = None,
+    checkpoint_validation: Mapping[str, Any] | None = None,
+    stored_predecessor_revision: int | None = None,
+    stored_predecessor_revision_id: str | None = None,
 ) -> Dict[str, Any]:
     complete = plan_next_summary_attempt(
         source_groups, fold_plan=fold_plan, current_ephemeral=current_ephemeral,
@@ -2874,6 +2973,8 @@ def build_thread_continuity_checkpoint_from_attempts(
         bridge_recent_horizon_hours=bridge_recent_horizon_hours,
         bridge_source_token_limit=bridge_source_token_limit,
         bridge_output_token_limit=bridge_output_token_limit,
+        compact_source=compact_source,
+        checkpoint_validation=checkpoint_validation,
     )
     if complete.get("status") != "complete":
         raise ValueError("thread_continuity_summary_incomplete")
@@ -2896,6 +2997,45 @@ def build_thread_continuity_checkpoint_from_attempts(
         raise ValueError("thread_continuity_summary_completion_invalid")
     if completion != expected:
         raise ValueError("thread_continuity_summary_completion_invalid")
+    if compact_source is not None:
+        source = normalize_thread_continuity_compact_source(compact_source)
+        bridge_ids = set(bridge_source_ids)
+        bridge_groups = [
+            group for group in source["groups"]
+            if group["source_prefix_id"] in bridge_ids
+        ]
+        if [group["source_prefix_id"] for group in bridge_groups] != bridge_source_ids:
+            raise ValueError("thread_continuity_summary_completion_invalid")
+        previous_v3: Mapping[str, Any] | None = None
+        if (
+            previous_checkpoint
+            and str(previous_checkpoint.get("schema") or "")
+            == THREAD_CONTINUITY_CHECKPOINT_V3_SCHEMA
+        ):
+            try:
+                previous_v3 = validate_thread_continuity_checkpoint_v3_source(
+                    previous_checkpoint,
+                    compact_source=source,
+                    checkpoint_validation=checkpoint_validation,
+                )
+            except (TypeError, ValueError):
+                previous_v3 = None
+        return build_thread_continuity_checkpoint_v3(
+            previous_state=previous_checkpoint,
+            source_proof=source["source_proof"],
+            retirement_prefix=source["retirement_eligibility"]["prefix"],
+            bridge_source_groups=bridge_groups,
+            bridge_text=summary,
+            bridge_policy={
+                "reference_at": fold_plan.get("bridge_reference_at"),
+                "recent_horizon_hours": fold_plan.get("bridge_recent_horizon_hours"),
+                "source_token_limit": fold_plan.get("bridge_source_token_limit"),
+                "output_token_limit": fold_plan.get("bridge_output_token_limit"),
+            },
+            continue_lineage=previous_v3 is not None,
+            predecessor_revision=stored_predecessor_revision,
+            predecessor_revision_id=stored_predecessor_revision_id,
+        )
     return build_thread_continuity_checkpoint_v2(
         previous_state=previous_checkpoint,
         source_groups=source_groups,
@@ -2991,7 +3131,11 @@ def _chunk_prompt(
             "content": json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         }
     )
-    return [*messages, *_chunk_fragment_messages(group, atoms, start, end)]
+    fragments = _chunk_fragment_messages(group, atoms, start, end)
+    return [*messages, *[
+        {**message, "content": _summary_source_content(message["content"])}
+        for message in fragments
+    ]]
 
 
 def _chunk_receipt(descriptor: Mapping[str, Any], provider_result: Any) -> Tuple[str, Dict[str, Any]]:

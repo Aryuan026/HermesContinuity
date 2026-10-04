@@ -10,7 +10,7 @@ permissions:
 jobs:
   unittest:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
@@ -21,4 +21,97 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Materialize compatible Hermes host
+        run: |
+          git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes"
+          git -C "$RUNNER_TEMP/hermes" checkout fcbd1076a93841fa88855acce810e342a5b78101
+          for patch in \
+            hermes-0.20.5-plugin-llm-finish-reason.patch \
+            hermes-0.20.5-request-middleware-v2.patch \
+            hermes-0.20.5-plugin-service-registry.patch \
+            hermes-0.20.5-bounded-session-message-reads.patch \
+            hermes-0.20.5-provider-transport-truth.patch \
+            hermes-0.20.5-closed-finish-state-truth.patch \
+            hermes-0.20.5-final-provider-budget-controls.patch \
+            hermes-0.20.5-verified-wakeup-provenance.patch \
+            hermes-0.20.5-installer-manifest-v2.patch \
+            hermes-0.20.5-joint-plugin-doctor.patch \
+            hermes-0.20.5-request-overlay-proofs.patch \
+            hermes-0.20.5-request-overlay-acceptance.patch
+          do
+            git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/$patch"
+          done
+          echo "PYTHONPATH=$RUNNER_TEMP/hermes" >> "$GITHUB_ENV"
+          echo "HERMES_SOURCE_ROOT=$RUNNER_TEMP/hermes" >> "$GITHUB_ENV"
+      - name: Install compatible Hermes runtime
+        run: python -m pip install -e "$RUNNER_TEMP/hermes" pytest==9.1.1
+      - name: Verify shared request overlay host seam
+        run: |
+          cd "$RUNNER_TEMP/hermes"
+          python -B -m pytest -q tests/test_request_overlay.py tests/test_middleware.py
       - run: python -B -m unittest discover -s tests -v
+      - name: Disposable full-chain resource benchmark
+        shell: bash
+        run: python -B tests/benchmark_resource_guard.py | tee "$RUNNER_TEMP/resource-guard.jsonl"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: resource-guard-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/resource-guard.jsonl
+      - name: Apply additive Block 3 host seam
+        run: |
+          mkdir "$RUNNER_TEMP/hermes-baseline-module"
+          cp "$RUNNER_TEMP/hermes/hermes_state.py" "$RUNNER_TEMP/hermes-baseline-module/hermes_state.py"
+          echo "HERMES_BASELINE_SOURCE_ROOT=$RUNNER_TEMP/hermes-baseline-module" >> "$GITHUB_ENV"
+          git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-incremental-history.patch"
+          git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-value-guard.patch"
+          git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-quantum-progress.patch"
+          git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-origin-recovery.patch"
+      - name: Verify bounded canonical-history host
+        run: |
+          cd "$RUNNER_TEMP/hermes"
+          HERMES_PYTHON="$(command -v python)" bash scripts/run_tests.sh --file-retries 0 tests/test_hermes_state_history.py tests/gateway/test_replay_entry_fields.py
+      - name: Verify indexed plugin and real host entrypoint
+        run: python -B -m unittest discover -s tests -v
+      - name: Disposable indexed-history scale benchmark
+        shell: bash
+        run: python -B tests/benchmark_history_index.py | tee "$RUNNER_TEMP/history-index.jsonl"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: history-index-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/history-index.jsonl
+      - name: Disposable native SQLite value-guard benchmark
+        shell: bash
+        run: python -B tests/benchmark_history_value_guard.py | tee "$RUNNER_TEMP/history-value-guard.jsonl"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: history-value-guard-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/history-value-guard.jsonl
+      - name: Apply streamed giant-value seam
+        run: |
+          git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-streamed-values.patch"
+          git clone --filter=blob:none https://github.com/Aryuan026/HermesGlobalHot.git "$RUNNER_TEMP/global-hot"
+          git -C "$RUNNER_TEMP/global-hot" checkout af605282d3b221e705d1ee47b886f2d054cc3598
+          echo "HERMES_GLOBAL_HOT_ROOT=$RUNNER_TEMP/global-hot" >> "$GITHUB_ENV"
+      - name: Verify streamed values and retained history contracts
+        run: |
+          cd "$RUNNER_TEMP/hermes"
+          python -B -m pytest -q tests/test_history_stream_values.py tests/test_hermes_state_history.py
+      - name: Verify giant-history and paired real-host entrypoints
+        run: python -B -m unittest discover -s tests -v
+      - name: Disposable streamed giant-history benchmark
+        shell: bash
+        run: python -B tests/benchmark_history_index.py --streamed-only | tee "$RUNNER_TEMP/history-streamed.jsonl"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: history-streamed-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/history-streamed.jsonl
+      - name: Apply bounded native-search seam
+        run: git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-native-search.patch"
+      - name: Apply giant-value member lifecycle correction
+        run: git -C "$RUNNER_TEMP/hermes" apply "$GITHUB_WORKSPACE/patches/hermes-0.20.5-history-value-member-lifecycle.patch"
+      - name: Verify native search and retained source/overlay contracts
+        run: |
+          cd "$RUNNER_TEMP/hermes"
+          HERMES_PYTHON="$(command -v python)" bash scripts/run_tests.sh --file-retries 0 tests/test_history_search.py tests/test_history_stream_values.py tests/test_hermes_state_history.py tests/test_request_overlay.py tests/test_middleware.py
+      - name: Verify question recall and real-host delivery
+        run: python -B -m unittest discover -s tests -v

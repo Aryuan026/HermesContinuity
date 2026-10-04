@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
 import os
 import sys
@@ -35,15 +36,34 @@ if HERMES_AVAILABLE:
     from hermes_cli.plugins import get_plugin_manager  # noqa: E402
 
 
-OLD_CHECKPOINT = {
-    "schema": "thread_continuity_checkpoint.v1",
-    "summary_text": "old bridge",
-}
-CANDIDATE = {
-    "schema": "thread_continuity_checkpoint.v1",
-    "summary_text": "candidate bridge",
-    "source_group_ids": ["g1"],
-}
+def _checkpoint(revision: int, body: str) -> dict:
+    body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return {
+        "schema": "thread_continuity_checkpoint.v2",
+        "revision": revision,
+        "recent_bridge": {
+            "schema": "thread_continuity_recent_bridge.v1",
+            "status": "ready" if body else "empty",
+            "relation": (
+                "represented_in_recent_bridge"
+                if body
+                else "no_visible_representation"
+            ),
+            "source_group_ids": ["g1"] if body else [],
+            "source_group_fingerprints": ["f" * 64] if body else [],
+            "source_slice_fingerprint": "e" * 64 if body else "",
+            "reference_at": "2026-08-30T00:00:00+00:00",
+            "recent_horizon_hours": 72,
+            "source_token_limit": 24_000,
+            "output_token_limit": 2_048,
+            "body": body,
+            "body_sha256": body_sha256,
+        },
+    }
+
+
+OLD_CHECKPOINT = _checkpoint(1, "old bridge")
+CANDIDATE = _checkpoint(2, "candidate bridge")
 
 
 class _Metadata:
@@ -77,10 +97,6 @@ class _Adapter:
             },
         }
 
-    def compare_and_swap_checkpoint(self, session_id: str, **kwargs) -> dict:
-        self.cas_calls.append({"session_id": session_id, **copy.deepcopy(kwargs)})
-        return {"ok": True, "status": "applied"}
-
     def settle_checkpoint_delivery(self, session_id: str, **kwargs) -> dict:
         self.cas_calls.append(
             {
@@ -110,14 +126,15 @@ class _Llm:
 
 
 class _Compiler:
-    def __init__(self) -> None:
+    def __init__(self, candidate: dict | None = None) -> None:
         self.calls = 0
+        self.candidate = copy.deepcopy(candidate or CANDIDATE)
 
     async def __call__(self, _bundle, **_kwargs) -> dict:
         self.calls += 1
         return {
             "status": "ready",
-            "checkpoint_candidate": copy.deepcopy(CANDIDATE),
+            "checkpoint_candidate": copy.deepcopy(self.candidate),
             "expected_revision": 1,
             "expected_pre_turn_source_snapshot": "a" * 64,
         }
@@ -279,6 +296,49 @@ class HermesMiddlewareIntegrationTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(self.adapter.cas_calls, [])
         self.assertEqual(self.adapter.metadata_store.receipts, [])
+
+    def test_empty_bridge_candidate_settles_through_zero_filter_transport(self) -> None:
+        self.compiler = _Compiler(_checkpoint(2, ""))
+        self.runtime = ContinuityRuntime(
+            self.adapter,
+            _Llm(),
+            compiler=self.compiler,
+            estimator=lambda messages: len(messages) * 8,
+            clock=lambda: "2026-08-30T00:00:00+00:00",
+        )
+        self.manager._middleware = {
+            LLM_REQUEST_MIDDLEWARE: [self.runtime.llm_request],
+            LLM_EXECUTION_MIDDLEWARE: [self.runtime.llm_execution],
+        }
+        self.manager._middleware_owners = {
+            LLM_REQUEST_MIDDLEWARE: ["hermes-continuity"],
+            LLM_EXECUTION_MIDDLEWARE: ["hermes-continuity"],
+        }
+        self.manager._hooks = {
+            "post_api_request": [self.runtime.post_api_request],
+            "api_request_error": [self.runtime.api_request_error],
+        }
+
+        projected = apply_llm_request_middleware(_request(), **_context())
+        self.assertFalse(projected.changed)
+        provider_bodies: list[dict] = []
+        self._execute(
+            projected,
+            lambda body: provider_bodies.append(copy.deepcopy(body)) or {"ok": True},
+        )
+        record = self.transport_records[_context()["api_request_id"]]
+        self.assertIsNotNone(record.provider_body_estimated_tokens)
+        self._post(record=record)
+
+        self.assertEqual(provider_bodies, [_request()])
+        self.assertEqual(len(self.adapter.cas_calls), 1)
+        self.assertEqual(len(self.adapter.metadata_store.receipts), 1)
+        self.assertEqual(
+            self.adapter.cas_calls[0]["checkpoint_candidate"]["recent_bridge"][
+                "status"
+            ],
+            "empty",
+        )
 
     def test_stored_projection_detects_drift_and_post_cannot_publish(self) -> None:
         original, projected = self._project()

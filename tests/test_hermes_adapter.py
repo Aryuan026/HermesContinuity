@@ -12,6 +12,7 @@ import time
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -94,21 +95,69 @@ class FakeSessionDB:
         self.rows = copy.deepcopy(rows)
         self.calls: list[dict] = []
 
+    @contextmanager
+    def _read_ctx(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        columns = list(row(1, "user", "", 0))
+        connection.execute("CREATE TABLE messages (" + ",".join(columns) + ")")
+        try:
+            for message in self.rows:
+                connection.execute(
+                    "INSERT INTO messages VALUES (" + ",".join("?" for _ in columns) + ")",
+                    [json.dumps(message.get(key)) if isinstance(message.get(key), (dict, list))
+                     else message.get(key) for key in columns],
+                )
+            connection.commit()
+            yield connection
+        finally:
+            connection.close()
+
+    def _decode_message_rows(self, rows):
+        result = []
+        for raw in rows:
+            message = dict(raw)
+            for name in ("content", "tool_calls", "display_metadata"):
+                value = message.get(name)
+                if isinstance(value, str) and value[:1] in ("[", "{"):
+                    try:
+                        message[name] = json.loads(value)
+                    except ValueError:
+                        pass
+            result.append(message)
+        return result
+
+    @staticmethod
+    def _dedupe_compacted_message_rows(rows):
+        winners = {}
+        for raw in rows:
+            message = dict(raw)
+            key = hermes_key(message)
+            current = winners.get(key)
+            if current is None or (message["active"], message["id"]) > (current["active"], current["id"]):
+                winners[key] = message
+        return sorted(winners.values(), key=lambda message: message["id"])
+
     def get_messages(
         self,
         session_id: str,
         include_inactive: bool = False,
         include_compacted: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict]:
         self.calls.append(
             {
                 "session_id": session_id,
                 "include_inactive": include_inactive,
                 "include_compacted": include_compacted,
+                "limit": limit,
+                "offset": offset,
             }
         )
         if include_inactive:
-            return copy.deepcopy(self.rows)
+            stop = None if limit is None else offset + limit
+            return copy.deepcopy(self.rows[offset:stop])
         if include_compacted:
             relevant = [
                 message
@@ -124,8 +173,11 @@ class FakeSessionDB:
                     current["id"],
                 ):
                     winners[key] = message
-            return copy.deepcopy(sorted(winners.values(), key=lambda message: message["id"]))
-        return copy.deepcopy([message for message in self.rows if message["active"] == 1])
+            rows = sorted(winners.values(), key=lambda message: message["id"])
+        else:
+            rows = [message for message in self.rows if message["active"] == 1]
+        stop = None if limit is None else offset + limit
+        return copy.deepcopy(rows[offset:stop])
 
 
 def dialogue_rows(start_id: int, timestamp: float, text: str) -> list[dict]:
@@ -159,6 +211,33 @@ def checkpoint(source: dict, previous: dict | None = None) -> dict:
 
 
 class HermesSourceProjectionTests(unittest.TestCase):
+    def test_full_prefix_overflow_stops_before_unbounded_canonical_read(self) -> None:
+        session_db = FakeSessionDB(
+            dialogue_rows(1, 100.0, "first")
+            + [row(3, "user", "overflow", 200.0)]
+        )
+        source = HermesSessionAdapter(
+            session_db,
+            max_full_prefix_physical_rows=2,
+        ).read_source("session-1")
+
+        self.assertEqual(source["status"], "overflow")
+        self.assertFalse(source["scan_complete"])
+        self.assertEqual(source["error"], "source_physical_row_limit_exceeded")
+        self.assertEqual(source["stats"]["max_physical_rows"], 2)
+        self.assertEqual(session_db.calls, [])
+
+    def test_full_prefix_row_limit_must_be_positive_integer(self) -> None:
+        for value in (0, -1, True, 1.5, "2048"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "max_full_prefix_physical_rows_invalid"
+                ):
+                    HermesSessionAdapter(
+                        FakeSessionDB([]),
+                        max_full_prefix_physical_rows=value,
+                    )
+
     def test_same_text_with_distinct_timestamps_remains_distinct(self) -> None:
         rows = dialogue_rows(1, 100.0, "same") + dialogue_rows(3, 200.0, "same")
         source = HermesSessionAdapter(FakeSessionDB(rows)).read_source("session-1")
@@ -375,6 +454,132 @@ class HermesSourceProjectionTests(unittest.TestCase):
         self.assertEqual(proactive["status"], "ambiguous")
         self.assertEqual(proactive["error"], "proactive_event_unverified")
 
+    def test_host_session_metadata_is_excluded_from_canonical_dialogue(self) -> None:
+        metadata = row(
+            1,
+            "session_meta",
+            '{"host_control":"not dialogue"}',
+            50.0,
+            active=0,
+            compacted=1,
+        )
+        source = HermesSessionAdapter(
+            FakeSessionDB([metadata, *dialogue_rows(2, 100.0, "live")])
+        ).read_source("session-1")
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(len(source["groups"]), 1)
+        self.assertNotIn("host_control", repr(source))
+
+    def test_nonvisible_provider_scaffolds_never_become_dialogue(self) -> None:
+        rows = [
+            row(1, "user", "visible question", 100.0),
+            row(
+                2,
+                "assistant",
+                "tool request",
+                101.0,
+                tool_calls=[{"id": "call-1", "type": "function"}],
+                finish_reason="tool_calls",
+            ),
+            row(
+                3,
+                "user",
+                "",
+                102.0,
+                api_content="provider-only continuation",
+            ),
+            row(4, "assistant", "visible answer", 103.0, finish_reason="stop"),
+            row(
+                5,
+                "assistant",
+                "",
+                104.0,
+                api_content="neutral interruption placeholder",
+                display_kind="hidden",
+            ),
+        ]
+        source = HermesSessionAdapter(FakeSessionDB(rows)).read_source("session-1")
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(len(source["groups"]), 1)
+        self.assertNotIn("provider-only continuation", repr(source))
+        self.assertNotIn("neutral interruption placeholder", repr(source))
+
+        inbound_empty = HermesSessionAdapter(
+            FakeSessionDB(
+                [
+                    row(
+                        1,
+                        "user",
+                        "",
+                        100.0,
+                        api_content="provider-only continuation",
+                        platform_message_id="inbound-1",
+                    ),
+                    row(2, "assistant", "answer", 101.0),
+                ]
+            )
+        ).read_source("session-1")
+        self.assertEqual(inbound_empty["status"], "ambiguous")
+        self.assertEqual(inbound_empty["error"], "source_visible_content_invalid")
+
+    def test_host_role_runs_preserve_visible_text_as_closed_groups(self) -> None:
+        source = HermesSessionAdapter(
+            FakeSessionDB(
+                [
+                    row(1, "user", "first user message", 100.0),
+                    row(2, "user", "second user message", 101.0),
+                    row(3, "assistant", "first answer", 102.0, finish_reason="stop"),
+                    row(
+                        4,
+                        "assistant",
+                        "follow-up answer",
+                        103.0,
+                        finish_reason="stop",
+                    ),
+                ]
+            )
+        ).read_source("session-1")
+
+        self.assertEqual(source["status"], "ready")
+        self.assertEqual(
+            [group["group_kind"] for group in source["groups"]],
+            ["dialogue_turn", "proactive_assistant_event"],
+        )
+        self.assertEqual(
+            source["groups"][0]["messages"][0]["content"],
+            "first user message\n\nsecond user message",
+        )
+        self.assertEqual(
+            source["groups"][1]["messages"][0]["content"],
+            "follow-up answer",
+        )
+
+        unmergeable = HermesSessionAdapter(
+            FakeSessionDB(
+                [
+                    row(
+                        1,
+                        "user",
+                        [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "https://example.invalid/a.png"},
+                            }
+                        ],
+                        100.0,
+                    ),
+                    row(2, "user", "second user message", 101.0),
+                    row(3, "assistant", "answer", 102.0),
+                ]
+            )
+        ).read_source("session-1")
+        self.assertEqual(unmergeable["status"], "ambiguous")
+        self.assertEqual(
+            unmergeable["error"], "consecutive_user_content_unmergeable"
+        )
+
     def test_compacted_prefix_is_contiguous_whole_groups_only(self) -> None:
         compacted = dialogue_rows(1, 100.0, "old")
         for message in compacted:
@@ -395,9 +600,19 @@ class HermesSourceProjectionTests(unittest.TestCase):
 
     def test_unexplained_canonical_view_or_multiple_active_rows_is_ambiguous(self) -> None:
         class MissingCanonical(FakeSessionDB):
-            def get_messages(self, session_id: str, include_inactive: bool = False,
-                             include_compacted: bool = False) -> list[dict]:
-                rows = super().get_messages(session_id, include_inactive, include_compacted)
+            @staticmethod
+            def _dedupe_compacted_message_rows(rows):
+                return []
+            def get_messages(
+                self,
+                session_id: str,
+                include_inactive: bool = False,
+                include_compacted: bool = False,
+                **kwargs,
+            ) -> list[dict]:
+                rows = super().get_messages(
+                    session_id, include_inactive, include_compacted, **kwargs
+                )
                 return [] if include_compacted else rows
 
         missing = HermesSessionAdapter(
@@ -818,6 +1033,31 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
         ).read_source("session-1")
         self.candidate = checkpoint(self.source)
 
+    def receipts(self, session_id: str) -> list[dict]:
+        with sqlite3.connect(self.db_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT receipt_id, session_id, receipt_kind, status,
+                       source_ids_json, hashes_json, counts_json, recorded_at
+                FROM continuity_receipts
+                WHERE session_id = ? ORDER BY recorded_at, receipt_id
+                """,
+                (session_id,),
+            ).fetchall()
+        return [
+            {
+                "receipt_id": row[0],
+                "session_id": row[1],
+                "kind": row[2],
+                "status": row[3],
+                "source_ids": json.loads(row[4]),
+                "hashes": json.loads(row[5]),
+                "counts": json.loads(row[6]),
+                "recorded_at": row[7],
+            }
+            for row in rows
+        ]
+
     def tearDown(self) -> None:
         self.temp.cleanup()
 
@@ -910,7 +1150,8 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
 
         self.assertTrue(settled["ok"])
         self.assertEqual(status["checkpoint"]["revision"], 1)
-        self.assertEqual(status["checkpoint"]["recent_bridge_status"], "ready")
+        self.assertEqual(status["checkpoint"]["status"], "stored_unvalidated")
+        self.assertGreater(status["checkpoint"]["stored_bytes"], 0)
         self.assertEqual(
             status["last_delivery"]["status"],
             "delivered_checkpoint_applied",
@@ -929,19 +1170,15 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
             "counts": {"represented_source_group_count": 1},
         }
 
-    def test_snapshot_and_revision_cas_survive_restart(self) -> None:
-        applied = self.store.compare_and_swap_checkpoint(
+    def test_snapshot_and_revision_settlement_survive_restart(self) -> None:
+        applied = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("restart-applied"),
             source_reread=lambda _session_id: self.source,
         )
-        conflict = self.store.compare_and_swap_checkpoint(
+        conflict = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("restart-conflict"),
             source_reread=lambda _session_id: self.source,
         )
         restarted = ContinuityMetadataStore(self.db_path)
@@ -952,6 +1189,39 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
         self.assertEqual(readback["status"], "ready")
         self.assertEqual(readback["state"]["checkpoint"], self.candidate)
 
+    def test_checkpoint_write_budget_matches_immediate_readback_boundary(self):
+        self.candidate = build_thread_continuity_checkpoint_v2(
+            previous_state=None, source_groups=self.source["groups"],
+            retired_source_group_ids=self.source["source_prefix_ids"],
+            bridge_source_group_ids=self.source["source_prefix_ids"],
+            bridge_text="桥" * 1500,
+            bridge_policy={"reference_at": self.source["groups"][-1]["effective_event_at"],
+                           "recent_horizon_hours": 72, "source_token_limit": 24000,
+                           "output_token_limit": 2048},
+        )
+        size = sum(len(hermes_adapter._json_text(value).encode("utf-8"))
+                   for value in (self.candidate, self.source["source_prefix_ids"]))
+        self.assertGreater(size, 4096)
+        for budget in (size - 1, size, size + 1):
+            with self.subTest(budget=budget):
+                store = ContinuityMetadataStore(Path(self.temp.name) / f"budget-{budget}.db",
+                                                max_checkpoint_bytes=budget)
+                result = store.settle_checkpoint_delivery(
+                    "session-1", **self.settlement_kwargs("budget"),
+                    source_reread=lambda _sid: self.source,
+                )
+                readback = store.read_continuity("session-1", self.source)
+                self.assertTrue(result["receipt_recorded"])
+                if budget < size:
+                    self.assertEqual(result["error"], "checkpoint_byte_limit_exceeded")
+                    self.assertEqual(readback["status"], "absent")
+                    self.assertEqual(store.status_summary("session-1")["last_delivery"]["status"],
+                                     "delivered_checkpoint_failed")
+                else:
+                    self.assertEqual(result["status"], "applied")
+                    self.assertEqual(readback["status"], "ready")
+                    self.assertEqual(readback["state"]["checkpoint"], self.candidate)
+
     def test_tail_growth_is_accepted_without_expanding_checkpoint_source(self) -> None:
         grown = HermesSessionAdapter(
             FakeSessionDB(
@@ -959,11 +1229,9 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
                 + dialogue_rows(3, 200.0, "tail")
             )
         ).read_source("session-1")
-        applied = self.store.compare_and_swap_checkpoint(
+        applied = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("tail-growth"),
             source_reread=lambda _session_id: grown,
         )
 
@@ -984,11 +1252,9 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
                 + dialogue_rows(3, 200.0, "uncompiled tail")
             )
         ).read_source("session-1")
-        applied = self.store.compare_and_swap_checkpoint(
+        applied = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("tail-undo"),
             source_reread=lambda _session_id: grown,
         )
 
@@ -1005,18 +1271,14 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
         rewritten = HermesSessionAdapter(
             FakeSessionDB(dialogue_rows(1, 100.0, "rewritten"))
         ).read_source("session-1")
-        rewrite = self.store.compare_and_swap_checkpoint(
+        rewrite = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("rewrite-conflict"),
             source_reread=lambda _session_id: rewritten,
         )
-        ambiguous = self.store.compare_and_swap_checkpoint(
+        ambiguous = self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("ambiguous-conflict"),
             source_reread=lambda _session_id: {"status": "ambiguous"},
         )
 
@@ -1027,21 +1289,19 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
             "absent",
         )
 
-    def test_concurrent_compare_and_swap_has_one_winner(self) -> None:
+    def test_concurrent_settlement_has_one_checkpoint_winner(self) -> None:
         barrier = threading.Barrier(2)
 
-        def publish() -> dict:
+        def publish(index: int) -> dict:
             barrier.wait()
-            return self.store.compare_and_swap_checkpoint(
+            return self.store.settle_checkpoint_delivery(
                 "session-1",
-                expected_revision=0,
-                expected_source_snapshot=self.source["source_snapshot"],
-                checkpoint_candidate=self.candidate,
+                **self.settlement_kwargs(f"concurrent-{index}"),
                 source_reread=lambda _session_id: self.source,
             )
 
         with ThreadPoolExecutor(max_workers=2) as executor:
-            results = list(executor.map(lambda _index: publish(), range(2)))
+            results = list(executor.map(publish, range(2)))
 
         self.assertEqual(sum(result.get("ok") is True for result in results), 1)
         self.assertEqual(
@@ -1063,7 +1323,7 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
         )
 
         readback = self.store.read_continuity("session-1", self.source)
-        receipts = self.store.list_receipts("session-1")
+        receipts = self.receipts("session-1")
         self.assertEqual(result["status"], "applied")
         self.assertTrue(result["receipt_recorded"])
         self.assertEqual(readback["state"]["checkpoint"], self.candidate)
@@ -1088,16 +1348,14 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
             "absent",
         )
         self.assertEqual(
-            self.store.list_receipts("session-1")[0]["status"],
+            self.receipts("session-1")[0]["status"],
             "delivered_checkpoint_unchanged",
         )
 
     def test_atomic_settlement_records_conflict_without_changing_checkpoint(self) -> None:
-        self.store.compare_and_swap_checkpoint(
+        self.store.settle_checkpoint_delivery(
             "session-1",
-            expected_revision=0,
-            expected_source_snapshot=self.source["source_snapshot"],
-            checkpoint_candidate=self.candidate,
+            **self.settlement_kwargs("settlement-seed"),
             source_reread=lambda _session_id: self.source,
         )
 
@@ -1112,7 +1370,7 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
         self.assertEqual(result["error"], "thread_continuity_revision_conflict")
         self.assertEqual(readback["state"]["checkpoint"], self.candidate)
         self.assertEqual(
-            self.store.list_receipts("session-1")[0]["status"],
+            self.receipts("session-1")[-1]["status"],
             "delivered_checkpoint_conflict",
         )
 
@@ -1140,7 +1398,7 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
             self.store.read_continuity("session-1", self.source)["status"],
             "absent",
         )
-        self.assertEqual(self.store.list_receipts("session-1"), [])
+        self.assertEqual(self.receipts("session-1"), [])
 
     def test_slow_source_reread_does_not_block_unrelated_receipt_writer(self) -> None:
         reread_started = threading.Event()
@@ -1197,7 +1455,7 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
         self.assertEqual(
             sorted(result["idempotent"] for result in results), [False, True]
         )
-        self.assertEqual(len(self.store.list_receipts("session-1")), 1)
+        self.assertEqual(len(self.receipts("session-1")), 1)
         self.assertEqual(
             self.store.read_continuity("session-1", self.source)["state"]["revision"],
             1,
@@ -1240,7 +1498,7 @@ class ContinuityMetadataStoreTests(unittest.TestCase):
             stored = repr(
                 connection.execute("SELECT * FROM continuity_receipts").fetchall()
             )
-        receipts = ContinuityMetadataStore(self.db_path).list_receipts("session-1")
+        receipts = self.receipts("session-1")
 
         self.assertNotIn("body", schema.lower())
         self.assertNotIn(sentinel, stored)

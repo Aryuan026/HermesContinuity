@@ -1,0 +1,397 @@
+From 5a680e5e38625fb3275b4bf6973a40d089ec11a7 Mon Sep 17 00:00:00 2001
+From: asherie <asherie@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 21:43:39 +0800
+Subject: [PATCH] fix(middleware): settle request overlay ownership
+
+
+diff --git a/hermes_cli/middleware.py b/hermes_cli/middleware.py
+index abb50f1..0cd51e9 100644
+--- a/hermes_cli/middleware.py
++++ b/hermes_cli/middleware.py
+@@ -203,6 +203,7 @@ class TransportRecord:
+             self._store_provider_body_estimate(_provider_body_estimate(None))
+             return None
+         if not filters:
++            self._store_provider_body_estimate(_provider_body_estimate(initial))
+             return initial
+         if preexisting_ambiguity:
+             self._store_provider_body_estimate(_provider_body_estimate(initial))
+@@ -222,20 +223,31 @@ class TransportRecord:
+                 )
+                 self._mark_ambiguous()
+                 continue
+-            accepted = _provider_filter_snapshot(result)
++            overlay_result = _request_overlay_filter_result(result)
++            accepted = _provider_filter_snapshot(
++                overlay_result.body if overlay_result is not None else result
++            )
+             if accepted is None or "timeout" in accepted:
+                 self._mark_ambiguous()
+                 continue
+             if phase == PROVIDER_BODY_FILTER_FINAL_GUARD:
+-                accepted_estimate = _provider_body_estimate(accepted)
+-                if not _provider_body_guard_is_non_expansive(
+-                    current,
+-                    accepted,
+-                    estimate,
+-                    accepted_estimate,
+-                ):
++                overlay_accepted = (
++                    overlay_result._accept(current, accepted)
++                    if overlay_result is not None
++                    else None
++                )
++                generic_accepted = bool(
++                    overlay_result is None
++                    and _provider_body_guard_is_non_expansive(
++                        current,
++                        accepted,
++                        estimate,
++                        _provider_body_estimate(accepted),
++                    )
++                )
++                if not overlay_accepted and not generic_accepted:
+                     logger.warning(
+-                        "Provider-body final guard %s expanded the body; "
++                        "Provider-body final guard %s was not accepted; "
+                         "keeping the previous body",
+                         getattr(callback, "__name__", repr(callback)),
+                     )
+@@ -337,6 +349,15 @@ def _provider_filter_snapshot(body: Any) -> Dict[str, Any] | None:
+         return None
+ 
+ 
++def _request_overlay_filter_result(result: Any) -> Any:
++    try:
++        from hermes_cli.request_overlay import RequestOverlayFilterResult
++
++        return result if isinstance(result, RequestOverlayFilterResult) else None
++    except Exception:
++        return None
++
++
+ def _provider_body_estimate(body: Any) -> Dict[str, Any]:
+     try:
+         from agent.model_metadata import estimate_provider_body_tokens_rough
+diff --git a/hermes_cli/request_overlay.py b/hermes_cli/request_overlay.py
+index 52deeba..162cef8 100644
+--- a/hermes_cli/request_overlay.py
++++ b/hermes_cli/request_overlay.py
+@@ -17,7 +17,7 @@ from threading import Lock
+ from typing import Any
+ 
+ 
+-REQUEST_OVERLAY_SCHEMA_VERSION = "hermes.request_overlay.v1"
++REQUEST_OVERLAY_SCHEMA_VERSION = "hermes.request_overlay.v2"
+ OVERLAY_PENDING = "pending"
+ OVERLAY_KEPT = "kept"
+ OVERLAY_REMOVED_FINAL_BUDGET = "removed_final_budget"
+@@ -200,25 +200,6 @@ def _content_binding(content: Any) -> tuple[str, int, str]:
+     return digest, length, kind
+ 
+ 
+-def _existing_material(
+-    content: Any,
+-    *,
+-    carrier_kind: str,
+-    block: str,
+-) -> Any:
+-    if carrier_kind.endswith(":string"):
+-        token = f"{block}\n\n"
+-        if isinstance(content, str) and content.startswith(token):
+-            return content[len(token) :]
+-        return None
+-    if not isinstance(content, list) or not content:
+-        return None
+-    block_type = carrier_kind.rsplit(":", 1)[-1]
+-    if content[0] != _projection_block(block_type, block):
+-        return None
+-    return content[1:]
+-
+-
+ class RequestOverlay:
+     """One process-private request projection and its ownership proof."""
+ 
+@@ -292,6 +273,19 @@ class RequestOverlay:
+             else:
+                 self._disposition = OVERLAY_DRIFTED
+ 
++    def _filter_result(
++        self,
++        before: Mapping[str, Any],
++        after: dict[str, Any],
++        disposition: str,
++    ) -> RequestOverlayFilterResult:
++        return RequestOverlayFilterResult(
++            overlay=self,
++            before=before,
++            after=after,
++            disposition=disposition,
++        )
++
+     def _projection_exact(self, request: Mapping[str, Any]) -> bool:
+         shape = request_messages(request)
+         if self.status != "projected" or shape is None:
+@@ -438,7 +432,7 @@ class RequestOverlay:
+             estimated_tokens: Any = None,
+             estimate_source: Any = None,
+             estimate_confidence: Any = None,
+-        ) -> dict[str, Any]:
++        ) -> Any:
+             native = self.native_request(body, require_original_material=False)
+             if native is None or not validator(body, native):
+                 self._set_disposition(OVERLAY_DRIFTED)
+@@ -456,13 +450,18 @@ class RequestOverlay:
+                 and reserve >= 0
+             )
+             if not estimate_valid:
+-                self._set_disposition(OVERLAY_REMOVED_ESTIMATE_UNPROVEN)
+-                return native
++                return self._filter_result(
++                    body,
++                    native,
++                    OVERLAY_REMOVED_ESTIMATE_UNPROVEN,
++                )
+             if estimated_tokens + reserve > context_window_tokens:
+-                self._set_disposition(OVERLAY_REMOVED_FINAL_BUDGET)
+-                return native
+-            self._set_disposition(OVERLAY_KEPT)
+-            return body
++                return self._filter_result(
++                    body,
++                    native,
++                    OVERLAY_REMOVED_FINAL_BUDGET,
++                )
++            return self._filter_result(body, body, OVERLAY_KEPT)
+ 
+         try:
+             register(final_budget_guard, phase=PROVIDER_BODY_FILTER_FINAL_GUARD)
+@@ -473,6 +472,49 @@ class RequestOverlay:
+         return True
+ 
+ 
++class RequestOverlayFilterResult:
++    """Host-verified final-guard proposal for one owned overlay."""
++
++    def __init__(
++        self,
++        *,
++        overlay: RequestOverlay,
++        before: Mapping[str, Any],
++        after: dict[str, Any],
++        disposition: str,
++    ) -> None:
++        self.body = after
++        self._overlay = overlay
++        self._before_sha256 = canonical_request_sha256(before)
++        self._after_sha256 = canonical_request_sha256(after)
++        self._disposition = disposition
++
++    def _accept(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> bool:
++        try:
++            if (
++                canonical_request_sha256(before) != self._before_sha256
++                or canonical_request_sha256(after) != self._after_sha256
++            ):
++                return False
++            expected = (
++                before
++                if self._disposition == OVERLAY_KEPT
++                else self._overlay.native_request(
++                    before,
++                    require_original_material=False,
++                )
++            )
++            if (
++                expected is None
++                or canonical_request_sha256(expected) != self._after_sha256
++            ):
++                return False
++        except (TypeError, ValueError):
++            return False
++        self._overlay._set_disposition(self._disposition)
++        return True
++
++
+ def _blocked(
+     request: dict[str, Any],
+     *,
+@@ -603,9 +645,7 @@ def project_request_overlay(
+     boundary_count = _text_occurrences(request, boundary)
+     marker_count = _text_occurrences(request, marker_text)
+     body_count = _text_occurrences(request, body_text)
+-    if (namespace_count or boundary_count) and not (
+-        namespace_count == boundary_count == marker_count == 1
+-    ):
++    if namespace_count or boundary_count or marker_count:
+         return _blocked(
+             request,
+             reason="projection_namespace_conflict",
+@@ -615,39 +655,6 @@ def project_request_overlay(
+             body=body_text,
+             message_count=len(messages),
+         )
+-    if marker_count:
+-        material = _existing_material(
+-            content,
+-            carrier_kind=carrier_kind,
+-            block=block,
+-        )
+-        material_digest, material_length, material_kind = _content_binding(material)
+-        overlay = RequestOverlay(
+-            request=request,
+-            status="projected",
+-            reason="",
+-            marker_namespace=namespace,
+-            end_boundary=boundary,
+-            marker=marker_text,
+-            body=body_text,
+-            carrier_index=carrier_index,
+-            carrier_kind=carrier_kind,
+-            message_count=len(messages),
+-            carrier_material_sha256=material_digest,
+-            carrier_material_length=material_length,
+-            carrier_material_kind=material_kind,
+-        )
+-        if material_digest and overlay.verify_exact(request):
+-            return overlay
+-        return _blocked(
+-            request,
+-            reason="projection_marker_conflict",
+-            marker_namespace=namespace,
+-            end_boundary=boundary,
+-            marker=marker_text,
+-            body=body_text,
+-            message_count=len(messages),
+-        )
+     if body_count:
+         return _blocked(
+             request,
+diff --git a/tests/test_middleware.py b/tests/test_middleware.py
+index 14facdd..6bb7e11 100644
+--- a/tests/test_middleware.py
++++ b/tests/test_middleware.py
+@@ -573,6 +573,16 @@ def test_plugin_owned_provider_body_filters_compose_once_before_sdk(monkeypatch)
+     ]
+ 
+ 
++def test_transport_estimates_provider_body_without_registered_filters():
++    request = {"messages": [{"role": "user", "content": "hello"}]}
++    record = middleware.TransportRecord()
++
++    assert record.filter_provider_body(request) == request
++    assert record.provider_body_estimated_tokens is not None
++    assert record.provider_body_estimate_source == "hermes.provider_body.rough.v1"
++    assert record.provider_body_estimate_confidence == "heuristic_with_margin"
++
++
+ def test_invalid_provider_body_filter_fails_closed_without_blocking_sdk(monkeypatch):
+     from agent import relay_llm
+     from hermes_cli import plugins
+diff --git a/tests/test_request_overlay.py b/tests/test_request_overlay.py
+index 2c5f155..7c04364 100644
+--- a/tests/test_request_overlay.py
++++ b/tests/test_request_overlay.py
+@@ -9,9 +9,11 @@ from hermes_cli import request_overlay as request_overlay_module
+ from hermes_cli.request_overlay import (
+     OVERLAY_DRIFTED,
+     OVERLAY_KEPT,
++    OVERLAY_PENDING,
+     OVERLAY_REMOVED_ESTIMATE_UNPROVEN,
+     OVERLAY_REMOVED_FINAL_BUDGET,
+     REQUEST_OVERLAY_SCHEMA_VERSION,
++    RequestOverlayFilterResult,
+     project_request_overlay,
+ )
+ 
+@@ -34,18 +36,6 @@ def project(request, **kwargs):
+     )
+ 
+ 
+-class _FilterRecord:
+-    schema_version = middleware.TRANSPORT_SCHEMA_VERSION
+-
+-    def __init__(self) -> None:
+-        self.callback = None
+-        self.phase = ""
+-
+-    def register_provider_body_filter(self, callback, *, phase="transform"):
+-        self.callback = callback
+-        self.phase = phase
+-
+-
+ class RequestOverlayProjectionTests(unittest.TestCase):
+     def assert_projected(self, overlay) -> None:
+         self.assertEqual(overlay.status, "projected")
+@@ -171,12 +161,24 @@ class RequestOverlayProjectionTests(unittest.TestCase):
+                 self.assertEqual(overlay.status, "blocked")
+                 self.assertEqual(overlay.reason, "projection_namespace_conflict")
+ 
+-    def test_same_projection_is_idempotent_but_another_marker_is_blocked(self) -> None:
++    def test_preexisting_exact_projection_never_mints_removal_authority(self) -> None:
+         request = {"messages": [{"role": "user", "content": "current"}]}
+         first = project(request)
+-        second = project(first.request)
+-        self.assert_projected(second)
+-        self.assertEqual(second.request, first.request)
++
++        for content in (
++            first.request["messages"][0]["content"],
++            [
++                {"type": "text", "text": BLOCK},
++                {"type": "text", "text": "current"},
++            ],
++        ):
++            with self.subTest(kind=type(content).__name__):
++                authored = {"messages": [{"role": "user", "content": content}]}
++                blocked = project(authored)
++                self.assertEqual(blocked.status, "blocked")
++                self.assertEqual(blocked.reason, "projection_namespace_conflict")
++                self.assertEqual(blocked.request, authored)
++                self.assertIsNone(blocked.native_request(blocked.request))
+ 
+         other = project_request_overlay(
+             first.request,
+@@ -304,20 +306,32 @@ class RequestOverlayBudgetTests(unittest.TestCase):
+         self.assertEqual(self.overlay.disposition, OVERLAY_REMOVED_FINAL_BUDGET)
+ 
+     def test_unproven_estimate_has_a_distinct_removal_disposition(self) -> None:
+-        record = _FilterRecord()
++        record = middleware.TransportRecord()
+         self.assertTrue(self.register(record, window=100_000))
+-        filtered = record.callback(
+-            copy.deepcopy(self.overlay.request),
+-            estimated_tokens=None,
+-            estimate_source="unknown",
+-            estimate_confidence="unknown",
+-        )
++        unknown = {
++            "estimated_tokens": None,
++            "estimate_source": "unknown",
++            "estimate_confidence": "unknown",
++        }
++        with patch.object(middleware, "_provider_body_estimate", return_value=unknown):
++            filtered = record.filter_provider_body(self.overlay.request)
+         self.assertEqual(filtered["messages"][0]["content"], "current")
++        self.assertFalse(record.ambiguous)
+         self.assertEqual(
+             self.overlay.disposition,
+             OVERLAY_REMOVED_ESTIMATE_UNPROVEN,
+         )
+ 
++    def test_rejected_guard_result_does_not_commit_proposed_disposition(self) -> None:
++        record = middleware.TransportRecord()
++        self.assertTrue(self.register(record, window=1))
++        with patch.object(RequestOverlayFilterResult, "_accept", return_value=False):
++            filtered = record.filter_provider_body(self.overlay.request)
++
++        self.assertEqual(filtered, self.overlay.request)
++        self.assertTrue(record.ambiguous)
++        self.assertEqual(self.overlay.disposition, OVERLAY_PENDING)
++
+     def test_final_carrier_drift_is_visible_and_provider_is_not_blocked(self) -> None:
+         record = middleware.TransportRecord()
+         self.assertTrue(self.register(record, window=100_000))
+-- 
+2.50.1 (Apple Git-155)
+

@@ -4,13 +4,17 @@ import asyncio
 import copy
 import importlib
 import json
+import sqlite3
 import sys
+import tempfile
 import threading
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+
+from hermes_cli.request_overlay import RequestOverlayFilterResult
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +25,9 @@ if PACKAGE not in sys.modules:
     sys.modules[PACKAGE] = package
 
 runtime_module = importlib.import_module(f"{PACKAGE}.runtime")
+checkpoint_store_v3_module = importlib.import_module(
+    f"{PACKAGE}.checkpoint_store_v3"
+)
 ContinuityRuntime = runtime_module.ContinuityRuntime
 MARKER = runtime_module.CONTINUITY_MARKER
 
@@ -139,14 +146,6 @@ class FakeAdapter:
         self.read_count += 1
         return copy.deepcopy(self.value)
 
-    def compare_and_swap_checkpoint(self, session_id: str, **kwargs) -> dict:
-        self.cas_calls.append({"session_id": session_id, **copy.deepcopy(kwargs)})
-        if self.cas_ok:
-            return {"ok": True, "status": "applied"}
-        if self.cas_error:
-            return {"ok": False, "error": self.cas_error}
-        return {"ok": False, "status": "conflict"}
-
     def settle_checkpoint_delivery(self, session_id: str, **kwargs) -> dict:
         candidate = kwargs.get("checkpoint_candidate")
         if candidate is None:
@@ -214,10 +213,15 @@ class FakeLlm:
         self.result = result or LlmResult()
         self.include_completion_marker = include_completion_marker
         self.calls = 0
+        self.recall_queries = 0
 
     async def acomplete(self, messages, **kwargs):
-        self.calls += 1
-        text = self.result.text
+        if kwargs.get("purpose") == "thread_continuity_recall_query":
+            self.recall_queries += 1
+            text = json.dumps({"queries": [], "start_at": None, "end_at": None})
+        else:
+            self.calls += 1
+            text = self.result.text
         if self.include_completion_marker:
             marker = next(
                 str(row.get("content") or "").splitlines()[-1]
@@ -270,7 +274,15 @@ class FakeTransportRecord:
         filters = sorted(self._filters, key=lambda item: item[0] == "final_guard")
         for _phase, callback in filters:
             try:
-                current = callback(current, **self._estimate(current))
+                result = callback(current, **self._estimate(current))
+                if isinstance(result, RequestOverlayFilterResult):
+                    accepted = result.body
+                    if not result._accept(current, accepted):
+                        self.ambiguous = True
+                        continue
+                    current = accepted
+                else:
+                    current = result
             except Exception:
                 self.ambiguous = True
         estimate = self._estimate(current)
@@ -434,6 +446,39 @@ def post(
 
 
 class ContinuityRuntimeTests(unittest.TestCase):
+    def test_full_prefix_overflow_leaves_native_request_unchanged_and_visible(
+        self,
+    ) -> None:
+        value = bundle()
+        value["source"] = {
+            "status": "overflow",
+            "groups": [],
+            "source_prefix_ids": [],
+            "source_snapshot": "",
+            "scan_complete": False,
+            "error": "source_physical_row_limit_exceeded",
+            "stats": {
+                "full_prefix": False,
+                "returned_groups": 0,
+                "compacted_prefix_group_ids": [],
+                "physical_row_count_at_least": 2_049,
+                "max_physical_rows": 2_048,
+            },
+        }
+        adapter = FakeAdapter(value)
+        compiler = FakeCompiler(checkpoint("unused"))
+        runtime = make_runtime(adapter, compiler)
+        original = request()
+
+        self.assertIsNone(project(runtime, original))
+        self.assertEqual(original, request())
+        self.assertEqual(compiler.calls, [])
+        status = json.loads(runtime.status_command())
+        self.assertEqual(
+            status["reason_counts"],
+            {"source_physical_row_limit_exceeded": 1},
+        )
+
     def test_real_extracted_compiler_reaches_projection_and_settlement(self) -> None:
         value = bundle()
         groups = [exact_group(1), exact_group(2)]
@@ -536,6 +581,33 @@ class ContinuityRuntimeTests(unittest.TestCase):
 
                 self.assertEqual(calls, [original])
                 self.assertEqual(adapter.cas_calls, [])
+
+    def test_user_authored_exact_current_block_never_mints_overlay_authority(self) -> None:
+        seed_runtime = make_runtime(FakeAdapter(bundle()), FakeCompiler(checkpoint("bridge")))
+        seed = project(seed_runtime, request())
+        self.assertIsNotNone(seed)
+        plan = seed_runtime._turns[("s1", "t1")]
+        exact_block = f"{plan.marker}\n{plan.bridge_body}"
+
+        contents = (
+            f"{exact_block}\n\nactual",
+            [
+                {"type": "text", "text": exact_block},
+                {"type": "text", "text": "actual"},
+            ],
+        )
+        for content in contents:
+            with self.subTest(kind=type(content).__name__):
+                adapter = FakeAdapter(bundle())
+                runtime = make_runtime(adapter, FakeCompiler(checkpoint("bridge")))
+                original = request()
+                original["messages"][-1]["content"] = content
+
+                self.assertIsNone(project(runtime, original))
+                _result, calls = execute(runtime, original, original)
+
+                self.assertEqual(calls, [original])
+                self.assertEqual(adapter.cas_calls, [])
                 self.assertEqual(adapter.metadata_store.rows, [])
 
     def test_old_checkpoint_projects_without_rewriting_revision(self) -> None:
@@ -607,54 +679,6 @@ class ContinuityRuntimeTests(unittest.TestCase):
         self.assertEqual(calls, [downstream])
         self.assertEqual(calls[0]["messages"][-1]["content"][-1], hot_block)
         self.assertEqual(len(adapter.cas_calls), 1)
-
-    def test_large_carrier_proof_hashes_only_the_bound_adjacent_material(self) -> None:
-        carriers = {
-            "one-megabyte-string": "x" * 1_000_000,
-            "ten-thousand-parts": [
-                {"type": "input_text", "text": f"part-{index}"}
-                for index in range(10_000)
-            ],
-        }
-        for name, content in carriers.items():
-            with self.subTest(name=name):
-                adapter = FakeAdapter(bundle())
-                compiler = FakeCompiler(checkpoint("bridge"))
-                runtime = ContinuityRuntime(
-                    adapter,
-                    FakeLlm(),
-                    compiler=compiler,
-                    estimator=lambda messages: max(1, len(repr(messages)) // 4),
-                    clock=lambda: "2026-08-30T00:00:00+00:00",
-                )
-                original = request()
-                original["messages"][-1]["content"] = content
-                projected = project(
-                    runtime,
-                    original,
-                    context_window_tokens=2_000_000,
-                )
-                calls = 0
-                content_sha256 = runtime._content_sha256
-
-                def counted(value):
-                    nonlocal calls
-                    calls += 1
-                    return content_sha256(value)
-
-                runtime._content_sha256 = counted
-                _result, provider_calls = execute(
-                    runtime,
-                    projected["request"],
-                    original,
-                    context_window_tokens=2_000_000,
-                )
-
-                self.assertEqual(len(provider_calls), 1)
-                self.assertIn("bridge", repr(provider_calls[0]))
-                # execution proof, final-body filter, and captured-body proof
-                # each hash one deterministic adjacent slice; none scans.
-                self.assertLessEqual(calls, 3)
 
     def test_codex_sanitize_stages_the_provider_bound_request_hash(self) -> None:
         adapter = FakeAdapter(bundle())
@@ -1289,6 +1313,63 @@ class ContinuityRuntimeTests(unittest.TestCase):
                 self.assertEqual(result["content"], "summary")
                 self.assertEqual(messages, original)
 
+    def test_summary_omits_pixels_before_hash_copy_and_provider_call(self) -> None:
+        class Pixels:
+            def __deepcopy__(self, memo):
+                raise AssertionError("historical pixels copied")
+
+        class InspectLlm(FakeLlm):
+            async def acomplete(self, messages, **kwargs):
+                serialized = json.dumps(messages, ensure_ascii=False)
+                self_test.assertNotIn("image_url", serialized)
+                self_test.assertNotIn("input_image", serialized)
+                self_test.assertIn("not unseen details", serialized)
+                self_test.assertIn(expected, serialized)
+                return await super().acomplete(messages, **kwargs)
+
+        self_test = self
+        for expected in (
+            "这次用表情表达反讽，不是画面描述",
+            "已识别信息：图表标注为 12；模糊数字未知",
+            "已保藏：pic_007；语义：用户指定保留的设计参考",
+        ):
+            for kind in ("image_url", "input_image", "bedrock"):
+                with self.subTest(meaning=expected, kind=kind):
+                    pixels = Pixels()
+                    image = ({"image": {"source": {"bytes": pixels}}}
+                             if kind == "bedrock" else
+                             {"type": kind, "image_url": {"url": pixels}})
+                    content = [{"type": "text", "text": expected}, image]
+                    messages = [{"role": "user", "content": content}]
+                    runtime = make_runtime(FakeAdapter(bundle()), FakeCompiler(None), llm=InspectLlm())
+                    result = asyncio.run(runtime._summary_call({"max_output_tokens": 128}, messages))
+                    self.assertNotIn("status", result)
+                    self.assertIs(messages[0]["content"], content)
+                    self.assertIs(content[1], image)
+                    self.assertEqual(runtime.plugin_llm.calls, 1)
+
+    def test_image_omission_does_not_invent_semantics_or_saved_numbers(self) -> None:
+        image = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+        projected = runtime_module._summary_source_content(image)
+        self.assertNotIn("AAAA", json.dumps(projected))
+        self.assertIn("not unseen details", projected[0]["text"])
+        self.assertNotIn("pic_", json.dumps(projected))
+        self.assertNotIn("description", projected[0])
+
+    def test_summary_image_policy_does_not_remove_current_turn_attachment(self) -> None:
+        runtime = make_runtime(FakeAdapter(bundle()), FakeCompiler(checkpoint("bridge")))
+        wire = request()
+        content = [{"type": "text", "text": "current image"},
+                   {"type": "image_url", "image_url": {"url": "data:image/png;base64,CURRENT"}}]
+        wire["messages"][-1]["content"] = content
+        original = copy.deepcopy(wire)
+        projected = project(runtime, wire)
+        projected_content = projected["request"]["messages"][-1]["content"]
+        self.assertEqual(projected_content[1:], content)
+        self.assertEqual(len(projected_content), len(content) + 1)
+        self.assertIn(MARKER.split(" marker=", 1)[0], projected_content[0]["text"])
+        self.assertEqual(wire, original)
+
     def test_missing_post_error_or_execution_drift_never_publishes(self) -> None:
         adapter = FakeAdapter(bundle())
         compiler = FakeCompiler(checkpoint("bridge"))
@@ -1542,6 +1623,90 @@ class ContinuityRuntimeTests(unittest.TestCase):
             [row["status"] for row in adapter.metadata_store.rows],
             ["delivered_checkpoint_conflict", "delivered_checkpoint_conflict"],
         )
+
+    def test_v3_retry_records_namespaced_unchanged_without_second_cas(self) -> None:
+        from test_checkpoint_v3 import checkpoint_fixture
+        from test_hermes_adapter import ContinuityMetadataStore
+
+        candidate = checkpoint_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "continuity.sqlite3"
+            store = ContinuityMetadataStore(path)
+            checkpoint_store_v3_module.initialize_checkpoint_store_v3(store)
+
+            class ValidHistoryIndex:
+                @staticmethod
+                def validate_checkpoint(value, **_kwargs):
+                    return copy.deepcopy(value)
+
+            class IndexedAdapter:
+                def __init__(self):
+                    self.metadata_store = store
+                    self.history_index = ValidHistoryIndex()
+                    self.cas_calls = []
+
+                @staticmethod
+                def read_bundle(_session_id, **_kwargs):
+                    return bundle()
+
+                def settle_checkpoint_delivery(self, session_id, **kwargs):
+                    self.cas_calls.append(copy.deepcopy(kwargs))
+                    return checkpoint_store_v3_module.settle_checkpoint_delivery_v3(
+                        self.metadata_store,
+                        session_id,
+                        expected_revision=kwargs["expected_revision"],
+                        checkpoint_candidate=kwargs["checkpoint_candidate"],
+                        receipt_id=kwargs["receipt_id"],
+                        validate_checkpoint_source=(
+                            self.history_index.validate_checkpoint
+                        ),
+                        source_ids=kwargs["source_ids"],
+                        hashes=kwargs["hashes"],
+                        counts=kwargs["counts"],
+                    )
+
+            adapter = IndexedAdapter()
+            runtime = make_runtime(adapter, FakeCompiler(candidate))
+            try:
+                original = request()
+                for api_request_id in ("a1", "a2"):
+                    projected = project(
+                        runtime, original, api=api_request_id
+                    )
+                    self.assertIsNotNone(projected)
+                    execute(
+                        runtime,
+                        projected["request"],
+                        original,
+                        api=api_request_id,
+                    )
+                    post(runtime, api=api_request_id)
+
+                with sqlite3.connect(path) as connection:
+                    receipts = connection.execute(
+                        "SELECT receipt_id,status FROM continuity_receipts "
+                        "ORDER BY rowid"
+                    ).fetchall()
+                    revision = connection.execute(
+                        "SELECT revision FROM continuity_checkpoints_v3"
+                    ).fetchone()[0]
+                self.assertEqual(len(adapter.cas_calls), 1)
+                self.assertEqual(revision, 1)
+                self.assertEqual(
+                    [status for _receipt_id, status in receipts],
+                    [
+                        "delivered_checkpoint_stored_unvalidated",
+                        "delivered_checkpoint_unchanged",
+                    ],
+                )
+                self.assertTrue(
+                    all(
+                        receipt_id.startswith("v3:")
+                        for receipt_id, _status in receipts
+                    )
+                )
+            finally:
+                runtime.clear()
 
     def test_non_conflict_cas_failure_is_persistently_reported_as_failed(self) -> None:
         adapter = FakeAdapter(

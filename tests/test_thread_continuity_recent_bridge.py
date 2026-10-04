@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib
 import sys
 import types
@@ -15,7 +16,6 @@ if PACKAGE not in sys.modules:
     sys.modules[PACKAGE] = package
 
 context_compactor = importlib.import_module(f"{PACKAGE}.context_compactor")
-build_thread_continuity_checkpoint = context_compactor.build_thread_continuity_checkpoint
 build_thread_continuity_checkpoint_v2 = (
     context_compactor.build_thread_continuity_checkpoint_v2
 )
@@ -52,29 +52,60 @@ def estimate(messages: list[dict]) -> int:
 
 
 class ThreadContinuityRecentBridgeTests(unittest.TestCase):
-    def test_v1_is_conservatively_read_as_retirement_with_unverified_bridge(self) -> None:
+    def test_recent_bridge_budgets_the_same_image_representation_as_summary(self) -> None:
+        rows = [
+            group("text", "2026-08-15T12:00:00Z", "已记录的决定"),
+            group("image", "2026-08-16T12:00:00Z", "图中是报告；保藏编号 PIC-007"),
+        ]
+        rows[1]["messages"][0]["content"] = [
+            {"type": "text", "text": "图中是报告；保藏编号 PIC-007"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 65536}},
+        ]
+        original = copy.deepcopy(rows)
+        expected_messages = [
+            {"role": message["role"], "content": context_compactor._summary_source_content(message["content"])}
+            for row in rows for message in row["messages"]
+        ]
+        limit = estimate(expected_messages)
+        policy = dict(
+            reference_at="2026-08-16T16:00:00Z",
+            recent_horizon_hours=72,
+            source_token_limit=limit,
+            estimate_messages=estimate,
+        )
+        selected = select_thread_continuity_recent_bridge(
+            rows, retired_source_group_ids=["text", "image"], **policy,
+        )
+        compact = context_compactor._select_compact_recent_bridge(rows, **policy)
+        self.assertEqual(selected["source_group_ids"], ["text", "image"])
+        self.assertEqual(compact["source_group_ids"], selected["source_group_ids"])
+        self.assertEqual(selected["estimated_source_tokens"], limit)
+        self.assertEqual(compact["source_slice_fingerprint"], selected["source_slice_fingerprint"])
+        self.assertEqual(rows, original)
+        self.assertEqual(compact["groups"], original)
+        # The representation change does not bypass an actual text budget.
+        too_small = select_thread_continuity_recent_bridge(
+            rows, retired_source_group_ids=["text", "image"],
+            **{**policy, "source_token_limit": 1},
+        )
+        self.assertEqual(too_small["status"], "empty")
+
+    def test_unexpected_top_level_v1_is_unsupported_and_never_projected(self) -> None:
         rows = [
             group("g-1", "2026-08-10T00:00:00Z", "旧一"),
             group("g-2", "2026-08-11T00:00:00Z", "旧二"),
         ]
-        v1 = build_thread_continuity_checkpoint(
-            previous_state=None,
-            source_groups=rows,
-            covered_source_group_ids=["g-1", "g-2"],
-            summary_text="旧 lifetime summary 只作迁移兼容正文",
-        )
+        v1 = {
+            "schema": "thread_continuity_checkpoint.v1",
+            "summary_text": "unexpected legacy body",
+            "covered_through": {"source_prefix_ids": ["g-1", "g-2"]},
+        }
 
-        normalized = normalize_thread_continuity_checkpoint(v1, source_groups=rows)
-        bridge = thread_continuity_bridge_projection(normalized)
-
-        self.assertEqual(
-            thread_continuity_retirement_source_group_ids(normalized),
-            ["g-1", "g-2"],
-        )
-        self.assertEqual(bridge["status"], "legacy_unverified")
-        self.assertEqual(bridge["relation"], "legacy_unverified")
-        self.assertEqual(bridge["represented_source_group_ids"], [])
-        self.assertEqual(bridge["body"], "旧 lifetime summary 只作迁移兼容正文")
+        with self.assertRaisesRegex(ValueError, "thread_continuity_checkpoint_invalid"):
+            normalize_thread_continuity_checkpoint(v1, source_groups=rows)
+        self.assertEqual(thread_continuity_retirement_source_group_ids(v1), [])
+        bridge = thread_continuity_bridge_projection(v1)
+        self.assertEqual((bridge["status"], bridge["body"]), ("empty", ""))
 
     def test_recent_bridge_slice_is_contiguous_recent_and_token_bounded(self) -> None:
         rows = [

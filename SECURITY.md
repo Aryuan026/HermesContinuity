@@ -6,8 +6,11 @@ revisions.
 
 ## Data boundaries
 
-- Hermes `state.db` is opened through `SessionDB(read_only=True)` and remains
-  the canonical transcript owner.
+- The active Hermes profile's `state.db` is opened through
+  `SessionDB(read_only=True)` and remains the canonical transcript owner.
+- Continuity metadata is fixed under the same profile's Hermes-owned
+  `plugin-data/<host-owned-plugin-namespace>/` directory. Neither database
+  path is configurable by the plugin.
 - The plugin does not copy canonical messages, create FTS/search storage, or
   register a search tool. Exact historical sentences remain retrievable through
   Hermes native `session_search`.
@@ -19,6 +22,10 @@ revisions.
   without minting an `api_request_error` receipt.
 - `api_content` may be audited for collision detection but is never used as
   continuity body material.
+- Hermes `session_meta`, hidden provider scaffolds, and clean-content-empty
+  provider sidecars are excluded from source material. An inbound empty row
+  with a platform message identity remains ambiguous rather than being
+  silently discarded.
 - The canonical-window service may return canonical message bodies only in its
   synchronous in-process response. Its trace and delivery receipts never
   persist those canonical bodies, and the checkpoint store persists only a
@@ -57,11 +64,11 @@ fail closed.
 
 The checkpoint update and its delivery receipt commit in one metadata-database
 transaction. Source rereads occur before that transaction, so a long source
-scan cannot hold the metadata write lock. Plugin registration rejects a
-metadata path that resolves to Hermes `state.db`, including symlink/hardlink
-aliases. Before any Continuity table is created, the metadata store also
-rejects Hermes canonical tables, a foreign/malformed owner, and unclaimed
-nonempty SQLite schema; a valid store carries one single-plugin owner claim.
+scan cannot hold the metadata write lock. The fixed canonical and metadata
+paths are derived from the same active profile rather than caller input.
+Before any Continuity table is created, the metadata store rejects Hermes
+canonical tables, a foreign/malformed owner, and unclaimed nonempty SQLite
+schema; a valid store carries one single-plugin owner claim.
 
 `api_mode=codex_app_server` is deliberately unsupported in v1 and receives no
 projection. MoA prepared requests remain transport-ambiguous and cannot publish
@@ -69,13 +76,16 @@ a checkpoint or delivery receipt.
 
 ## Host patch
 
-The plugin requires the eight ordered generic host seams in `patches/`: finish
+The plugin distribution records twelve ordered generic host seams in `patches/`:
+finish
 reason exposure, sequential request middleware, profile-scoped services,
 bounded SessionDB time-window reads, provider-body transport truth, closed
 finish-state normalization, final provider-body budget controls, and verified
-wakeup provenance. Review and apply them to the documented compatible Hermes
+wakeup provenance, followed by manifest-v2 installer alignment and joint
+Doctor support, then shared request-overlay ownership/proof and host-accepted
+overlay disposition. Review and apply them to the documented compatible Hermes
 base before installation. Plugin registration fails visibly when a required
-schema or API is absent.
+runtime schema or API is absent.
 
 Report vulnerabilities through a private GitHub security advisory. Do not put
 conversation content, credentials, local paths, or runtime database excerpts in
