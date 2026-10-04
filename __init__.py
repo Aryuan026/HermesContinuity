@@ -105,6 +105,7 @@ def register(ctx: Any) -> None:
         ),
         max_full_prefix_bytes=ctx.get_config("max_full_prefix_bytes", default=4_194_304),
     )
+    ctx.on_unload(adapter.close)
     canonical_source_service = ContinuityCanonicalSourceService(
         adapter,
         additional_human_sources=additional_human_sources,

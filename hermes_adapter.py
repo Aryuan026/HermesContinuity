@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Mapping, Sequence
 from .context_compactor import (
     _content_hash,
     _content_to_text,
+    HistoryValue,
     normalize_complete_thread_groups,
     normalize_thread_continuity_checkpoint,
 )
@@ -101,6 +102,12 @@ class _ProjectionError(ValueError):
     pass
 
 
+def _history_footprint(value: Any) -> Any:
+    if isinstance(value, HistoryValue):
+        return value.footprint()
+    raise TypeError("source_row_not_json")
+
+
 def _json_text(value: Any) -> str:
     try:
         return json.dumps(
@@ -108,6 +115,7 @@ def _json_text(value: Any) -> str:
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+            default=_history_footprint,
         )
     except (TypeError, ValueError) as exc:
         raise _ProjectionError("source_row_not_json") from exc
@@ -428,10 +436,14 @@ def _project_canonical_source(
     full_prefix: bool,
     max_groups: int | None = None,
     include_lineage_proofs: bool = False,
+    identity_occurrences: Any = None,
+    group_occurrences: Any = None,
+    prior_group_count: int = 0,
+    include_group_boundaries: bool = False,
 ) -> Dict[str, Any]:
     """Run the retained canonical-row grouping algorithm."""
 
-    occurrences: Dict[str, int] = defaultdict(int)
+    occurrences = identity_occurrences if identity_occurrences is not None else defaultdict(int)
     prepared: List[Dict[str, Any]] = []
     try:
         for row in canonical:
@@ -466,8 +478,11 @@ def _project_canonical_source(
     group_compacted: List[bool] = []
     lineage_proofs: List[Dict[str, str]] = []
     pending_users: List[Dict[str, Any]] = []
-    group_occurrences: Dict[str, int] = defaultdict(int)
-    for row in prepared:
+    group_occurrences = group_occurrences if group_occurrences is not None else defaultdict(int)
+    group_ends: List[int] = []
+    group_starts: List[int] = []
+    pending_start: int | None = None
+    for row_index, row in enumerate(prepared):
         role = row["_continuity_role"]
         if _is_compaction_summary(row) or role in {
             "system",
@@ -491,9 +506,11 @@ def _project_canonical_source(
         if not _content_to_text(row.get("content")):
             return _failed_source("ambiguous", "source_visible_content_invalid")
         if role == "user":
+            if not pending_users:
+                pending_start = row_index
             pending_users.append(row)
             continue
-        if not pending_users and not groups:
+        if not pending_users and not groups and not prior_group_count:
             return _failed_source("ambiguous", "proactive_event_unverified")
 
         assistant_id = row["_continuity_message_id"]
@@ -523,7 +540,12 @@ def _project_canonical_source(
                     "ambiguous", "consecutive_user_content_unmergeable"
                 )
             evidence = _source_evidence(pending_users[-1])
-            if any(_source_evidence(pending) != evidence for pending in pending_users):
+            # Continuity retains the whole dialogue without granting a source
+            # class. The separate typed Global Hot window still requires one
+            # consistent provenance for every merged user row.
+            if include_lineage_proofs and any(
+                _source_evidence(pending) != evidence for pending in pending_users
+            ):
                 return _failed_source("ambiguous", "source_evidence_ambiguous")
             user_hash = _content_hash(user_content)
             group_kind = "dialogue_turn"
@@ -583,6 +605,8 @@ def _project_canonical_source(
             "messages": messages,
         }
         groups.append(group)
+        group_starts.append(pending_start if pending_start is not None else row_index)
+        group_ends.append(row_index + 1)
         group_compacted.append(
             all(not _active(message) and _compacted(message) for message in persisted_rows)
         )
@@ -597,6 +621,7 @@ def _project_canonical_source(
                 }
             )
         pending_users = []
+        pending_start = None
         if max_groups is not None and len(groups) > max_groups:
             return _failed_source("overflow", "source_group_limit_exceeded")
 
@@ -627,6 +652,11 @@ def _project_canonical_source(
     }
     if include_lineage_proofs:
         result["_lineage_group_proofs"] = lineage_proofs
+    if include_group_boundaries:
+        result["_group_ends"] = group_ends
+        result["_group_starts"] = group_starts
+        result["_group_compacted"] = group_compacted
+        result["_consumed_rows"] = pending_start if pending_start is not None else len(canonical)
     return result
 
 
@@ -652,6 +682,18 @@ class HermesSessionAdapter:
         if type(max_full_prefix_bytes) is not int or not 1 <= max_full_prefix_bytes <= 2**31 - 1:
             raise ValueError("max_full_prefix_bytes_invalid")
         self.max_full_prefix_bytes = max_full_prefix_bytes
+        self.history_index = None
+        if metadata_store is not None and all(callable(getattr(type(session_db), name, None)) for name in (
+            "prepare_history_step", "read_history_page", "seal_history_prefix", "validate_history_prefix",
+        )):
+            from .history_index import ContinuityHistoryIndex
+            from .checkpoint_store_v3 import initialize_checkpoint_store_v3
+            initialize_checkpoint_store_v3(metadata_store)
+            self.history_index = ContinuityHistoryIndex(session_db, metadata_store)
+
+    def close(self) -> None:
+        if self.history_index is not None:
+            self.history_index.close()
 
     def _read_full_source_rows(self, session_id: str) -> tuple[list, list]:
         """Probe before payload transfer, using one short host-owned snapshot.
@@ -699,7 +741,15 @@ class HermesSessionAdapter:
         canonical = db._dedupe_compacted_message_rows(visible)
         return db._decode_message_rows(rows), db._decode_message_rows(canonical)
 
-    def read_source(self, session_id: str) -> Dict[str, Any]:
+    def read_source(self, session_id: str, *, reference_at: str | None = None,
+                    recent_horizon_hours: int = 72) -> Dict[str, Any]:
+        if self.history_index is not None:
+            return self.history_index.read_source(
+                session_id, reference_at=reference_at or datetime.now(timezone.utc).isoformat(),
+                recent_horizon_hours=recent_horizon_hours,
+                max_rows=min(self.max_full_prefix_physical_rows, 2048),
+                max_bytes=min(self.max_full_prefix_bytes, 4*1024*1024),
+            )
         session_id = str(session_id or "").strip()
         if not session_id:
             return _failed_source("unavailable", "session_id_invalid")
@@ -921,8 +971,33 @@ class HermesSessionAdapter:
             },
         }
 
-    def read_bundle(self, session_id: str) -> Dict[str, Any]:
-        source = self.read_source(session_id)
+    def read_bundle(self, session_id: str, *, reference_at: str | None = None,
+                    recent_horizon_hours: int = 72) -> Dict[str, Any]:
+        source = self.read_source(session_id, reference_at=reference_at,
+                                  recent_horizon_hours=recent_horizon_hours)
+        if self.history_index is not None:
+            if source.get("status") != "ready":
+                return {"source": source, "continuity": {
+                    "status": "unavailable", "state": {}, "error": "source_unavailable"}}
+            from .checkpoint_store_v3 import read_checkpoint_v3
+            from .checkpoint_v3 import canonical_proof_sha256
+            continuity = read_checkpoint_v3(
+                self.metadata_store, session_id,
+                validate_checkpoint_source=lambda checkpoint: self.history_index.validate_checkpoint(
+                    checkpoint, session_id=session_id),
+            )
+            if continuity.get("status") == "ready":
+                checkpoint = continuity["state"]["checkpoint"]
+                continuity["state"]["checkpoint_validation"] = {
+                    "schema": "thread_continuity_checkpoint_validation.v1", "status": "valid",
+                    "checkpoint_revision_id": checkpoint["revision_id"],
+                    "checkpoint_source_proof_sha256": canonical_proof_sha256(checkpoint["source_proof"]),
+                    "checkpoint_retirement_cursor_sha256": canonical_proof_sha256(checkpoint["retirement_cursor"]),
+                    "current_source_snapshot": source["source_snapshot"],
+                    "current_retirement_eligibility_sha256": canonical_proof_sha256(source["retirement_eligibility"]),
+                    "body_included": False,
+                }
+            return {"source": source, "continuity": continuity}
         continuity = (
             self.metadata_store.read_continuity(session_id, source)
             if self.metadata_store is not None
@@ -945,6 +1020,15 @@ class HermesSessionAdapter:
     ) -> Dict[str, Any]:
         if self.metadata_store is None:
             return {"ok": False, "status": "failed", "error": "metadata_store_unavailable"}
+        if self.history_index is not None:
+            from .checkpoint_store_v3 import settle_checkpoint_delivery_v3
+            return settle_checkpoint_delivery_v3(
+                self.metadata_store, session_id, expected_revision=expected_revision,
+                checkpoint_candidate=checkpoint_candidate, receipt_id=receipt_id,
+                source_ids=source_ids, hashes=hashes, counts=counts, recorded_at=recorded_at,
+                validate_checkpoint_source=lambda checkpoint: self.history_index.validate_checkpoint(
+                    checkpoint, session_id=session_id),
+            )
         return self.metadata_store.settle_checkpoint_delivery(
             session_id,
             expected_revision=expected_revision,

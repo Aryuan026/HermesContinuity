@@ -49,11 +49,106 @@ The exported patch SHA-256 values, in application order, are:
 10. `99b4847dc3af412f6a0696735021d8ee0a33f6364bab93c426c12f36332e2cfb`
 11. `f3e70e70b0811beb390ef034d1c080497724f3061d93c83ae0329bdd7547f2c6`
 12. `ee52adf371717dc4529ddc6d9b678db92214afb3146393c695cdf45b617addd3`
+13. `1791c7a384b96d7b4e299334bd5b36c9ca20065e3e262e16aae0309ae9e5cfeb`
+14. `b7e388fcf5ffefbe4b3665974d0fa1ab6a2b4a425986df2a6de0254d4dde91f3`
+15. `77aa8db643df87618413ec3c86333790ef53dc219fa8d70b82d2b797c880f0c5`
+16. `a6c726f18cd7fdb49b95c2a843e6d2e90f0ea383f324be897a6aca00f7eb46cc`
+17. `60a6332287346b4ef217efd76fc16a297e3267a6bac2fcfbed605009d7e6f41e`
+18. `89d5866af9e8de1e4964f39721068e080523990f248f650044c58d2d5d26f2b4`
+19. `fe6a6c691d2a3dc0de4ee54dacc3dc8423e5514c681383d313a12ea783e60ecb`
+
+Patch 13 (`hermes-0.20.5-incremental-history.patch`) is the additive Block 3
+canonical journal/index seam. It is exported from compatibility-host commit
+`60a36dda4387db20ce5777ead59e7a308672b061`, tree
+`f800b2dd1698f93138404535a350c8f08a873646`, whose parent materializes the
+unchanged first twelve patches. Those original artifacts are not rewritten.
+This is an implementation candidate on the named 0.20.5 lane, not a port to
+0.21.3 or a selected deployment artifact.
+
+Patch 14 (`hermes-0.20.5-history-value-guard.patch`) appends the
+Block 3 correction surface: SQLite value limits before size probes and page
+fetches, with borrowed connection limits and outer transactions restored.
+Compatibility-host commit `a488b6ebf46765a7323bb3e862bcbb77bccbd172`, tree
+`fa9a9030295b769c0e391ca860e3ebe1cd1e3b46`, is a direct child of the patch-13
+host above. The original thirteen patch artifacts remain byte-identical.
+The owner relayed Block 3 source acceptance at `191853bf`.
+
+Patch 15 (`hermes-0.20.5-history-quantum-progress.patch`) is the Block 4
+target preparation-granularity correction, host commit
+`9364e363b0d57a17399972e0a094d55369e8fd41`, tree
+`87846e90406265717a904fc7e0a581e41c032579`, a direct child of patch 14.
+Building, resetting and physical-prefix finalization stop between complete
+rows halfway through the existing quantum to leave time for legal cursor
+publication; the original SQL deadline and rollback remain in force. This is
+not a strict wall-clock guarantee or a change to source-validity, grouping,
+checkpoint or provider contracts. Original fourteen artifacts are unchanged.
+External review of this additional correction and target deployment are pending.
+
+Patch 16 (`hermes-0.20.5-history-origin-recovery.patch`) is exported from host
+`ff67db0d2fdf1a08c02aedccedb77f29a7549a24`, tree
+`d9553785cda565b177b077f7784309bd116264cf`, a direct child of patch 15.
+The shared Gateway replay helper preserves producer display metadata before
+compaction. Indexed history restores a missing user-clone notification tag
+only from its earlier archived explicit notification, after both complete raw
+and decoded signatures match with that one field restored. Physical member
+signatures and canonical message rows are not rewritten. Rule identity v2
+invalidates old proofs and rebuilds their derived index with the existing
+bounded worker; no checkpoint or database schema is changed. The first fifteen
+artifacts, plugin compiler and Global Hot remain unchanged. This source
+candidate is not deployed and does not establish whole-owner-history readiness.
+
+Patch 17 (`hermes-0.20.5-history-streamed-values.patch`) is exported from
+`e654daaa11d5f960b26edc40cabc58f44e7b53fc`, tree
+`dadd41d44e0418d601c7d9c4bdf8267ca667fb7d`. Its direct parent is a local
+materialization of the unchanged sixteen-patch tree `d9553785...`, not a claim
+to reconstruct the original `ff67db0d` commit history. It adds cooperative
+64-KiB SQLite value work, complete raw/semantic identity hashes, checksummed
+body-free range descriptors and snapshot-validated deferred reads. No SQLite
+connection or blob survives a preparation quantum. Only completed values
+advance record proofs; captured same-row edits restart unfinished work, while
+unrelated tail appends do not. Rule v3 invalidates older derived proofs.
+The first sixteen exported artifacts remain byte-identical. Plugin adaptation
+uses actual complete content hashes for identity and private descriptor sizes
+only for admission; historical image pixels remain excluded only from summary
+input. This is not a port to 0.21.x or a selected production artifact.
+
+Patch 18 (`hermes-0.20.5-history-native-search.patch`) is exported from
+`69baf5efd01de0b375cf58c37c8da668fba15677`, tree
+`013ab213b91836df2cb9d2bf3854e2aea625520c`. The single exported diff spans
+the generic seam, deterministic fixture, and owner-copy query-plan correction after patch
+17's local materialization; it does not rewrite either local commit.
+It reuses Hermes native search routing/grammar and returns
+only bounded canonical positions under a verified domain token and SQL deadline.
+It does not return snippets, decode neighboring bodies, repair FTS, create a
+search store or register a tool. Native newest-posting order and the existing
+winner index avoid domain-first rescans and global clone BM25 scoring. The
+first seventeen artifacts are unchanged.
+The owner-approved plugin adaptation selects complete verified groups for an
+ephemeral question-driven request reference, independently of checkpoint
+retirement. This new retrieval composition is not presented as an unchanged
+donor algorithm: donor compiler/checkpoint selection and CAS are retained;
+Hermes owns candidate search, and two bounded existing host auxiliary calls
+plan keywords and select/summarize candidates. No donor source is modified.
+
+Patch 19 (`hermes-0.20.5-history-value-member-lifecycle.patch`) is the narrow
+`B4-GIANT-REWIND-01` correction, exported from host commit
+`964c65abfe7b646dca284737e41f62c37d6324f6`, tree
+`d212962d9c0a0a49000d1132fe9e5b68d739821a`, directly after patch 18's
+`69baf5ef` materialization. The proof INSERT selects only the actual parent
+member inside the existing preparation transaction. A legally rewound row
+still advances the physical scan without creating a canonical member or
+child proof. Restore/redo remains journaled and revalidates the real bytes.
+Foreign keys, canonical rows, schema, budgets, compiler, checkpoints, CAS and
+recall are unchanged. Seven actual-host subprocess cases cover plain and
+encoded multimodal values, ordinary rewinds, active/compacted controls,
+fresh-process reopen, rollback invalidation, restore and indexed rewind/redo.
+The first eighteen artifacts remain byte-identical; this is not a deployment.
 
 ## Extraction matrix
 
 | Decision | AsherieSystem donor | Hermes Continuity target | Treatment |
 | --- | --- | --- | --- |
+| Adapt | Retained recent-bridge selection, chunk planning/acceptance and checkpoint policy; current donor inspected at `ddfb1e9aeb7c6f7797912e959a0970c621875c83` | `checkpoint_v3.py`, explicit v3 paths in `context_compactor.py` / `thread_continuity_runtime.py`, `history_index.py` | Block 3 replaces full-history identity arrays with host-proven compact prefix descriptors and a bounded complete-group window. Selection, summary/chunk acceptance, current/raw non-retirement and budget helpers are reused; checkpoint v2 remains available on the original twelve-patch host. This is a representation/storage adaptation, not a new memory or search algorithm. |
 | Retain | `services/home/app/context_compactor.py`: `_ThreadContinuityPhysicalOwnerSidecar`, `_content_to_text`, `_normalize` | `context_compactor.py` | Retained the physical-input authority used by compilation and checkpoint-candidate validation. The prompt-plan/fixed-selection capabilities were initially retained for donor parity, then excluded because the Hermes product has no finalizer registration or consumer. |
 | Adapt | `services/home/app/context_compactor.py`: the continuity compactor section through `accept_summary_chunk_attempt` | `context_compactor.py` | Retained checkpoint v2, its nested retirement/recent-bridge v1 schemas, fold planning, physical-owner proof, summary/chunk planning, acceptance receipts, and bounded validation. Removed the top-level `thread_continuity_checkpoint.v1` builder, normalizer, legacy bridge projection, and physical-owner relation only after the body-free owner-store census found zero v1 rows and zero malformed rows across the known local and Tencent estate. Unexpected top-level v1 now fails closed and is never projected or migrated. |
 | Retain | `services/home/app/thread_continuity_runtime.py`: live compilation, summary/chunk acceptance, and physical-input validation path | `thread_continuity_runtime.py` | Retained the compiler used by `ContinuityRuntime`. The fixed-prompt finalizer and token-watermark context-epoch planner were initially retained for donor parity, then excluded because Hermes registered no policy, configuration, caller, or result consumer for them. |
@@ -92,3 +187,18 @@ bounded request carrier.
 
 The compatibility patches retain the upstream Hermes/Nous MIT notice in
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+## Owner-authorized historical image representation trial
+
+The donor summary prompt forwards multimodal source parts. This trial deliberately
+adapts that provider-input representation at the owner's request: historical
+pixels are omitted before summary/chunk estimation, copying and request hashing;
+recorded dialogue and interpretations remain text. Canonical content, identities,
+fingerprints, checkpoint/CAS ownership and current-turn attachments are unchanged.
+All three retained prompt paths use the same projection rather than separate
+image policies. The extraction lineage and notices above remain in force.
+
+This is not a new vision, image-storage or numbering implementation. A recorded
+save number is retained as dialogue, not promoted to a verified file receipt.
+Missing interpretations stay missing; the actual folder-based save consumer and
+bounded giant-value source/index path still require integration and validation.

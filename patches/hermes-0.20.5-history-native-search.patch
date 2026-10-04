@@ -1,0 +1,157 @@
+diff --git a/hermes_state_history.py b/hermes_state_history.py
+index 662ad715..b279bab7 100644
+--- a/hermes_state_history.py
++++ b/hermes_state_history.py
+@@ -2681,6 +2681,75 @@ class SessionHistoryMixin:
+             finally:
+                 conn.rollback()
+ 
++    def search_history_matches(self, domain_id, *, target, query, max_matches=64,
++                               deadline_ms=50):
++        """Native search locators, restricted to one verified canonical domain.
++
++        Reuse SessionSearchMixin's routing and query grammar. Unlike interactive
++        search, this foreground projection never asks FTS to construct snippets
++        or decode neighboring bodies, repair an index, or start a writer.
++        """
++        token = _normalize_prefix_token(target)
++        if token["domain_id"] != domain_id:
++            raise ValueError("history_search_domain_mismatch")
++        if (not isinstance(query, str) or not 1 <= len(query) <= 512
++                or type(max_matches) is not int or not 1 <= max_matches <= 128
++                or type(deadline_ms) is not int or not 1 <= deadline_ms <= 250):
++            raise ValueError("history_search_budget_invalid")
++        query = self._sanitize_fts5_query(query)
++        if not query:
++            return {"status": "ready", "matches": []}
++        self._refresh_fts_stale_state()
++        route = self._describe_search_path(query)
++        table = {"fts5": "messages_fts", "fts_cjk": "messages_fts_cjk",
++                 "trigram": "messages_fts_trigram"}.get(route)
++        if table and not self._fts_enabled:
++            return {"status": "unavailable", "reason": "native_search_unavailable", "matches": []}
++        if table:
++            if table != "messages_fts":
++                query = " ".join(part if part.upper() in {"AND", "OR", "NOT"}
++                                 else '"' + part.replace('"', '""') + '"'
++                                 for part in query.strip('"').split())
++            predicate, params = f"{table} MATCH ?", [query]
++            # The owner-copy plan otherwise rescans a whole domain for each
++            # FTS hit; BM25 also scores all matching compaction clones before
++            # LIMIT. Seek existing winners from bounded newest postings instead.
++            source = (f"{table} CROSS JOIN hermes_history_buckets b "
++                      f"INDEXED BY idx_hermes_history_buckets_winner ON b.winner_message_id={table}.rowid "
++                      "CROSS JOIN messages m ON m.id=b.winner_message_id")
++            order = f"{table}.rowid DESC"
++        else:
++            predicate, params, _ = self._compile_like_boolean_query(query)
++            if not predicate:
++                return {"status": "ready", "matches": []}
++            predicate = "(" + predicate + ")"
++            source = ("hermes_history_buckets b CROSS JOIN messages m "
++                      "ON m.id=b.winner_message_id")
++            order = "b.position DESC"
++        sql = (
++            "SELECT b.position FROM " + source +
++            " WHERE b.domain_id=? AND b.position<=? AND " + predicate +
++            " AND (m.active=1 OR m.compacted=1) AND m.role IN ('user','assistant') "
++            "ORDER BY " + order + " LIMIT ?"
++        )
++        deadline = time.monotonic() + deadline_ms / 1000
++        with self._read_ctx() as conn, self._history_value_limit(conn, 4*1024*1024):
++            conn.execute("SAVEPOINT history_search")
++            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
++            try:
++                validation = self._history_validate_token_conn(conn, token)
++                if validation["status"] != "valid" or validation.get("invalidated_from_position"):
++                    return {"status": "pending", "reason": "history_source_changed", "matches": []}
++                matches = [int(row[0]) for row in conn.execute(
++                    sql, [domain_id, token["canonical_count"], *params, max_matches])]
++                return {"status": "ready", "matches": matches, "route": route}
++            except sqlite3.Error as error:
++                code = getattr(error, "sqlite_errorname", "SQLITE_ERROR").lower()
++                return {"status": "unavailable", "reason": "native_search_" + code, "matches": []}
++            finally:
++                conn.set_progress_handler(None, 0)
++                conn.execute("RELEASE history_search")
++
+     def seal_history_prefix(
+         self,
+         domain_id: str,
+diff --git a/tests/test_history_search.py b/tests/test_history_search.py
+new file mode 100644
+index 00000000..ccb55c49
+--- /dev/null
++++ b/tests/test_history_search.py
+@@ -0,0 +1,71 @@
++"""Native bounded ID search must not hydrate transcripts or mint source proof."""
++import pytest
++from contextlib import contextmanager
++
++from hermes_state import SessionDB
++
++
++def prepare(db, session):
++    for _ in range(2000):
++        result = db.prepare_history_step(session, owner_id="search-test", deadline_ms=50)
++        if result["status"] == "ready":
++            return result["head_token"]
++        assert result["status"] == "progress", result
++    raise AssertionError("preparation stalled")
++
++
++def test_native_id_search_preserves_scope_grammar_and_large_value_bound(tmp_path, monkeypatch):
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session("one", "cli")
++        db.create_session("other", "cli")
++        db.append_message("one", "user", "樱桃项目 cherry budget", timestamp=1)
++        db.append_message("one", "assistant", "12万元，未确认", timestamp=2)
++        db.append_message("one", "user", [{"type": "text", "text": "information-figure"},
++            {"type": "image_url", "image_url": {"url": "A"*(5*1024*1024)}}], timestamp=3)
++        db.append_message("other", "user", "cherry 樱桃项目", timestamp=1)
++        token = prepare(db, "one")
++        monkeypatch.setattr(db, "_decode_message_rows", lambda *a: pytest.fail("no body decoder"))
++        for query in ("cherry", "樱桃项目", "cherry OR unknown", "information-figure"):
++            result = db.search_history_matches("one", target=token, query=query)
++            assert result["status"] == "ready", result
++            assert result["matches"] == ([3] if query == "information-figure" else [1])
++            assert set(result) == {"status", "matches", "route"}
++        assert db.search_history_matches("one", target=token, query="cherry NOT budget")["matches"] == []
++        original_read, queries = db._read_ctx, []
++        @contextmanager
++        def traced():
++            with original_read() as connection:
++                connection.set_trace_callback(lambda sql: queries.append(sql) if sql.startswith("SELECT b.position") else None)
++                try:
++                    yield connection
++                finally:
++                    connection.set_trace_callback(None)
++        monkeypatch.setattr(db, "_read_ctx", traced)
++        assert db.search_history_matches("one", target=token, query="cherry")["matches"] == [1]
++        with original_read() as connection:
++            plan = [row[3] for row in connection.execute("EXPLAIN QUERY PLAN " + queries[-1])]
++        assert "messages_fts VIRTUAL TABLE" in plan[0], plan
++        assert any("idx_hermes_history_buckets_winner" in detail for detail in plan), plan
++        assert not any("TEMP B-TREE" in detail for detail in plan), plan
++        with pytest.raises(ValueError, match="domain"):
++            db.search_history_matches("other", target=token, query="cherry")
++        with pytest.raises(ValueError, match="budget"):
++            db.search_history_matches("one", target=token, query="x"*513)
++        db._execute_write(lambda connection: connection.execute(
++            "UPDATE messages SET content='changed' WHERE session_id='one' AND id=1"))
++        assert db.search_history_matches("one", target=token, query="cherry")["status"] == "pending"
++
++
++def test_search_deadline_or_sql_error_does_not_become_empty_success(tmp_path, monkeypatch):
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session("one", "cli")
++        db.append_message("one", "user", "cherry", timestamp=1)
++        token = prepare(db, "one")
++        db._execute_write(lambda connection: connection.execute("DROP TABLE messages_fts"))
++        monkeypatch.setattr(db, "_describe_search_path", lambda _: "fts5")
++        result = db.search_history_matches("one", target=token, query="cherry")
++        # A missing native index must not become an empty successful lookup.
++        assert result["status"] == "unavailable", result
++        # Cleanup resets the query controls even on an actual SQL failure.
++        with db._read_ctx() as connection:
++            assert connection.execute("SELECT 1").fetchone()[0] == 1
