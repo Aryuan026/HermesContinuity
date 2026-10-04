@@ -490,3 +490,31 @@
 - `DONOR_RECALL_REPAIR_NOTES.md` now provides the requested mother-repository
   reference. It does not modify the donor. PR #6 remains open/unmerged;
   selected Assembly reconciliation is tracked separately, not presumed done.
+
+## 2026-10-04 — completed-prefix checkpoint validation correction
+
+- The owner requested investigation/repair of the separately recorded
+  `checkpoint_index_pending` replay failure. Current main is `284ff1f2`, with
+  the same production tree as the accepted/installed `d549c95a`; this is source
+  maintenance, not deployment or an upstream-version transition.
+- A deterministic real-SQLite regression reproduces a false publication
+  conflict: the host audits a physical API-sidecar edit on a trailing incomplete
+  user, but the group worker has not refreshed that row. The completed checkpoint
+  prefix remains valid; validation previously demanded the longer physical head.
+  The same staged delivery now stores one conditional v3 checkpoint/receipt by
+  validating the existing complete-group prefix instead. An unaudited journal
+  and an edit inside that prefix still reject; no deadline, budget, readiness,
+  schema, CAS or provider-delivery requirement is relaxed.
+- Local Python 3.11 against exact nineteen-patch host `964c65ab` / tree
+  `d212962d...`: focused history/v3/real-entry suite 45/45; complete plugin suite
+  315 tests, 313 pass / 2 conditional skips; exact old Global Hot `af605282`
+  paired production entrypoint separately 1/1. Ruff and diff-check pass.
+  Providers are substitutes and databases disposable. No Tencent access,
+  install, enable, restart, merge, selected Assembly pin or .21.5 change occurs.
+- Original intermittent CI scheduling has not been recreated wholesale locally:
+  the unchanged giant entry test also passed before this correction. Successor
+  public replay remains necessary; a pending index is not generally a bug and
+  must not be marked applied. Its existing failure assertion now emits the
+  already-bounded host/group/preparation diagnostics instead of status alone.
+  The independent 50-ms streamed-value test assumption remains separately
+  recorded and untouched. No natural relevance/stability claim is added.

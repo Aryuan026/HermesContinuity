@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
-import os
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -601,6 +601,71 @@ class HistoryIndexTests(unittest.TestCase):
             self.assertEqual(bundle["continuity"]["error"],
                              "thread_continuity_checkpoint_source_invalid")
             self.assertNotIn("recent_bridge", bundle["continuity"].get("state", {}))
+        finally:
+            runtime.clear()
+
+    def test_pending_user_sidecar_does_not_block_completed_checkpoint_prefix(self):
+        from test_runtime import ContinuityRuntime, FakeLlm, project, execute, post, request
+        from test_hermes_adapter import PACKAGE
+        import importlib
+        preparation = importlib.import_module(f"{PACKAGE}.resource_budget")
+        self.seed(24)
+        self.writer.append_message("session-1", "user", "pending user", timestamp=1787961700)
+        self.prepare()
+        index = self.adapter.history_index
+        runtime = ContinuityRuntime(
+            self.adapter, FakeLlm(), estimator=lambda messages: max(1, len(repr(messages))//8),
+            clock=lambda: "2026-08-30T00:00:00+00:00")
+        try:
+            wire = request()
+            projected = project(runtime, wire, session="session-1", turn="sidecar", api="sidecar")
+            self.assertIsNotNone(projected)
+            execute(runtime, projected["request"], wire,
+                    session="session-1", turn="sidecar", api="sidecar")
+            candidate = next(iter(runtime._turns.values())).checkpoint_candidate
+            self.assertEqual(candidate["source_proof"]["group_count"], 24)
+            # The host has audited the new physical sidecar, while the plugin
+            # group worker has not yet refreshed its trailing incomplete row.
+            with preparation.PREPARATION_LOCK:
+                self.writer.set_latest_user_api_content("session-1", "pending user", "provider sidecar")
+                with self.assertRaisesRegex(ValueError, "checkpoint_source_pending"):
+                    index._validate_checkpoint_once(candidate, session_id="session-1")
+                for _ in range(100):
+                    prepared = self.reader.prepare_history_step(
+                        "session-1", owner_id=index.owner_id, activation_epoch=index.activation_epoch)
+                    if prepared["status"] == "ready":
+                        break
+                    self.assertEqual(prepared["status"], "progress", prepared)
+                self.assertEqual(prepared["status"], "ready")
+                with closing(self.store._connect()) as connection:
+                    head = connection.execute(
+                        "SELECT head_json FROM continuity_group_progress WHERE session_id=?",
+                        ("session-1",)).fetchone()[0]
+                stale = self.reader.validate_history_prefix(json.loads(head))
+                self.assertEqual(stale["status"], "changed")
+                self.assertEqual(json.loads(head)["canonical_count"], 49)
+                self.assertEqual(self.reader.validate_history_prefix(
+                    candidate["source_proof"]["host_token"])["invalidated_from_position"], None)
+                post(runtime, session="session-1", turn="sidecar", api="sidecar")
+                with closing(self.store._connect()) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT status FROM continuity_receipts").fetchone()[0],
+                        "delivered_checkpoint_stored_unvalidated")
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM continuity_checkpoints_v3").fetchone()[0], 1)
+                self.assertEqual(index.validate_checkpoint(candidate, session_id="session-1"), candidate)
+                # An edit inside the proven prefix still fails closed, even
+                # while the same group-worker barrier is held.
+                self.writer._execute_write(lambda connection: connection.execute(
+                    "UPDATE messages SET content='changed prefix' WHERE id=1"))
+                for _ in range(100):
+                    prepared = self.reader.prepare_history_step(
+                        "session-1", owner_id=index.owner_id, activation_epoch=index.activation_epoch)
+                    if prepared["status"] == "ready":
+                        break
+                self.assertEqual(prepared["status"], "ready")
+                with self.assertRaisesRegex(ValueError, "checkpoint_source_changed"):
+                    index.validate_checkpoint(candidate, session_id="session-1")
         finally:
             runtime.clear()
 
