@@ -444,7 +444,7 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
             self.assertEqual(
                 _sqlite_count(continuity_db, "continuity_checkpoints_v3"),
                 1,
-                f"{self._continuity_status()} validation_errors={self.validation_errors}",
+                self._diagnostics(),
             )
             self.assertEqual(
                 _sqlite_count(continuity_db, "continuity_receipts"), 1

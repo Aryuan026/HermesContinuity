@@ -705,12 +705,16 @@ class ContinuityHistoryIndex:
         with closing(self.store._connect()) as connection:
             connection.execute("BEGIN")
             progress = connection.execute(
-                "SELECT head_json,ready,invalid_from FROM continuity_group_progress WHERE session_id=?",
+                "SELECT head_json,prefix_json,ready,invalid_from FROM continuity_group_progress WHERE session_id=?",
                 (session_id,),
             ).fetchone()
             if progress is None or not progress["ready"] or progress["invalid_from"] is not None:
                 raise ValueError("checkpoint_index_pending")
-            current_target = json.loads(progress["head_json"])
+            # Only complete groups belong to a checkpoint. A physical sidecar
+            # refresh on the trailing pending user must not make their proof
+            # wait for an unrelated, incomplete tail to be reindexed.
+            current_target = self._prefix(json.loads(progress["head_json"]),
+                                          json.loads(progress["prefix_json"]))
             validation = self.db.validate_history_prefix(current_target)
             if validation.get("status") != "valid" or validation.get("invalidated_from_position"):
                 raise ValueError("checkpoint_index_pending")
