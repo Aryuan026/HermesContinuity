@@ -19,6 +19,7 @@ from .resource_budget import PREPARATION_LOCK, PREPARATION_WORKSETS
 
 
 GROUP_RULE = "hermes_continuity_group_index.v1"
+H13_GROUP_RULE = "hermes_continuity_group_index.h13.v1"
 
 
 class _Occurrences:
@@ -60,9 +61,11 @@ class _Occurrences:
 
 
 class ContinuityHistoryIndex:
-    def __init__(self, session_db, metadata_store):
+    def __init__(self, session_db, metadata_store, *, origin_classifier=None):
         self.db = session_db
         self.store = metadata_store
+        self.origin_classifier = origin_classifier
+        self.grouping_rule = H13_GROUP_RULE if origin_classifier else GROUP_RULE
         self.owner_id = "continuity-" + uuid.uuid4().hex
         self.activation_epoch = None
         self._closed = False
@@ -75,6 +78,10 @@ class ContinuityHistoryIndex:
         self._pending_group = None
         with closing(self.store._connect()) as connection:
             connection.executescript("""
+                CREATE TABLE IF NOT EXISTS continuity_group_rules (
+                    session_id TEXT PRIMARY KEY,
+                    grouping_rule TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS continuity_group_progress (
                     session_id TEXT PRIMARY KEY,
                     position INTEGER NOT NULL,
@@ -213,6 +220,12 @@ class ContinuityHistoryIndex:
             remaining |= cursor.rowcount == 256
         return remaining
 
+    def _rule_matches(self, connection, session_id):
+        row = connection.execute(
+            "SELECT grouping_rule FROM continuity_group_rules WHERE session_id=?",
+            (session_id,)).fetchone()
+        return (row[0] if row else GROUP_RULE) == self.grouping_rule
+
     def prepare_step(self, session_id):
         """A finite preparation quantum, also callable by isolated tests."""
         if self._closed:
@@ -262,11 +275,26 @@ class ContinuityHistoryIndex:
                 "schema": "thread_continuity_prefix_descriptor.v1", "through_anchor": "",
                 "canonical_count": 0, "group_count": 0, "prefix_hash": empty_token["prefix_hash"],
                 "group_root": thread_continuity_group_root_seed(
-                    domain_id=target["domain_id"], grouping_rule_version=GROUP_RULE),
+                    domain_id=target["domain_id"], grouping_rule_version=self.grouping_rule),
             }
             if progress is None:
                 connection.execute("INSERT INTO continuity_group_progress VALUES (?,?,?,?,?,NULL,0)",
                                    (session_id, 0, 0, _json_text(empty_prefix), "{}"))
+                progress = connection.execute(
+                    "SELECT * FROM continuity_group_progress WHERE session_id=?", (session_id,)
+                ).fetchone()
+            if not self._rule_matches(connection, session_id):
+                # Only derived grouping is retired. Preserve canonical data,
+                # checkpoint bytes and receipts; reuse bounded suffix cleanup.
+                connection.execute(
+                    "UPDATE continuity_group_progress SET position=0,group_count=0,"
+                    "prefix_json=?,head_json='{}',invalid_from=0,ready=0 WHERE session_id=?",
+                    (_json_text(empty_prefix), session_id))
+                connection.execute(
+                    "INSERT INTO continuity_group_rules VALUES (?,?) ON CONFLICT(session_id) "
+                    "DO UPDATE SET grouping_rule=excluded.grouping_rule",
+                    (session_id, self.grouping_rule))
+                self._pending_group = None
                 progress = connection.execute(
                     "SELECT * FROM continuity_group_progress WHERE session_id=?", (session_id,)
                 ).fetchone()
@@ -333,6 +361,7 @@ class ContinuityHistoryIndex:
                     session_id, rows, full_prefix=False, identity_occurrences=identities,
                     group_occurrences=groups, prior_group_count=prefix["group_count"],
                     include_group_boundaries=True,
+                    origin_classifier=self.origin_classifier,
                 )
                 if projected.get("status") != "ready":
                     return {"status": "fault", "reason": projected.get("error", "group_projection_failed")}
@@ -361,6 +390,7 @@ class ContinuityHistoryIndex:
                 session_id, rows[:consumed], full_prefix=False, identity_occurrences=identities,
                 group_occurrences=groups, prior_group_count=prefix["group_count"],
                 include_group_boundaries=True,
+                origin_classifier=self.origin_classifier,
             )
             records = []
             for group, start, end, compacted in zip(projected["groups"], projected["_group_starts"], projected["_group_ends"],
@@ -453,6 +483,7 @@ class ContinuityHistoryIndex:
             group_occurrences=_Occurrences(connection, session_id, "group", start_position),
             prior_group_count=records[0]["ordinal"]-1 if records else 0,
             include_group_boundaries=True,
+            origin_classifier=self.origin_classifier,
         )
         if projected.get("status") != "ready" or len(projected["groups"]) != len(records):
             raise ValueError("group_index_projection_mismatch")
@@ -481,7 +512,8 @@ class ContinuityHistoryIndex:
             progress = connection.execute(
                 "SELECT * FROM continuity_group_progress WHERE session_id=?", (session_id,)
             ).fetchone()
-            if progress is None or not progress["ready"] or progress["invalid_from"] is not None:
+            if (not self._rule_matches(connection, session_id) or progress is None
+                    or not progress["ready"] or progress["invalid_from"] is not None):
                 self.request(session_id)
                 return _failed_source("pending", "history_preparation_pending")
             target = self._prefix(json.loads(progress["head_json"]), json.loads(progress["prefix_json"]))
@@ -527,7 +559,7 @@ class ContinuityHistoryIndex:
                 bytes_used += size
                 if len(groups) >= max_groups:
                     break
-            proof = {"host_token": target, "grouping_rule_version": GROUP_RULE, "groups": selected}
+            proof = {"host_token": target, "grouping_rule_version": self.grouping_rule, "groups": selected}
             self.validate_recall(proof, session_id=session_id)
             return {"status": "ready", "groups": groups, "source_proof": proof,
                     "source_snapshot": _sha256(proof),
@@ -535,13 +567,22 @@ class ContinuityHistoryIndex:
                               "returned_groups": len(groups), "retirement_authority": False}}
 
     def validate_recall(self, proof, *, session_id):
+        return self._validate_prepared(
+            self._validate_recall_once, proof, session_id=session_id,
+            pending_errors={"recall_source_pending"})
+
+    def _validate_recall_once(self, proof, *, session_id):
         target = proof["host_token"]
-        if target["domain_id"] != session_id or proof["grouping_rule_version"] != GROUP_RULE:
+        if target["domain_id"] != session_id or proof["grouping_rule_version"] != self.grouping_rule:
             raise ValueError("recall_domain_or_group_rule_changed")
         validation = self.db.validate_history_prefix(target)
+        if validation.get("status") == "pending":
+            raise ValueError("recall_source_pending")
         if validation.get("status") != "valid" or validation.get("invalidated_from_position"):
             raise ValueError("recall_source_changed")
         with closing(self.store._connect()) as connection:
+            if not self._rule_matches(connection, session_id):
+                raise ValueError("recall_group_rule_changed")
             for group in proof["groups"]:
                 row = connection.execute(
                     "SELECT fingerprint,end_position FROM continuity_group_index WHERE session_id=? AND group_id=?",
@@ -560,7 +601,8 @@ class ContinuityHistoryIndex:
             progress = connection.execute(
                 "SELECT * FROM continuity_group_progress WHERE session_id=?", (session_id,)
             ).fetchone()
-            if progress is None or not progress["ready"] or progress["invalid_from"] is not None:
+            if (not self._rule_matches(connection, session_id) or progress is None
+                    or not progress["ready"] or progress["invalid_from"] is not None):
                 last = self.status(session_id)
                 self.request(session_id)
                 if last["status"] == "overflow":
@@ -584,7 +626,7 @@ class ContinuityHistoryIndex:
                 "canonical_count": 0, "group_count": 0,
                 "prefix_hash": empty["token"]["prefix_hash"],
                 "group_root": thread_continuity_group_root_seed(
-                    domain_id=target["domain_id"], grouping_rule_version=GROUP_RULE),
+                    domain_id=target["domain_id"], grouping_rule_version=self.grouping_rule),
             }
             first_live = connection.execute(
                 "SELECT ordinal FROM continuity_group_index WHERE session_id=? AND compacted=0 "
@@ -647,7 +689,7 @@ class ContinuityHistoryIndex:
             # complete group. Its later provider sidecar must not rewrite the
             # proof of the preceding complete dialogue prefix.
             complete_target = self._prefix(target, last_prefix)
-            proof = {"host_token": complete_target, "grouping_rule_version": GROUP_RULE,
+            proof = {"host_token": complete_target, "grouping_rule_version": self.grouping_rule,
                      "group_count": progress["group_count"], "group_root": last_prefix["group_root"]}
             eligibility = {
                 "schema": "thread_continuity_retirement_eligibility.v1", "status": "eligible",
@@ -669,14 +711,20 @@ class ContinuityHistoryIndex:
             return result
 
     def validate_checkpoint(self, checkpoint, *, session_id):
+        return self._validate_prepared(
+            self._validate_checkpoint_once, checkpoint, session_id=session_id,
+            pending_errors={"checkpoint_source_pending", "checkpoint_index_pending"})
+
+    def _validate_prepared(self, validator, value, *, session_id, pending_errors):
+        """Share the existing bounded checkpoint wait, never a foreground scan."""
         deadline = time.monotonic() + 0.1
         while True:
             with self._wake:
                 completed = self._completed
             try:
-                return self._validate_checkpoint_once(checkpoint, session_id=session_id)
+                return validator(value, session_id=session_id)
             except ValueError as error:
-                if str(error) not in {"checkpoint_source_pending", "checkpoint_index_pending"}:
+                if str(error) not in pending_errors:
                     raise
                 self.request(session_id)
                 with self._wake:
@@ -692,7 +740,7 @@ class ContinuityHistoryIndex:
                                     thread_continuity_group_root_seed)
         checkpoint = normalize_thread_continuity_checkpoint_v3(checkpoint)
         proof = checkpoint["source_proof"]
-        if proof["grouping_rule_version"] != GROUP_RULE:
+        if proof["grouping_rule_version"] != self.grouping_rule:
             raise ValueError("checkpoint_grouping_rule_changed")
         target = proof["host_token"]
         if target["domain_id"] != session_id:
@@ -704,6 +752,8 @@ class ContinuityHistoryIndex:
             raise ValueError("checkpoint_source_changed")
         with closing(self.store._connect()) as connection:
             connection.execute("BEGIN")
+            if not self._rule_matches(connection, session_id):
+                raise ValueError("checkpoint_grouping_rule_changed")
             progress = connection.execute(
                 "SELECT head_json,prefix_json,ready,invalid_from FROM continuity_group_progress WHERE session_id=?",
                 (session_id,),
@@ -727,7 +777,7 @@ class ContinuityHistoryIndex:
                     return {"through_anchor": "", "canonical_count": 0, "group_count": 0,
                             "prefix_hash": empty["token"]["prefix_hash"],
                             "group_root": thread_continuity_group_root_seed(
-                                domain_id=session_id, grouping_rule_version=GROUP_RULE)}
+                                domain_id=session_id, grouping_rule_version=self.grouping_rule)}
                 row = connection.execute(
                     "SELECT prefix_json FROM continuity_group_index WHERE session_id=? AND ordinal=?",
                     (session_id, count),
