@@ -17,8 +17,18 @@ Hermes retains native search grammar, canonical group hydration, H13, source
 validation and physical settlement. Query packing, partial resource-limited
 search coverage and native search grammar adaptation are Hermes-specific
 integration work. No private source data, vocabulary, production config or
-mother memory owner is copied. The pending `3841a7f9` / PR #388 temporal changes
-are not absorbed. The original extraction and license notices below remain.
+mother memory owner is copied.
+
+The owner subsequently approved two bounded adaptations from merged PR #388,
+inspected at release `26681d182337b24a645cc8ce3353e56a54acb45d`:
+`history_progressive_read.py::_is_history_reference` supplies the full-match
+subjectless-follow-up grammar, and
+`conversation_cache.py::_extract_query_terms` supplies event-date content keys.
+They extend the existing query builder only. Hermes native search continues to
+own date punctuation/routing; the existing `reference_at` upper bound remains.
+No donor temporal engine, relative chat-date filtering, Warm admission gate or
+other memory owner is ported. The optional auxiliary planner is unchanged.
+The original extraction and license notices below remain.
 
 Hermes Continuity is an owner-authorized extraction from the private
 AsherieSystem revision

@@ -13,6 +13,8 @@ from .context_compactor import _summary_source_content
 def _query_terms(query):
     """Adapt AsherieSystem's source-text query terms; no generated aliases."""
     text = str(query or "").strip()[:4096]
+    # An event date is a content key, not the day its source was spoken.
+    dates = re.findall(r"(?:20\d{2}[年/-])?\d{1,2}[月/-]\d{1,2}", text)
     for pattern in (
         r"20\d{2}[年/-]\s*\d{1,2}[月/-]\s*\d{1,2}(?:日|号)?",
         r"\d{1,2}月\d{1,2}(?:日|号)?", r"\d{1,2}[/-]\d{1,2}",
@@ -22,7 +24,7 @@ def _query_terms(query):
     text = re.sub(r"^(?:宝宝|你|我|人家(?=\s)|还记得|记不记得|记得|跟你说过|跟你说|说过|说|聊过|提过|请问)+", "", text)
     text = re.sub(r"(?:那段|这段|那个|这个)?(?:故事)?(?:我们|你)?(?:讨论|还记得|聊|说)(?:了)?(?:些)?(?:什么细节|什么|啥)", " ", text)
     chunks = re.findall(r"[a-zA-Z0-9]{2,}|[\u4e00-\u9fff]{2,}", text)
-    candidates = [c.lower() for c in chunks if c.isascii()]
+    candidates = dates + [c.lower() for c in chunks if c.isascii()]
     chinese = [c.rstrip("吗呢呀啊吧") for c in chunks if not c.isascii()]
     candidates.extend(c for c in chinese if 2 <= len(c) <= 12)
     for width in (2, 3, 4):
@@ -33,14 +35,21 @@ def _query_terms(query):
 
 
 def _search_queries(query, recent_query):
-    # Use only the already-visible preceding user carrier for pronouns. An
-    # explicitly named object must not inherit an unrelated preceding topic.
+    # Use only the already-visible preceding user carrier for references. A
+    # full subjectless question can borrow it; a newly named topic cannot.
     deictic = re.search(r"(?:它|这[个块款件台只]|那[个块款件台只])(?:是|的|呢|呀|后来|还|现在|当时|怎么|什么|谁|哪|能|会|要|有|可)", query)
-    terms = _query_terms(recent_query) if deictic and recent_query else _query_terms(query)
+    subjectless = re.fullmatch(
+        r"(?:(?:那|所以|后来|最后|现在|当时|到底|一共|总共|大概)[，,\s]*)*"
+        r"(?:(?:花|用|付|花费)(?:了|掉)?(?:多少|多久)"
+        r"|(?:定|改|约|安排)(?:在|到|成)?(?:哪[天年]|几[点号月]|什么时间)"
+        r"|(?:是|在|到|从)?(?:哪[里儿天年]|谁|几[点号月]|多少钱|多久)"
+        r"(?:买|办|做|送|定|开始|结束)?(?:的|了)?)"
+        r"[呀呢啊吗吧了？?！!。\s]*", query.strip())
+    terms = _query_terms(recent_query) if (deictic or subjectless) and recent_query else _query_terms(query)
     queries, current = [], ""
     for term in terms:
-        # Terms contain only letters/digits/CJK. Hermes adds the quoting for
-        # its CJK/trigram route; pre-quoting would change the native grammar.
+        # Hermes owns date punctuation and CJK/trigram quoting. Pre-quoting
+        # every atom here would change that native grammar.
         atom = term
         if len(atom) > 80:
             continue

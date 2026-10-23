@@ -14,6 +14,8 @@ or GitHub Actions is part of this change.
 - Mother remote release branch readback:
   `9e4ca4bd82c9cd1f5293193f5d14bb8d22a59b3e`. Remote default `main` still points
   to older `a80850bd`; it is not the current recall implementation.
+  The owner-approved follow-up additionally inspects merged PR #388 at
+  `26681d182337b24a645cc8ce3353e56a54acb45d` on the same release branch.
 - Test host: exact accepted 29-artifact 0.21.5 source
   `06501c37567a50f8c3ee65bc359a1caae921d74f`. No host source was changed.
 - The old graph guide is sealed at `0adda1b4` and is navigation ancestry only;
@@ -30,7 +32,7 @@ or GitHub Actions is part of this change.
 | Original role-aware passages instead of leading truncation | Allocate 220 characters per group before locating matching sentences, preserve short answers/negations and mark omitted text. At most four quoted groups. |
 | Exact source readback | Existing canonical proof checks at plan, execution and post-settlement stay authoritative. Recall never retires or CASes a checkpoint. |
 | Warm coverage reuse, memory hint aliases, Home UI and other organs | Not ported: Hermes has no equivalent owner-bound Warm coverage carrier here. No shadow store, second memory/search service or fabricated aliases. |
-| Pending temporal/follow-up successor PR #388 | Not ported. OFF mode does not claim model-planned synonym/date interpretation. `reference_at` is the as-of upper bound; retrieval is lexical, not a semantic answer. |
+| PR #388 subjectless follow-ups and event dates | Adapt full-match follow-up grammar and preserve literal event-date terms. Do not port the temporal engine or Warm gate. `reference_at` remains the as-of upper bound; OFF mode does not claim chat-date filtering, date-format equivalence or semantic interpretation. |
 
 The predecessor's source/output/shared workset limits remain: 24 complete
 candidate groups, 2,048 rows / 4 MiB, 24k estimated source tokens, shared 2,048
@@ -41,7 +43,8 @@ wall-clock/tokenizer guarantee.
 ## Integration defects found while testing
 
 1. Native CJK/trigram search owns quoting. Pre-quoting every token changes that
-   grammar; query terms now use only letters/digits/CJK and let Hermes quote.
+   grammar. Word terms use source letters/digits/CJK; literal event-date keys
+   retain their source punctuation and use the same native sanitizer/router.
 2. Without an available CJK index, two-character fragments can take a LIKE
    path. A 16-MiB historical image correctly trips SQLite's value guard. Only
    explicit resource-limit outcomes (`SQLITE_TOOBIG`/`SQLITE_INTERRUPT`) may
@@ -70,10 +73,11 @@ was read or used as a fixture.
 
 | Final focused selection | Python 3.11.15 | Python 3.12.13 |
 | --- | --- | --- |
-| New lexical checks, old opt-in recall, registration, H13-v3, real Agent recall | 39/39, 63.529 s | 39/39, 65.368 s |
+| Original candidate at `4bd7a4d`: lexical, opt-in, registration, H13-v3, real Agent recall | 39/39, 63.529 s | 39/39, 65.368 s |
+| Follow-up: same selection plus four subjectless/date checks | 43/43, 75.756 s | 43/43, 76.688 s |
 | Conditional skips in this final selection | 0 | 0 |
 
-The ten new lexical checks cover short Chinese objects, English terms,
+The original ten lexical checks cover short Chinese objects, English terms,
 pronouns versus newly named topics, original negations/conditions, sentence and
 length boundaries, unrelated/empty queries, oversized groups, native search,
 partial query failure, source rewrite, pending user rows and answer readback.
@@ -83,6 +87,19 @@ body-free delivery receipts across manager reload, and a synthetic provider
 error that adds no delivery. Recall auxiliary call count is zero; no pending
 tail field, weakened assertion or manual post-settlement call is used. The
 retained opt-in mode still passes its eight original recall regressions.
+
+Four successor checks add full-match subjectless follow-ups (cost, final date,
+location), absent-context/new-topic negatives, and Chinese/full-year/slash/hyphen
+event-date keys. The native tests reach real bounded search, final-body proof
+and body-free post-settlement without an auxiliary call. They retrieve an event
+in December from a conversation stored in August, reject later-than-as-of
+records and an unmatched date, and preserve the original current question.
+The two unit checks first reproduced the unmodified predecessor's seven missed
+subcases. No temporal engine or relative conversation-date filter is added;
+date-format equivalence is not promised, and the retained opt-in planner is
+unchanged. The follow-up changes only `recall.py`, its existing test module,
+this report and the provenance record; the earlier broader-suite failures
+below were not rerun or relabelled by this focused verification.
 
 Reproduce against the exact host with the existing test dependencies available:
 

@@ -69,6 +69,35 @@ class LexicalUnitTests(unittest.TestCase):
                 self.assertEqual(result["source_ids"], ["fact"])
                 self.assertIsNone(self.build(index, "这个围巾怎么清洗？", recent_query=f"刚装好了 {model}。"))
 
+    def test_subjectless_followups_borrow_only_the_recent_subject(self):
+        for question, recent, subject, answer in (
+            ("花了多少？", "银杉相机的镜头修好了。", "银杉相机", "八十元。"),
+            ("最后定在几号了？", "秋风陶艺课的日期改好了。", "秋风陶艺课", "二十三号。"),
+            ("在哪儿办的？", "海岬借阅证已经办好了。", "海岬借阅证", "在南馆。"),
+        ):
+            with self.subTest(question=question):
+                index = Index([group("fact", subject, answer)])
+                result = self.build(index, question, recent_query=recent)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["source_ids"], ["fact"])
+                self.assertIn(answer, result["body"])
+                self.assertIsNone(self.build(index, question))
+                self.assertIsNone(self.build(index, "火星观测站花了多少？", recent_query=recent))
+
+    def test_event_dates_remain_content_without_a_conversation_date_window(self):
+        for date in ("12月6日", "2026年12月6日", "12/6", "2026-12-06"):
+            with self.subTest(date=date):
+                index = Index([group("fact", date, "归还画架。"),
+                               group("noise", "12月7日", "领取水壶。")])
+                result = self.build(index, date + " 的安排？")
+                self.assertIsNotNone(result)
+                self.assertEqual(result["source_ids"], ["fact"])
+                self.assertIn("归还画架。", result["body"])
+                # An event in December may have been discussed in August.
+                # Only the existing as-of bound limits the conversation rows.
+                self.assertEqual(index.calls[0][2], {
+                    "end_at": "2026-08-30T00:00:00+00:00", "allow_partial_queries": True})
+
     def test_rank_and_passage_preserve_fact_condition_not_recent_noise(self):
         fact = "磁轨校准前必须关闭线圈供电，等指示灯熄灭后才能拆罩。"
         original = "无关的包装信息。" * 40 + fact + "外壳的说明。" * 40
@@ -129,6 +158,50 @@ class LexicalNativeTests(unittest.TestCase):
         projected = project(self.runtime, wire, session="session-1")
         self.assertIsNotNone(projected, self.runtime.status_command())
         self.assertIn("12万元", repr(projected["request"]))
+        self.assertEqual(self.llm.calls, [])
+
+    def test_subjectless_followup_reaches_native_history_and_settlement(self):
+        self.runtime.recall_auxiliary_enabled = False
+        self.writer.append_message("session-1", "user", "银杉相机的镜头维修", timestamp=1787965100)
+        self.writer.append_message("session-1", "assistant", "八十元，不含运费。", timestamp=1787965101)
+        self.prepare()
+        wire = request("花了多少？")
+        wire["messages"][:0] = [{"role": "user", "content": "银杉相机的镜头修好了。"},
+                                {"role": "assistant", "content": "我们接着看。"}]
+        projected = project(self.runtime, wire, session="session-1")
+        self.assertIsNotNone(projected, self.runtime.status_command())
+        self.assertIn("八十元，不含运费。", repr(projected["request"]))
+        self.assertEqual(wire["messages"][-1]["content"], "花了多少？")
+        execute(self.runtime, projected["request"], wire, session="session-1")
+        post(self.runtime, session="session-1")
+        self.assertEqual(self.rows()[0][0], "delivered_recall")
+        self.assertNotIn("八十元", repr(self.rows()))
+        self.assertEqual(self.llm.calls, [])
+
+    def test_native_date_punctuation_keeps_event_history_before_the_event(self):
+        self.runtime.recall_auxiliary_enabled = False
+        dates = ("12月6日", "2026年12月6日", "12/6", "2026-12-06")
+        for number, date in enumerate(dates):
+            self.writer.append_message("session-1", "user", date, timestamp=1787965100+number*2)
+            self.writer.append_message("session-1", "assistant", "归还画架。", timestamp=1787965101+number*2)
+        self.writer.append_message("session-1", "user", "12月6日", timestamp=1788134400)
+        self.writer.append_message("session-1", "assistant", "未来追加不应出现。", timestamp=1788134401)
+        self.prepare()
+        for number, date in enumerate(dates):
+            with self.subTest(date=date):
+                wire = request(date + " 的安排？")
+                turn = f"date-{number}"
+                projected = project(self.runtime, wire, session="session-1", turn=turn)
+                self.assertIsNotNone(projected, self.runtime.status_command())
+                self.assertIn("归还画架。", repr(projected["request"]))
+                self.assertNotIn("未来追加不应出现", repr(projected["request"]))
+                execute(self.runtime, projected["request"], wire, session="session-1", turn=turn)
+                post(self.runtime, session="session-1", turn=turn)
+                self.assertEqual(len(self.rows()), number+1)
+                self.assertTrue(all(row[0] == "delivered_recall" for row in self.rows()))
+        self.assertIsNone(project(self.runtime, request("12月9日 的安排？"),
+                                  session="session-1", turn="date-miss"))
+        self.assertEqual(len(self.rows()), len(dates))
         self.assertEqual(self.llm.calls, [])
 
     def test_rewritten_source_removes_lexical_reference_before_provider(self):
