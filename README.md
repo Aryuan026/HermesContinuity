@@ -1,36 +1,40 @@
 # Hermes Continuity
 
-**Keep recent conversational continuity without loading the whole past.**
+**给压缩后的对话留一段近期上文，并按当前问题召回相关旧片段，不把整段历史反复塞回模型。**
 
-A request-only Hermes plugin that combines a bounded rolling bridge with
-question-selected historical recall. It reads canonical history rather than
-copying transcripts, and exposes a profile-local source service for
-[Global Hot](https://github.com/Aryuan026/HermesGlobalHot).
+这是一个实验性的 Hermes 工作上下文插件，不是永久记忆库，也不替代原生压缩器。
+它读取 Hermes 已有历史，只向本轮请求递送有界的连续性桥和相关片段；另为
+[Global Hot](https://github.com/Aryuan026/HermesGlobalHot) 提供只读来源服务。
+简单区分：**Continuity 接同一段对话的过去，Global Hot 接其他会话的近期动静。**
 
-## Compatibility
+## 支持版本与当前状态
 
-Last reviewed: **2026-10-10**. Compatibility means an exact plugin/host pairing,
-not support for every installation sharing the same version number.
+核对日期：**2026-10-23**。插件版本为 **0.4.2**；同一版本号下仍须固定 Git 提交。
+这里的“适配”指经过验证的**插件＋补丁宿主配对**，不是纯上游 Hermes 开箱即用。
 
-- **Hermes 0.20.5 — public integration baseline.** Current public main is based
-  on plugin `0.4.2`. Use the ordered host patches in [patches/](patches/),
-  starting from upstream `fcbd1076`. The original twelve provide the runtime
-  foundation; patches 13–19 add bounded long-history preparation, streamed
-  values and native-search recall. This lane received source review,
-  exact installation/Doctor checks and owner-controlled deployment.
-- **Hermes 0.21.3 — historical, separately ported integration.** Enabled paired
-  replay, Lean compression and disposable migration/rollback were accepted
-  for that exact lane. The 0.20.5 patch files are not its installation recipe;
-  that evidence does not qualify arbitrary 0.21.3 hosts or current main.
-- **Hermes 0.21.5 — maintained owner-controlled integration.** The adapted
-  plugin `75aecd6d6544f3dcb313c42bf917c4a015a31cea` was tested with the
-  corresponding patched host and installed/enabled on 2026-10-10. Its H13
-  source adapter differs from this public main. This repository does not yet
-  package that complete public installation lane; do not install main as a
-  substitute or apply the 0.20.5 patches to 0.21.5.
-- **Other versions — not qualified.** A newer release is not automatically
-  compatible. Historical 0.21.0 acceptance is a regression reference, not the
-  selected upgrade target.
+| Hermes 版本 | 对应代码与使用条件 | 状态 |
+| --- | --- | --- |
+| **0.20.5** | 本仓公开主线；从上游 `fcbd1076` 按顺序应用 [host patches](patches/) | 可重放的公开基线：前 12 枚为基础，13–19 为长历史与问题召回增量 |
+| **0.21.3** | 单独移植的历史装配线，不能套用 0.20.5 补丁安装 | 已有阶段验收，保留为历史参考 |
+| **0.21.5** | 固定插件 [75aecd6](https://github.com/Aryuan026/HermesContinuity/commit/75aecd6d6544f3dcb313c42bf917c4a015a31cea) ＋对应已补丁宿主 | 已验证的维护线；适配层不同于 main，本仓尚未提供完整公开宿主安装包 |
+| **0.22.0** | 仅开始本机宿主插件底座迁移 | **尚未取得本插件运行支持** |
+
+其他版本未验证；0.21.0 的历史验收仅作回归参考。不要用 main 代替固定的
+0.21.5 适配提交，也不要把旧补丁直接贴到新宿主上。详细身份见
+[PROVENANCE.md](PROVENANCE.md)，阶段记录见 [PROGRESS.md](PROGRESS.md)；
+其中旧的候选／未部署状态属于各自记录的时间和代码，不覆盖另一条适配线。
+
+## 最近维护了什么
+
+- **长历史不再每轮整库搬进内存**：索引分批准备，前台只读预算内的完整组；消息和
+  checkpoint 在大字段解码前受字节保护。仅基础 12 枚补丁仍是受限的全前缀读取。
+- **召回会自动参与本轮上下文**：公开主线通过关键词候选、完整组校验和辅助 AI
+  选择／摘要递送旧片段，不只是开放一个搜索工具；目前可能增加两次辅助调用。
+- **新召回候选在 [PR #10](https://github.com/Aryuan026/HermesContinuity/pull/10)**：
+  默认停用这两次召回辅助调用，改用中文短词、指代续问、相关性排序和带角色的原话
+  片段。**尚未合并／部署**；不关闭滚动连续性摘要，不宣称向量语义检索或自然效果已通过。
+
+## 宿主前提
 
 Required host contracts include `hermes.middleware.v2`,
 `hermes.transport.v3`, `hermes.request_overlay.v2`, profile-local services,
