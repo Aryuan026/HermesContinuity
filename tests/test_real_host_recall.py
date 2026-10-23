@@ -70,7 +70,7 @@ class RealHostRecallTests(unittest.TestCase):
                 with sqlite3.connect(ledger) as connection:
                     receipts = connection.execute("SELECT status,hashes_json FROM continuity_receipts").fetchall()
                     self.assertEqual(len(receipts), number+1)
-                    self.assertTrue(all(row[0] == "delivered_recall" for row in receipts))
+                    self.assertTrue(all(row[0] == "delivered_recall" for row in receipts), self._diagnostics())
                     self.assertTrue(all("recall_source_sha256" in json.loads(row[1]) for row in receipts))
                     self.assertNotIn("12万元", repr(receipts))
                     self.assertEqual(connection.execute("SELECT COUNT(*) FROM continuity_checkpoints_v3").fetchone()[0], 0)
@@ -87,4 +87,4 @@ class RealHostRecallTests(unittest.TestCase):
             result = agent.run_conversation("樱桃项目预算", conversation_history=[], task_id="recall-error")
             self.assertFalse(result["completed"])
             self.assertEqual(host._sqlite_count(ledger, "continuity_receipts"), 2)
-            self.assertEqual(self.llm.calls, ["thread_continuity_recall_query", "thread_continuity_recall_summary"]*3)
+            self.assertEqual(self.llm.calls, [])

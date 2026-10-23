@@ -438,6 +438,7 @@ class ContinuityRuntime:
         max_cached_turns: int = 128,
         attempt_ttl_seconds: float = 600.0,
         summary_timeout_seconds: float = 120.0,
+        recall_auxiliary_enabled: bool = False,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
         self.adapter = adapter
@@ -454,6 +455,9 @@ class ContinuityRuntime:
         self.max_cached_turns = max(1, int(max_cached_turns))
         self.attempt_ttl_seconds = max(1.0, float(attempt_ttl_seconds))
         self.summary_timeout_seconds = float(summary_timeout_seconds)
+        if type(recall_auxiliary_enabled) is not bool:
+            raise ValueError("recall_auxiliary_enabled must be a boolean")
+        self.recall_auxiliary_enabled = recall_auxiliary_enabled
         self.monotonic = monotonic or time.monotonic
         self._lock = threading.RLock()
         self._publish_condition = threading.Condition(self._lock)
@@ -679,6 +683,16 @@ class ContinuityRuntime:
         current_sha = _current_message_sha256(current_message)
         if not current_sha:
             return _TurnPlan("", reason="current_identity_invalid")
+        # Original visible dialogue is only a lexical hint, never new origin
+        # authority. Do not borrow tool output, native summaries or notices.
+        recent_query = next((
+            _text(row.get("content"))[-600:] for row in reversed(messages[:current_index])
+            if isinstance(row, Mapping) and row.get("role") == "user"
+            and not row.get("display_kind") and not _is_native_compaction_message(row)
+            and (row.get("message_origin_proof") is None or
+                 isinstance(row.get("message_origin_proof"), Mapping)
+                 and row["message_origin_proof"].get("kind") == "human")
+        ), "")
         usable_window = _usable_context_window(
             context_window_tokens,
             context_window_source,
@@ -719,7 +733,7 @@ class ContinuityRuntime:
                     plan.reserved_output_tokens = reserve
                     plan.provider_key = (model, provider, base_url)
                     return self._add_recall(plan, session_id=session_id, query=current_text,
-                                            reference_at=reference_at)
+                                            reference_at=reference_at, recent_query=recent_query)
                 return plan
             compacted_ids = list(
                 dict(source.get("stats") or {}).get(
@@ -820,9 +834,9 @@ class ContinuityRuntime:
                            if indexed else 0),
         )
         return (self._add_recall(plan, session_id=session_id, query=current_text,
-                                 reference_at=reference_at) if indexed else plan)
+                                 reference_at=reference_at, recent_query=recent_query) if indexed else plan)
 
-    def _add_recall(self, plan, *, session_id, query, reference_at):
+    def _add_recall(self, plan, *, session_id, query, reference_at, recent_query=""):
         index = self.adapter.history_index
         if not callable(getattr(getattr(index, "db", None), "search_history_matches", None)):
             plan.recall_status = "unavailable"
@@ -842,7 +856,8 @@ class ContinuityRuntime:
             recall = asyncio.run(asyncio.wait_for(build_recall(
                 index, self._summary_call, session_id=session_id, query=query,
                 reference_at=reference_at, estimate_messages=self.estimator,
-                source_token_limit=self.source_token_limit, output_token_limit=available),
+                source_token_limit=self.source_token_limit, output_token_limit=available,
+                auxiliary_enabled=self.recall_auxiliary_enabled, recent_query=recent_query),
                 timeout=self.summary_timeout_seconds))
             if recall is None:
                 plan.recall_status = "empty"
@@ -873,13 +888,14 @@ class ContinuityRuntime:
                 return plan
             return combined
         except Exception as error:
-            # A failed auxiliary recall cannot invalidate an already valid
+            # A failed recall cannot invalidate an already valid
             # rolling bridge. It grants no checkpoint or receipt authority.
             plan.recall_status = "failed"
             code = str(error)
             plan.recall_reason = ("recall_auxiliary_timeout" if isinstance(error, TimeoutError)
                                   else code if re.fullmatch(r"recall_[a-z_]+", code)
-                                  else "recall_auxiliary_failed")
+                                  else "recall_auxiliary_failed" if self.recall_auxiliary_enabled
+                                  else "recall_lexical_failed")
             return plan
 
     def _plan_for_request(
@@ -1796,6 +1812,7 @@ class ContinuityRuntime:
                 "reason_counts": reason_counts,
                 "recall_status_counts": recall_counts,
                 "recall_reason_counts": recall_reasons,
+                "recall_auxiliary_enabled": self.recall_auxiliary_enabled,
                 "context_window_source_counts": context_source_counts,
                 "context_window_confidence_counts": context_confidence_counts,
                 "final_provider_estimate": {

@@ -95,6 +95,14 @@ honestly replace this full-prefix contract.
 
 ## Owner-approved independent recall repair
 
+2026-10-23 successor scope: absorb the mother repository's accepted code-only
+recall, relevance and original-passage improvements before resuming host-version
+migration. Default the optional recall auxiliary path off, retain the existing
+two-call mode for explicit opt-in, and leave rolling summaries, H13, checkpoint
+formats, CAS and resource budgets intact. Validate locally, publish for review,
+and stop before merge/deployment/version work. The following 2026-10-02 contract
+describes the retained opt-in path; the successor mapping is RECALL_QUALITY.md.
+
 The owner approved separating bounded question-driven recall from the continuous
 retirement cursor on 2026-10-02. The current source checkpoint is `c0a0d607`;
 the primary worktree is HermesContinuity's existing Block 4 review branch.

@@ -493,7 +493,8 @@ class ContinuityHistoryIndex:
         return projected["groups"], len(rows), actual_bytes
 
     def read_recall(self, session_id, queries, *, max_groups=24, max_rows=2048,
-                    max_bytes=4*1024*1024, start_at=None, end_at=None):
+                    max_bytes=4*1024*1024, start_at=None, end_at=None,
+                    allow_partial_queries=False):
         """Question-selected complete groups, never retirement eligibility."""
         from .hermes_adapter import _failed_source
         search = getattr(self.db, "search_history_matches", None)
@@ -523,9 +524,17 @@ class ContinuityHistoryIndex:
                 return _failed_source("pending", "history_source_changed")
             ranked = {}
             records = {}
+            query_failures = []
             for query in queries:
                 hits = search(session_id, target=target, query=query, max_matches=64, deadline_ms=50)
                 if hits.get("status") != "ready":
+                    # A query resource ceiling says nothing about other hits.
+                    # Keep valid bounded locators, never a changed source or a
+                    # corruption error; the legacy semantic route stays atomic.
+                    if (allow_partial_queries and hits.get("status") == "unavailable"
+                            and hits.get("reason") in {"native_search_sqlite_toobig", "native_search_sqlite_interrupt"}):
+                        query_failures.append(hits["reason"])
+                        continue
                     return _failed_source("unavailable", str(hits.get("reason") or "recall_search_unavailable"))
                 seen = set()
                 for rank, position in enumerate(hits["matches"], 1):
@@ -559,12 +568,15 @@ class ContinuityHistoryIndex:
                 bytes_used += size
                 if len(groups) >= max_groups:
                     break
+            if query_failures and not groups:
+                return _failed_source("unavailable", query_failures[0])
             proof = {"host_token": target, "grouping_rule_version": self.grouping_rule, "groups": selected}
             self.validate_recall(proof, session_id=session_id)
             return {"status": "ready", "groups": groups, "source_proof": proof,
                     "source_snapshot": _sha256(proof),
                     "stats": {"workset_rows": rows_used, "workset_bytes": bytes_used,
-                              "returned_groups": len(groups), "retirement_authority": False}}
+                              "returned_groups": len(groups), "retirement_authority": False,
+                              "query_failure_count": len(query_failures)}}
 
     def validate_recall(self, proof, *, session_id):
         return self._validate_prepared(

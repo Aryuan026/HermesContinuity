@@ -96,10 +96,24 @@ each subsequent use verifies its compact proof against the canonical source.
 
 The nineteen-patch candidate also delivers an ephemeral historical reference
 selected for the current question. It can cross an old live hole without
-retiring it. One bounded host auxiliary call extracts up to three keyword
-queries; Hermes native FTS/LIKE returns body-free positions, then up to 24
-complete verified groups are hydrated within 2,048 rows / 4 MiB. A second
-bounded call selects relevant groups and summarizes only admitted material.
+retiring it. The recall-quality candidate defaults `recall_auxiliary_enabled`
+to `false`: source-text keywords and the preceding visible user carrier supply
+bounded lexical queries, and Hermes native FTS/LIKE returns body-free positions.
+Up to 24 complete verified groups are hydrated within 2,048 rows / 4 MiB.
+Bounded relevance ranking then delivers at most four role-labelled original-text
+passages, with visible ellipses, rather than a generated recall summary. The
+existing group owner keeps the unfinished tail outside the complete-group pool;
+older user-only groups are not blanket-excluded. This is **lexical retrieval,
+not semantic confirmation**. A resource-limited query may leave other verified
+hits usable, explicitly labelled incomplete coverage; no hits plus a failed
+query remains a failure, not an empty history. Source changes and corruption
+still reject delivery.
+
+Set `recall_auxiliary_enabled: true` explicitly to retain the previous two-call
+recall path: keyword/time planning, then candidate selection and summary. The
+switch concerns only question-driven recall; rolling continuity summaries are
+unchanged. This candidate is local-tested, not selected for production; see
+[the donor mapping and verification record](RECALL_QUALITY.md).
 The recall shares the 2,048-token overlay output ceiling with any rolling
 bridge, and the existing final-provider budget guard remains authoritative.
 Auxiliary input is bounded by `source_token_limit`; each native query has a
@@ -108,8 +122,9 @@ exact tokenizer or hard I/O wall-clock guarantees.
 FTS candidates use native newest-posting order rather than scoring every
 matching physical clone; relevance is decided over the admitted complete groups.
 
-This is automatic question-driven **selection and semantic delivery**, not
-merely permission to use a search tool. It is not embedding similarity search
+This is automatic question-driven request delivery, not merely permission to
+use a search tool. The opt-in auxiliary mode adds semantic selection. Neither
+mode is embedding similarity search
 or a promise to find every paraphrase: native keyword candidates remain the
 retrieval ceiling; optional date filtering applies to those bounded candidates.
 There is no transcript copy, new search tool, background whole-history summary
@@ -117,9 +132,10 @@ or persisted recall body. Selected source IDs/hashes are recorded only after
 verified post-settlement. Recall-only delivery never CASes a checkpoint or
 advances retirement. Empty, unproven, failed or over-budget recall leaves the
 native request / valid rolling bridge intact. `/continuity-status` distinguishes
-`selected`, `empty`, `failed`, and a missing search seam. Planning adds one
-bounded auxiliary call per new indexed turn; nonempty candidates can add a
-second, besides any existing rolling summary. Retries reuse the frozen plan;
+`selected`, `empty`, `failed`, a missing search seam, and the auxiliary switch.
+With the switch off there are zero recall model calls. With it on, planning
+adds one bounded auxiliary call per new indexed turn; nonempty candidates can
+add a second, besides any existing rolling summary. Retries reuse the frozen plan;
 next turns plan afresh. Natural relevance and live latency still need a canary.
 Both recall auxiliary calls share `summary_timeout_seconds`, rather than each
 adding a fresh full timeout. A timeout cannot erase an already valid rolling

@@ -154,6 +154,7 @@ class PluginRegistrationTests(unittest.TestCase):
             [name for name, _callback in self.ctx.middleware],
             ["llm_request", "llm_execution"],
         )
+        self.assertFalse(self.ctx.middleware[0][1].__self__.recall_auxiliary_enabled)
         self.assertEqual(
             [name for name, _callback in self.ctx.hooks],
             ["post_api_request", "api_request_error"],

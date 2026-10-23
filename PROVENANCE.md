@@ -1,5 +1,25 @@
 # Provenance
 
+## 2026-10-23 recall-quality adaptation
+
+The owner authorized tracking and absorbing the private AsherieSystem mother's
+effective bucket recall changes, before further Hermes version migration.
+The inspected remote release branch was
+`codex/global-hot-h1-h2-20260816@9e4ca4bd82c9cd1f5293193f5d14bb8d22a59b3e`.
+`recall.py` adapts `_extract_query_terms` and bounded BM25-style ranking from
+`services/home/app/conversation_cache.py`, contextual lexical discovery and
+original-role passage allocation from `history_progressive_read.py`, and
+sentence/ellipsis handling from `warm_memory/search.py::_render_query_excerpt`.
+Relevant changes are `b6f62215`, `51339182`, `b276dcf3`, `936f5fcc`, `68cb5f1e`
+and `98252ba7`. They are adaptations, not an unchanged donor algorithm.
+
+Hermes retains native search grammar, canonical group hydration, H13, source
+validation and physical settlement. Query packing, partial resource-limited
+search coverage and native search grammar adaptation are Hermes-specific
+integration work. No private source data, vocabulary, production config or
+mother memory owner is copied. The pending `3841a7f9` / PR #388 temporal changes
+are not absorbed. The original extraction and license notices below remain.
+
 Hermes Continuity is an owner-authorized extraction from the private
 AsherieSystem revision
 `ddfb1e9aeb7c6f7797912e959a0970c621875c83`. The extraction preserves the
