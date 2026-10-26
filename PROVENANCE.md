@@ -30,6 +30,30 @@ No donor temporal engine, relative chat-date filtering, Warm admission gate or
 other memory owner is ported. The optional auxiliary planner is unchanged.
 The original extraction and license notices below remain.
 
+## 2026-10-26 identifier and calendar-page adaptation
+
+After inspecting release `68593c64dbf94c3db64b1a73de13927431601921`, the owner
+approved two further behaviors from mother PRs #392 / #425. `recall.py` adapts
+the complete Latin identifier grammar (`[a-z0-9]+(?:[-_.][a-z0-9]+)*`), using
+the same match positions for ranking and excerpt anchoring. It does not port
+an alias/association store or give partial names literal credit.
+
+`temporal_recall.py` retains the pure calendar grammar and helpers from
+`services/home/app/temporal_recall.py`, including Chinese dates, spans,
+conversation-versus-event time and topic-free recap routing. The unused packet
+renderer is omitted; day-end precision is adapted from milliseconds to SQLite
+microseconds. Timezone comes from the caller, not a new user-profile resolver.
+This explicitly supersedes the previous increment's no-temporal-engine scope
+only for topic-free calendar recaps; event dates remain lexical content keys.
+
+Hermes-specific integration uses `ContinuityHistoryIndex.read_timeline` over
+the existing body-free group positions and canonical source-prefix proof.
+Frozen bounds, page position and context fingerprint travel in existing receipt
+hashes/counts only after verified post-settlement. This is an adaptation of
+the donor's bounded timeline/omission contract, not a copy of its JSONL scanner,
+cursor wire format, Warm owners, UI, model summaries or memory service.
+The original owner-authorized extraction, attribution and license remain.
+
 Hermes Continuity is an owner-authorized extraction from the private
 AsherieSystem revision
 `ddfb1e9aeb7c6f7797912e959a0970c621875c83`. The extraction preserves the

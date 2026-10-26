@@ -75,6 +75,7 @@ was read or used as a fixture.
 | --- | --- | --- |
 | Original candidate at `4bd7a4d`: lexical, opt-in, registration, H13-v3, real Agent recall | 39/39, 63.529 s | 39/39, 65.368 s |
 | Follow-up: same selection plus four subjectless/date checks | 43/43, 75.756 s | 43/43, 76.688 s |
+| 2026-10-26 successor: identifiers + calendar pages + retained selection | 52/52, 93.706 s | 52/52, 96.173 s |
 | Conditional skips in this final selection | 0 | 0 |
 
 The original ten lexical checks cover short Chinese objects, English terms,
@@ -108,7 +109,7 @@ HERMES_DISABLE_LAZY_INSTALLS=1 \
 HERMES_SOURCE_ROOT=/absolute/exact-06501c3 \
 PYTHONPATH=/absolute/exact-06501c3:/absolute/existing-test-dependencies:tests \
 python -B -m unittest test_lexical_recall test_recall test_plugin_registration \
-  test_h13_v3_adapter test_real_host_recall -v
+  test_h13_v3_adapter test_real_host_recall test_timeline_recall -v
 ```
 
 Two initial offline test starts attempted the host's optional Bedrock package
@@ -133,6 +134,70 @@ overlay expectation. They remain red, not a newly created Green allowlist.
 No claim of an all-Green host/plugin suite follows from focused recall checks.
 
 ## Assembly impact and stopping point
+
+### 2026-10-26 successor: identifiers and calendar pages
+
+Owner-approved delta after `c42ab440b2c433ed7251e870975f0af39a90603d`:
+mother release `68593c64dbf94c3db64b1a73de13927431601921`, PRs #392 / #425.
+The existing subjectless/event-date behavior and optional auxiliary switch stay;
+the previous no-calendar-engine statement describes the earlier increment.
+
+- Complete Latin identifiers share one boundary rule in terms, ranking and
+  passage anchoring. Native search still owns punctuation/quoting. Positive
+  `.`, `_`, `-` names reach native search and physical settlement, while
+  different prefixes, suffixes and compound names earn no literal credit.
+- Topic-free calendar recaps use the donor's pure grammar, then the existing
+  group index, not lexical top-K. One additional SQL index supports bounded
+  `(event_at, ordinal)` seek pages of up to four complete groups. Existing
+  2,048-row / 4-MiB hydration, source/output/shared budgets and H13 rules stay.
+  Timestamp bounds are UTC-normalized, inclusive to SQLite microseconds and
+  capped at the request's as-of time. Calendar interpretation retains the
+  supplied reference offset; the default runtime clock supplies UTC.
+- A frozen compact prefix plus time bounds prevents new appends changing an
+  ongoing recap, without rejecting ordinary appends. Source rewrites, domain
+  changes and group-rule disagreement are rejected. No history bodies enter
+  the index or cursor. Existing origin-bearing group projection is reused.
+- Output says that it contains excerpts and whether complete-group coverage
+  of the frozen range is finished. A budget omission stops the page before
+  that group; continuation starts there, not after it. Oversized first groups
+  fail visibly; no larger budget, skipping, or whole-history model pass.
+- `llm_request` consumes first pages and explicit `继续回顾` / `下一页` follow-ups.
+  The existing receipt stores only hashes and integer counts; preparation,
+  projection and unverified requests never advance it. Same-turn retries reuse
+  the frozen plan. Visible original-user sequence fingerprints bind a receipt
+  to that dialogue, allowing failed-continuation retries but not borrowing from
+  an intervening topic. Manager reload reuses the receipt. Native compaction or
+  loss of the original visible sequence may require a new explicit range;
+  there is no heuristic cursor recovery. Neither mode adds recall model calls
+  for these calendar pages. Rolling summaries/checkpoint publication are unchanged.
+
+The final selection adds identifier, calendar, budget/retry, empty-snapshot,
+source-conflict and native settlement checks. Real discovery plus
+`AIAgent.run_conversation` additionally delivers a four-group page, reloads the
+plugin manager, then delivers the remaining three, checks body-free receipts,
+and retains its synthetic provider-error negative. Disposable SQLite/provider
+fixtures are not a natural model-quality or live QQ acceptance claim.
+Old checkpoint/receipt preservation remains covered by the retained H13 tests.
+The four earlier broader-suite red outcomes above are not reclassified.
+
+Assembly eight-axis successor check: source **yes** (review candidate);
+artifact **yes** (branch publication); dependencies **no**; managed paths **no**;
+units **no**; secrets **no**; capability **yes** (identifier/calendar behavior);
+rollback **no** (additive SQL index and receipt keys, no checkpoint/table-format or
+canonical-data migration; old readers ignore these additions). This records
+candidate impact only, not a selected pin, installation or deployment. No
+HermesPrivateAssembly write is in this authorization. Independent read-only
+intent audit: PASS. Local tests, PR publication, external review and natural
+acceptance remain distinct.
+
+The final successor selection is **52/52 with zero skips** on each interpreter
+(3.11.15 / 3.12.13); Ruff checks and `git diff --check` also pass. The retained
+synthetic duplicate-service and provider-error logs are expected negative cases,
+not hidden test failures. First budget-test calibration selected too little
+space even for the page header; its explicit character estimator now gives a
+deterministic partially filled page and verifies that the next group is not lost.
+
+### Earlier 2026-10-23 candidate impact
 
 Eight-axis check: source identity **yes** (candidate only); artifact publication
 **yes** when this review branch is pushed; runtime dependencies **no**; managed

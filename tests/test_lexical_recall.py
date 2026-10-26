@@ -33,6 +33,21 @@ class Index:
 
 
 class LexicalUnitTests(unittest.TestCase):
+    def test_latin_identifiers_do_not_match_inside_other_names(self):
+        for term in ("ZK7", "ZK7-R1", "ZK7_R1", "ZK7.R1"):
+            with self.subTest(term=term):
+                exact = group("exact", "型号"+term+"，已确认。", "不是另一个型号。")
+                noise = [group("prefix", "A"+term, "前缀不同。"),
+                         group("suffix", term+"Pro", "后缀不同。"),
+                         group("compound", term+"-X", "复合名不同。")]
+                self.assertEqual(recall._ranked_groups([*noise, exact], [term.lower()]), [exact])
+                self.assertEqual(recall._term_positions(term.lower(), "型号"+term+"。"), [2])
+                self.assertIn(term.lower(), recall._query_terms("看看 "+term+"。"))
+        text = "AZK7Pro。" + "无关段落。"*50 + "ZK7，必须保留冷却条件。"
+        excerpt = recall._excerpt(text, ["zk7"], 50)
+        self.assertIn("必须保留冷却条件", excerpt)
+        self.assertNotIn("AZK7Pro", excerpt)
+
     def build(self, index, query, **kwargs):
         self.auxiliary = AsyncMock(side_effect=AssertionError("recall auxiliary must stay off"))
         result = asyncio.run(recall.build_recall(index, self.auxiliary,
@@ -202,6 +217,28 @@ class LexicalNativeTests(unittest.TestCase):
         self.assertIsNone(project(self.runtime, request("12月9日 的安排？"),
                                   session="session-1", turn="date-miss"))
         self.assertEqual(len(self.rows()), len(dates))
+        self.assertEqual(self.llm.calls, [])
+
+    def test_native_compound_identifier_reaches_settlement_without_partial_name_credit(self):
+        self.runtime.recall_auxiliary_enabled = False
+        for number, term in enumerate(("ZK7", "QR8-R1", "QS9_R2", "QT8.R3")):
+            for offset, (text, answer) in enumerate(((term, "exact identifier answer"),
+                                                  ("A"+term+"Pro", "wrong identifier answer"))):
+                stamp = 1787965100+number*4+offset*2
+                self.writer.append_message("session-1", "user", text, timestamp=stamp)
+                self.writer.append_message("session-1", "assistant", answer, timestamp=stamp+1)
+        self.prepare()
+        for number, term in enumerate(("ZK7", "QR8-R1", "QS9_R2", "QT8.R3")):
+            with self.subTest(term=term):
+                wire = request("看看 "+term)
+                turn = f"identifier-{number}"
+                projected = project(self.runtime, wire, session="session-1", turn=turn)
+                self.assertIsNotNone(projected, self.runtime.status_command())
+                self.assertIn("exact identifier answer", repr(projected["request"]))
+                self.assertNotIn("wrong identifier answer", repr(projected["request"]))
+                execute(self.runtime, projected["request"], wire, session="session-1", turn=turn)
+                post(self.runtime, session="session-1", turn=turn)
+        self.assertEqual(len(self.rows()), 4)
         self.assertEqual(self.llm.calls, [])
 
     def test_rewritten_source_removes_lexical_reference_before_provider(self):

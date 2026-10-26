@@ -733,7 +733,8 @@ class ContinuityRuntime:
                     plan.reserved_output_tokens = reserve
                     plan.provider_key = (model, provider, base_url)
                     return self._add_recall(plan, session_id=session_id, query=current_text,
-                                            reference_at=reference_at, recent_query=recent_query)
+                                            reference_at=reference_at, recent_query=recent_query,
+                                            context_messages=messages)
                 return plan
             compacted_ids = list(
                 dict(source.get("stats") or {}).get(
@@ -834,9 +835,29 @@ class ContinuityRuntime:
                            if indexed else 0),
         )
         return (self._add_recall(plan, session_id=session_id, query=current_text,
-                                 reference_at=reference_at, recent_query=recent_query) if indexed else plan)
+                                 reference_at=reference_at, recent_query=recent_query,
+                                 context_messages=messages) if indexed else plan)
 
-    def _add_recall(self, plan, *, session_id, query, reference_at, recent_query=""):
+    @staticmethod
+    def _timeline_context(messages):
+        """Bind a delivered page to visible dialogue, not to a repeated '继续'."""
+        from .recall import TIMELINE_CONTINUE
+        state, previous = _sha256([]), []
+        for row in messages:
+            if (isinstance(row, Mapping) and row.get("role") == "user"
+                    and not row.get("display_kind") and not _is_native_compaction_message(row)):
+                previous.append((state, _text(row.get("content"))))
+                state = _sha256([state, _current_message_sha256(row)])
+        allowed = set()
+        # A failed continuation has no receipt. Retry it from the last settled
+        # page, but never walk backwards across a different conversational topic.
+        for before, text in reversed(previous):
+            if not TIMELINE_CONTINUE.fullmatch(text.strip()):
+                break
+            allowed.add(before)
+        return state, allowed
+
+    def _add_recall(self, plan, *, session_id, query, reference_at, recent_query="", context_messages=()):
         index = self.adapter.history_index
         if not callable(getattr(getattr(index, "db", None), "search_history_matches", None)):
             plan.recall_status = "unavailable"
@@ -848,16 +869,27 @@ class ContinuityRuntime:
             pass
         else:
             return plan
-        from .recall import build_recall
+        from .recall import build_recall, TIMELINE_CONTINUE
         existing = plan.bridge_body.removesuffix("\n" + CONTINUITY_END_BOUNDARY)
         available = self.output_token_limit - self.estimator(
             [{"role": "user", "content": existing}]) if existing else self.output_token_limit
         try:
+            cursor = None
+            if TIMELINE_CONTINUE.fullmatch(query.strip()):
+                _, allowed = self._timeline_context(context_messages)
+                receipt = self.adapter.metadata_store.status_summary(session_id).get("last_delivery") or {}
+                hashes, counts = receipt.get("hashes", {}), receipt.get("counts", {})
+                if (str(receipt.get("status", "")).startswith("delivered")
+                        and receipt["status"] != "delivered_recall_source_changed"
+                        and hashes.get("timeline_context_sha256") in allowed):
+                    cursor = {key: value for values in (hashes, counts) for key, value in values.items()
+                              if key.startswith("timeline_")}
             recall = asyncio.run(asyncio.wait_for(build_recall(
                 index, self._summary_call, session_id=session_id, query=query,
                 reference_at=reference_at, estimate_messages=self.estimator,
                 source_token_limit=self.source_token_limit, output_token_limit=available,
-                auxiliary_enabled=self.recall_auxiliary_enabled, recent_query=recent_query),
+                auxiliary_enabled=self.recall_auxiliary_enabled, recent_query=recent_query,
+                timeline_cursor=cursor),
                 timeout=self.summary_timeout_seconds))
             if recall is None:
                 plan.recall_status = "empty"
@@ -871,6 +903,8 @@ class ContinuityRuntime:
                 plan.recall_status = "over_budget"
                 return plan
             proof = recall["source_proof"]
+            if "timeline" in proof:
+                proof["timeline"]["timeline_context_sha256"] = self._timeline_context(context_messages)[0]
             marker = (f"{CONTINUITY_MARKER_NAMESPACE} "
                            f"source_snapshot={plan.expected_source_snapshot or _sha256(proof)} "
                            f"recall_source={_sha256(proof)} "
@@ -1534,11 +1568,11 @@ class ContinuityRuntime:
         }
         if plan.recall_proof is not None:
             hashes["recall_source_sha256"] = _sha256(plan.recall_proof)
-        return (
-            receipt_id,
-            hashes,
-            {"represented_source_group_count": len(plan.source_ids)},
-        )
+        counts = {"represented_source_group_count": len(plan.source_ids)}
+        if plan.recall_proof is not None:
+            for key, value in plan.recall_proof.get("timeline", {}).items():
+                (counts if type(value) is int else hashes)[key] = value
+        return receipt_id, hashes, counts
 
     def post_api_request(
         self, *, session_id: str, turn_id: str, api_request_id: str,
