@@ -56,6 +56,7 @@ class RecallTests(unittest.TestCase):
         self.prepare()
         self.llm = RecallLlm()
         self.runtime = ContinuityRuntime(self.adapter, self.llm,
+            recall_auxiliary_enabled=True,
             clock=lambda: "2026-08-30T00:00:00+00:00")
         self.addCleanup(self.runtime.clear)
 
@@ -101,6 +102,7 @@ class RecallTests(unittest.TestCase):
         for flag in ("empty", "invalid_id"):
             self.runtime.clear()
             self.runtime = ContinuityRuntime(self.adapter, RecallLlm(**{flag: True}),
+                                             recall_auxiliary_enabled=True,
                                              clock=lambda: "2026-08-30T00:00:00+00:00")
             self.assertIsNone(project(self.runtime, request(), session="session-1"))
             self.assertEqual(self.rows(), [])

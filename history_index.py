@@ -7,7 +7,7 @@ history, but neither this database nor a Python cache keeps those bodies.
 from __future__ import annotations
 
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import threading
 import time
@@ -19,6 +19,7 @@ from .resource_budget import PREPARATION_LOCK, PREPARATION_WORKSETS
 
 
 GROUP_RULE = "hermes_continuity_group_index.v1"
+H13_GROUP_RULE = "hermes_continuity_group_index.h13.v1"
 
 
 class _Occurrences:
@@ -60,9 +61,11 @@ class _Occurrences:
 
 
 class ContinuityHistoryIndex:
-    def __init__(self, session_db, metadata_store):
+    def __init__(self, session_db, metadata_store, *, origin_classifier=None):
         self.db = session_db
         self.store = metadata_store
+        self.origin_classifier = origin_classifier
+        self.grouping_rule = H13_GROUP_RULE if origin_classifier else GROUP_RULE
         self.owner_id = "continuity-" + uuid.uuid4().hex
         self.activation_epoch = None
         self._closed = False
@@ -75,6 +78,10 @@ class ContinuityHistoryIndex:
         self._pending_group = None
         with closing(self.store._connect()) as connection:
             connection.executescript("""
+                CREATE TABLE IF NOT EXISTS continuity_group_rules (
+                    session_id TEXT PRIMARY KEY,
+                    grouping_rule TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS continuity_group_progress (
                     session_id TEXT PRIMARY KEY,
                     position INTEGER NOT NULL,
@@ -102,6 +109,8 @@ class ContinuityHistoryIndex:
                     ON continuity_group_index(session_id,end_position);
                 CREATE INDEX IF NOT EXISTS continuity_group_uncompacted
                     ON continuity_group_index(session_id,compacted,ordinal);
+                CREATE INDEX IF NOT EXISTS continuity_group_time
+                    ON continuity_group_index(session_id,event_at,ordinal);
                 CREATE TABLE IF NOT EXISTS continuity_group_occurrences (
                     session_id TEXT NOT NULL,
                     kind TEXT NOT NULL,
@@ -213,6 +222,12 @@ class ContinuityHistoryIndex:
             remaining |= cursor.rowcount == 256
         return remaining
 
+    def _rule_matches(self, connection, session_id):
+        row = connection.execute(
+            "SELECT grouping_rule FROM continuity_group_rules WHERE session_id=?",
+            (session_id,)).fetchone()
+        return (row[0] if row else GROUP_RULE) == self.grouping_rule
+
     def prepare_step(self, session_id):
         """A finite preparation quantum, also callable by isolated tests."""
         if self._closed:
@@ -262,11 +277,26 @@ class ContinuityHistoryIndex:
                 "schema": "thread_continuity_prefix_descriptor.v1", "through_anchor": "",
                 "canonical_count": 0, "group_count": 0, "prefix_hash": empty_token["prefix_hash"],
                 "group_root": thread_continuity_group_root_seed(
-                    domain_id=target["domain_id"], grouping_rule_version=GROUP_RULE),
+                    domain_id=target["domain_id"], grouping_rule_version=self.grouping_rule),
             }
             if progress is None:
                 connection.execute("INSERT INTO continuity_group_progress VALUES (?,?,?,?,?,NULL,0)",
                                    (session_id, 0, 0, _json_text(empty_prefix), "{}"))
+                progress = connection.execute(
+                    "SELECT * FROM continuity_group_progress WHERE session_id=?", (session_id,)
+                ).fetchone()
+            if not self._rule_matches(connection, session_id):
+                # Only derived grouping is retired. Preserve canonical data,
+                # checkpoint bytes and receipts; reuse bounded suffix cleanup.
+                connection.execute(
+                    "UPDATE continuity_group_progress SET position=0,group_count=0,"
+                    "prefix_json=?,head_json='{}',invalid_from=0,ready=0 WHERE session_id=?",
+                    (_json_text(empty_prefix), session_id))
+                connection.execute(
+                    "INSERT INTO continuity_group_rules VALUES (?,?) ON CONFLICT(session_id) "
+                    "DO UPDATE SET grouping_rule=excluded.grouping_rule",
+                    (session_id, self.grouping_rule))
+                self._pending_group = None
                 progress = connection.execute(
                     "SELECT * FROM continuity_group_progress WHERE session_id=?", (session_id,)
                 ).fetchone()
@@ -333,6 +363,7 @@ class ContinuityHistoryIndex:
                     session_id, rows, full_prefix=False, identity_occurrences=identities,
                     group_occurrences=groups, prior_group_count=prefix["group_count"],
                     include_group_boundaries=True,
+                    origin_classifier=self.origin_classifier,
                 )
                 if projected.get("status") != "ready":
                     return {"status": "fault", "reason": projected.get("error", "group_projection_failed")}
@@ -361,6 +392,7 @@ class ContinuityHistoryIndex:
                 session_id, rows[:consumed], full_prefix=False, identity_occurrences=identities,
                 group_occurrences=groups, prior_group_count=prefix["group_count"],
                 include_group_boundaries=True,
+                origin_classifier=self.origin_classifier,
             )
             records = []
             for group, start, end, compacted in zip(projected["groups"], projected["_group_starts"], projected["_group_ends"],
@@ -453,6 +485,7 @@ class ContinuityHistoryIndex:
             group_occurrences=_Occurrences(connection, session_id, "group", start_position),
             prior_group_count=records[0]["ordinal"]-1 if records else 0,
             include_group_boundaries=True,
+            origin_classifier=self.origin_classifier,
         )
         if projected.get("status") != "ready" or len(projected["groups"]) != len(records):
             raise ValueError("group_index_projection_mismatch")
@@ -461,8 +494,109 @@ class ContinuityHistoryIndex:
                 raise ValueError("group_index_projection_mismatch")
         return projected["groups"], len(rows), actual_bytes
 
+    def read_timeline(self, session_id, *, start_at=None, end_at=None, cursor=None,
+                      max_groups=4, max_rows=2048, max_bytes=4*1024*1024):
+        """Page the existing group index; cursor contains only hashes/counts.
+
+        A frozen compact prefix is revalidated against the current host head,
+        so ordinary tail appends work without accepting prefix rewrites.
+        """
+        from .hermes_adapter import _failed_source
+        if any(type(value) is not int or not 1 <= value <= cap for value, cap in
+               ((max_groups, 4), (max_rows, 2048), (max_bytes, 4*1024*1024))):
+            raise ValueError("recall_timeline_budget_invalid")
+        with closing(self.store._connect()) as connection:
+            connection.execute("BEGIN")
+            progress = connection.execute(
+                "SELECT * FROM continuity_group_progress WHERE session_id=?", (session_id,)).fetchone()
+            if (not self._rule_matches(connection, session_id) or progress is None
+                    or not progress["ready"] or progress["invalid_from"] is not None):
+                self.request(session_id)
+                return _failed_source("pending", "history_preparation_pending")
+            prefix = json.loads(progress["prefix_json"])
+            after = 0
+            if cursor is not None:
+                for key in ("timeline_snapshot_groups", "timeline_after_ordinal", "timeline_start_us", "timeline_end_us"):
+                    if type(cursor.get(key)) is not int or cursor[key] < 0:
+                        raise ValueError("recall_timeline_cursor_invalid")
+                count, after = cursor["timeline_snapshot_groups"], cursor["timeline_after_ordinal"]
+                if after > count or count > progress["group_count"]:
+                    raise ValueError("recall_timeline_cursor_invalid")
+                if count:
+                    row = connection.execute(
+                        "SELECT prefix_json FROM continuity_group_index WHERE session_id=? AND ordinal=?",
+                        (session_id, count)).fetchone()
+                    if row is None:
+                        raise ValueError("recall_timeline_source_changed")
+                    prefix = json.loads(row[0])
+                else:
+                    from .checkpoint_v3 import thread_continuity_group_root_seed
+                    prefix = {"canonical_count": 0, "group_count": 0, "through_anchor": "",
+                              "prefix_hash": cursor.get("timeline_prefix_hash"),
+                              "group_root": thread_continuity_group_root_seed(
+                                  domain_id=session_id, grouping_rule_version=self.grouping_rule)}
+                if (prefix["group_root"] != cursor.get("timeline_group_root")
+                        or prefix["prefix_hash"] != cursor.get("timeline_prefix_hash")):
+                    raise ValueError("recall_timeline_source_changed")
+                epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+                start_at = (epoch + timedelta(microseconds=cursor["timeline_start_us"])).isoformat()
+                end_at = (epoch + timedelta(microseconds=cursor["timeline_end_us"])).isoformat()
+            start, end = datetime.fromisoformat(start_at), datetime.fromisoformat(end_at)
+            if start.tzinfo is None or end.tzinfo is None or start > end:
+                raise ValueError("recall_timeline_window_invalid")
+            start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+            target = self._prefix(json.loads(progress["head_json"]), prefix)
+            validation = self.db.validate_history_prefix(target)
+            if validation.get("status") != "valid" or validation.get("invalidated_from_position"):
+                raise ValueError("recall_timeline_source_changed")
+            params = [session_id, prefix["group_count"], start.isoformat(), end.isoformat()]
+            seek = ""
+            if after:
+                row = connection.execute(
+                    "SELECT event_at FROM continuity_group_index WHERE session_id=? AND ordinal=?",
+                    (session_id, after)).fetchone()
+                if row is None:
+                    raise ValueError("recall_timeline_source_changed")
+                seek = " AND (event_at,ordinal)>(?,?)"
+                params.extend((row[0], after))
+            deadline = time.monotonic() + .05
+            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            try:
+                records = connection.execute(
+                    "SELECT * FROM continuity_group_index WHERE session_id=? AND ordinal<=? "
+                    "AND event_at>=? AND event_at<=?" + seek +
+                    " ORDER BY event_at,ordinal LIMIT ?", [*params, max_groups+1]).fetchall()
+            finally:
+                connection.set_progress_handler(None, 0)
+            groups, selected, ordinals, rows, size = [], [], [], 0, 0
+            for record in records[:max_groups]:
+                count = record["end_position"] - record["start_position"] + 1
+                if rows+count > max_rows or size+record["stored_bytes"] > max_bytes:
+                    if not groups:
+                        raise ValueError("recall_timeline_group_over_budget")
+                    break
+                hydrated, count, used = self._hydrate_groups(
+                    connection, session_id, target, [record], max_rows-rows, max_bytes-size)
+                groups.extend(hydrated)
+                selected.append({"group_id": record["group_id"], "fingerprint": record["fingerprint"]})
+                ordinals.append(record["ordinal"])
+                rows, size = rows+count, size+used
+            proof = {"host_token": target, "grouping_rule_version": self.grouping_rule, "groups": selected}
+            self.validate_recall(proof, session_id=session_id)
+            return {"status": "ready", "groups": groups, "source_proof": proof,
+                    "ordinals": ordinals,
+                    "timeline": {"timeline_snapshot_groups": prefix["group_count"],
+                        "timeline_after_ordinal": after,
+                        "timeline_start_us": round(start.timestamp()*1_000_000),
+                        "timeline_end_us": round(end.timestamp()*1_000_000),
+                        "timeline_group_root": prefix["group_root"],
+                        "timeline_prefix_hash": prefix["prefix_hash"],
+                        "timeline_more": int(len(records) > len(groups))},
+                    "stats": {"workset_rows": rows, "workset_bytes": size}}
+
     def read_recall(self, session_id, queries, *, max_groups=24, max_rows=2048,
-                    max_bytes=4*1024*1024, start_at=None, end_at=None):
+                    max_bytes=4*1024*1024, start_at=None, end_at=None,
+                    allow_partial_queries=False):
         """Question-selected complete groups, never retirement eligibility."""
         from .hermes_adapter import _failed_source
         search = getattr(self.db, "search_history_matches", None)
@@ -481,7 +615,8 @@ class ContinuityHistoryIndex:
             progress = connection.execute(
                 "SELECT * FROM continuity_group_progress WHERE session_id=?", (session_id,)
             ).fetchone()
-            if progress is None or not progress["ready"] or progress["invalid_from"] is not None:
+            if (not self._rule_matches(connection, session_id) or progress is None
+                    or not progress["ready"] or progress["invalid_from"] is not None):
                 self.request(session_id)
                 return _failed_source("pending", "history_preparation_pending")
             target = self._prefix(json.loads(progress["head_json"]), json.loads(progress["prefix_json"]))
@@ -491,9 +626,17 @@ class ContinuityHistoryIndex:
                 return _failed_source("pending", "history_source_changed")
             ranked = {}
             records = {}
+            query_failures = []
             for query in queries:
                 hits = search(session_id, target=target, query=query, max_matches=64, deadline_ms=50)
                 if hits.get("status") != "ready":
+                    # A query resource ceiling says nothing about other hits.
+                    # Keep valid bounded locators, never a changed source or a
+                    # corruption error; the legacy semantic route stays atomic.
+                    if (allow_partial_queries and hits.get("status") == "unavailable"
+                            and hits.get("reason") in {"native_search_sqlite_toobig", "native_search_sqlite_interrupt"}):
+                        query_failures.append(hits["reason"])
+                        continue
                     return _failed_source("unavailable", str(hits.get("reason") or "recall_search_unavailable"))
                 seen = set()
                 for rank, position in enumerate(hits["matches"], 1):
@@ -527,21 +670,33 @@ class ContinuityHistoryIndex:
                 bytes_used += size
                 if len(groups) >= max_groups:
                     break
-            proof = {"host_token": target, "grouping_rule_version": GROUP_RULE, "groups": selected}
+            if query_failures and not groups:
+                return _failed_source("unavailable", query_failures[0])
+            proof = {"host_token": target, "grouping_rule_version": self.grouping_rule, "groups": selected}
             self.validate_recall(proof, session_id=session_id)
             return {"status": "ready", "groups": groups, "source_proof": proof,
                     "source_snapshot": _sha256(proof),
                     "stats": {"workset_rows": rows_used, "workset_bytes": bytes_used,
-                              "returned_groups": len(groups), "retirement_authority": False}}
+                              "returned_groups": len(groups), "retirement_authority": False,
+                              "query_failure_count": len(query_failures)}}
 
     def validate_recall(self, proof, *, session_id):
+        return self._validate_prepared(
+            self._validate_recall_once, proof, session_id=session_id,
+            pending_errors={"recall_source_pending"})
+
+    def _validate_recall_once(self, proof, *, session_id):
         target = proof["host_token"]
-        if target["domain_id"] != session_id or proof["grouping_rule_version"] != GROUP_RULE:
+        if target["domain_id"] != session_id or proof["grouping_rule_version"] != self.grouping_rule:
             raise ValueError("recall_domain_or_group_rule_changed")
         validation = self.db.validate_history_prefix(target)
+        if validation.get("status") == "pending":
+            raise ValueError("recall_source_pending")
         if validation.get("status") != "valid" or validation.get("invalidated_from_position"):
             raise ValueError("recall_source_changed")
         with closing(self.store._connect()) as connection:
+            if not self._rule_matches(connection, session_id):
+                raise ValueError("recall_group_rule_changed")
             for group in proof["groups"]:
                 row = connection.execute(
                     "SELECT fingerprint,end_position FROM continuity_group_index WHERE session_id=? AND group_id=?",
@@ -560,7 +715,8 @@ class ContinuityHistoryIndex:
             progress = connection.execute(
                 "SELECT * FROM continuity_group_progress WHERE session_id=?", (session_id,)
             ).fetchone()
-            if progress is None or not progress["ready"] or progress["invalid_from"] is not None:
+            if (not self._rule_matches(connection, session_id) or progress is None
+                    or not progress["ready"] or progress["invalid_from"] is not None):
                 last = self.status(session_id)
                 self.request(session_id)
                 if last["status"] == "overflow":
@@ -584,7 +740,7 @@ class ContinuityHistoryIndex:
                 "canonical_count": 0, "group_count": 0,
                 "prefix_hash": empty["token"]["prefix_hash"],
                 "group_root": thread_continuity_group_root_seed(
-                    domain_id=target["domain_id"], grouping_rule_version=GROUP_RULE),
+                    domain_id=target["domain_id"], grouping_rule_version=self.grouping_rule),
             }
             first_live = connection.execute(
                 "SELECT ordinal FROM continuity_group_index WHERE session_id=? AND compacted=0 "
@@ -647,7 +803,7 @@ class ContinuityHistoryIndex:
             # complete group. Its later provider sidecar must not rewrite the
             # proof of the preceding complete dialogue prefix.
             complete_target = self._prefix(target, last_prefix)
-            proof = {"host_token": complete_target, "grouping_rule_version": GROUP_RULE,
+            proof = {"host_token": complete_target, "grouping_rule_version": self.grouping_rule,
                      "group_count": progress["group_count"], "group_root": last_prefix["group_root"]}
             eligibility = {
                 "schema": "thread_continuity_retirement_eligibility.v1", "status": "eligible",
@@ -669,14 +825,20 @@ class ContinuityHistoryIndex:
             return result
 
     def validate_checkpoint(self, checkpoint, *, session_id):
+        return self._validate_prepared(
+            self._validate_checkpoint_once, checkpoint, session_id=session_id,
+            pending_errors={"checkpoint_source_pending", "checkpoint_index_pending"})
+
+    def _validate_prepared(self, validator, value, *, session_id, pending_errors):
+        """Share the existing bounded checkpoint wait, never a foreground scan."""
         deadline = time.monotonic() + 0.1
         while True:
             with self._wake:
                 completed = self._completed
             try:
-                return self._validate_checkpoint_once(checkpoint, session_id=session_id)
+                return validator(value, session_id=session_id)
             except ValueError as error:
-                if str(error) not in {"checkpoint_source_pending", "checkpoint_index_pending"}:
+                if str(error) not in pending_errors:
                     raise
                 self.request(session_id)
                 with self._wake:
@@ -692,7 +854,7 @@ class ContinuityHistoryIndex:
                                     thread_continuity_group_root_seed)
         checkpoint = normalize_thread_continuity_checkpoint_v3(checkpoint)
         proof = checkpoint["source_proof"]
-        if proof["grouping_rule_version"] != GROUP_RULE:
+        if proof["grouping_rule_version"] != self.grouping_rule:
             raise ValueError("checkpoint_grouping_rule_changed")
         target = proof["host_token"]
         if target["domain_id"] != session_id:
@@ -704,6 +866,8 @@ class ContinuityHistoryIndex:
             raise ValueError("checkpoint_source_changed")
         with closing(self.store._connect()) as connection:
             connection.execute("BEGIN")
+            if not self._rule_matches(connection, session_id):
+                raise ValueError("checkpoint_grouping_rule_changed")
             progress = connection.execute(
                 "SELECT head_json,prefix_json,ready,invalid_from FROM continuity_group_progress WHERE session_id=?",
                 (session_id,),
@@ -727,7 +891,7 @@ class ContinuityHistoryIndex:
                     return {"through_anchor": "", "canonical_count": 0, "group_count": 0,
                             "prefix_hash": empty["token"]["prefix_hash"],
                             "group_root": thread_continuity_group_root_seed(
-                                domain_id=session_id, grouping_rule_version=GROUP_RULE)}
+                                domain_id=session_id, grouping_rule_version=self.grouping_rule)}
                 row = connection.execute(
                     "SELECT prefix_json FROM continuity_group_index WHERE session_id=? AND ordinal=?",
                     (session_id, count),

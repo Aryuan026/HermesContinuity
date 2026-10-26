@@ -1,5 +1,59 @@
 # Provenance
 
+## 2026-10-23 recall-quality adaptation
+
+The owner authorized tracking and absorbing the private AsherieSystem mother's
+effective bucket recall changes, before further Hermes version migration.
+The inspected remote release branch was
+`codex/global-hot-h1-h2-20260816@9e4ca4bd82c9cd1f5293193f5d14bb8d22a59b3e`.
+`recall.py` adapts `_extract_query_terms` and bounded BM25-style ranking from
+`services/home/app/conversation_cache.py`, contextual lexical discovery and
+original-role passage allocation from `history_progressive_read.py`, and
+sentence/ellipsis handling from `warm_memory/search.py::_render_query_excerpt`.
+Relevant changes are `b6f62215`, `51339182`, `b276dcf3`, `936f5fcc`, `68cb5f1e`
+and `98252ba7`. They are adaptations, not an unchanged donor algorithm.
+
+Hermes retains native search grammar, canonical group hydration, H13, source
+validation and physical settlement. Query packing, partial resource-limited
+search coverage and native search grammar adaptation are Hermes-specific
+integration work. No private source data, vocabulary, production config or
+mother memory owner is copied.
+
+The owner subsequently approved two bounded adaptations from merged PR #388,
+inspected at release `26681d182337b24a645cc8ce3353e56a54acb45d`:
+`history_progressive_read.py::_is_history_reference` supplies the full-match
+subjectless-follow-up grammar, and
+`conversation_cache.py::_extract_query_terms` supplies event-date content keys.
+They extend the existing query builder only. Hermes native search continues to
+own date punctuation/routing; the existing `reference_at` upper bound remains.
+No donor temporal engine, relative chat-date filtering, Warm admission gate or
+other memory owner is ported. The optional auxiliary planner is unchanged.
+The original extraction and license notices below remain.
+
+## 2026-10-26 identifier and calendar-page adaptation
+
+After inspecting release `68593c64dbf94c3db64b1a73de13927431601921`, the owner
+approved two further behaviors from mother PRs #392 / #425. `recall.py` adapts
+the complete Latin identifier grammar (`[a-z0-9]+(?:[-_.][a-z0-9]+)*`), using
+the same match positions for ranking and excerpt anchoring. It does not port
+an alias/association store or give partial names literal credit.
+
+`temporal_recall.py` retains the pure calendar grammar and helpers from
+`services/home/app/temporal_recall.py`, including Chinese dates, spans,
+conversation-versus-event time and topic-free recap routing. The unused packet
+renderer is omitted; day-end precision is adapted from milliseconds to SQLite
+microseconds. Timezone comes from the caller, not a new user-profile resolver.
+This explicitly supersedes the previous increment's no-temporal-engine scope
+only for topic-free calendar recaps; event dates remain lexical content keys.
+
+Hermes-specific integration uses `ContinuityHistoryIndex.read_timeline` over
+the existing body-free group positions and canonical source-prefix proof.
+Frozen bounds, page position and context fingerprint travel in existing receipt
+hashes/counts only after verified post-settlement. This is an adaptation of
+the donor's bounded timeline/omission contract, not a copy of its JSONL scanner,
+cursor wire format, Warm owners, UI, model summaries or memory service.
+The original owner-authorized extraction, attribution and license remain.
+
 Hermes Continuity is an owner-authorized extraction from the private
 AsherieSystem revision
 `ddfb1e9aeb7c6f7797912e959a0970c621875c83`. The extraction preserves the

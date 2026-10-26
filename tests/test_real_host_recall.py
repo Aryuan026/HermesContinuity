@@ -70,10 +70,44 @@ class RealHostRecallTests(unittest.TestCase):
                 with sqlite3.connect(ledger) as connection:
                     receipts = connection.execute("SELECT status,hashes_json FROM continuity_receipts").fetchall()
                     self.assertEqual(len(receipts), number+1)
-                    self.assertTrue(all(row[0] == "delivered_recall" for row in receipts))
+                    self.assertTrue(all(row[0] == "delivered_recall" for row in receipts), self._diagnostics())
                     self.assertTrue(all("recall_source_sha256" in json.loads(row[1]) for row in receipts))
                     self.assertNotIn("12万元", repr(receipts))
                     self.assertEqual(connection.execute("SELECT COUNT(*) FROM continuity_checkpoints_v3").fetchone()[0], 0)
+                if number == 0:
+                    host.plugins._reset_plugin_managers_for_tests()
+                    host.hermes_config._config_cache = None
+            # Real discovery + run_conversation, including persisted user rows,
+            # must consume the same page receipt after manager reload.
+            for number in range(7):
+                for offset, role in enumerate(("user", "assistant")):
+                    self.session_db.append_message("long-mouth", role, f"calendar-topic-{number}",
+                        timestamp=1785628800+number*86400+offset)
+            history = []
+            for number, question in enumerate(("回顾2026年8月的聊天", "继续回顾")):
+                host.plugins.discover_plugins()
+                self._prepare_index()
+                agent = self._agent()
+                self.agents.append(agent)
+                agent._interruptible_streaming_api_call = provider
+                result = agent.run_conversation(question, conversation_history=history,
+                                                task_id=f"timeline-{number}")
+                self.assertEqual(result["final_response"], "long-history answer")
+                expected = range(4) if number == 0 else range(4, 7)
+                omitted = range(4, 7) if number == 0 else range(4)
+                for item in expected:
+                    self.assertIn(f"calendar-topic-{item}", repr(bodies[-1]))
+                for item in omitted:
+                    self.assertNotIn(f"calendar-topic-{item}", repr(bodies[-1]))
+                with sqlite3.connect(ledger) as connection:
+                    rows = connection.execute(
+                        "SELECT status,hashes_json,counts_json FROM continuity_receipts ORDER BY recorded_at").fetchall()
+                self.assertEqual(len(rows), number+3, self._diagnostics())
+                self.assertEqual(rows[-1][0], "delivered_recall", self._diagnostics())
+                self.assertEqual(json.loads(rows[-1][2])["timeline_more"], 1-number)
+                self.assertIn("timeline_context_sha256", json.loads(rows[-1][1]))
+                self.assertNotIn("calendar-topic-", repr(rows))
+                history = result["messages"]
                 if number == 0:
                     host.plugins._reset_plugin_managers_for_tests()
                     host.hermes_config._config_cache = None
@@ -86,5 +120,5 @@ class RealHostRecallTests(unittest.TestCase):
             agent._interruptible_streaming_api_call = failing
             result = agent.run_conversation("樱桃项目预算", conversation_history=[], task_id="recall-error")
             self.assertFalse(result["completed"])
-            self.assertEqual(host._sqlite_count(ledger, "continuity_receipts"), 2)
-            self.assertEqual(self.llm.calls, ["thread_continuity_recall_query", "thread_continuity_recall_summary"]*3)
+            self.assertEqual(host._sqlite_count(ledger, "continuity_receipts"), 4)
+            self.assertEqual(self.llm.calls, [])
