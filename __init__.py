@@ -132,6 +132,7 @@ def register(ctx: Any) -> None:
         summary_timeout_seconds=ctx.get_config(
             "summary_timeout_seconds", default=120.0
         ),
+        recall_auxiliary_enabled=ctx.get_config("recall_auxiliary_enabled", default=False),
     )
     ctx.on_unload(runtime.clear)
 

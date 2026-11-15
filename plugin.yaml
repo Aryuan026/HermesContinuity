@@ -11,6 +11,10 @@ provides_hooks:
   - post_api_request
   - api_request_error
 config_schema:
+  recall_auxiliary_enabled:
+    type: bool
+    default: false
+    description: Enable the two optional recall model calls; false uses bounded lexical original-text references, not semantic confirmation. Rolling bridge summaries are unchanged.
   additional_human_sources:
     type: list
     default: []

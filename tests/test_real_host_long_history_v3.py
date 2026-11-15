@@ -126,7 +126,14 @@ class RealHostLongHistoryV3Tests(unittest.TestCase):
         self.validation_errors: list[str] = []
         self.last_bundle = {}
         self.last_prepared = {}
-        self.session_db = SessionDB(self.home / "state.db")
+        try:
+            from hermes_state_registry import acquire
+        except ImportError:  # Released 0.20.5 test host has no registry.
+            self.session_db = SessionDB(self.home / "state.db")
+        else:
+            # Reuse the accepted .21.5 fixture's live Gateway writer owner;
+            # preparation must not open/close a competing transient writer.
+            self.session_db = acquire(self.home / "state.db")
         self.session_db.create_session("long-mouth", "cli")
         now = time.time() - 1_800
         self.session_db.append_message("long-mouth", "user", "legacy notification",
