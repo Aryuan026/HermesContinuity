@@ -1,5 +1,20 @@
 # Progress
 
+## 2026-11-15 — recall maintenance qualified for owner-authorized delivery
+
+Current question and contextual hints retain separate search/admission/ranking
+routes; historical quotes distinguish object, time, completion and speaker
+confirmation. Broad qualification also repairs combined checkpoint/recall
+receipt IDs and closes hydrated snapshots before fresh recall/timeline
+validation, retaining CAS, proofs, format and budgets. Deterministic old-code
+lock failure and new/reused checkpoint positives are covered.
+Final local focused selection: 58/58 on Python 3.11.15 and 3.12.13, zero skips;
+paired entrypoints pass on both after the checkpoint correction. Intermediate
+failures remain in [verification](RECALL_QUALITY.md). No Actions or host upgrade.
+Owner authorized PR #10 merge, Continuity-only Tencent deployment and recovery
+pin synchronization. Exact installed source/health and natural quality are
+separate states recorded in the private Assembly after target readback.
+
 - Lifecycle: active, local implementation.
 - Manifest version: 0.4.1.
 - Source extraction: completed from owner-authorized AsherieSystem revision

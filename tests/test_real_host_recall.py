@@ -15,10 +15,24 @@ class RealHostRecallTests(unittest.TestCase):
     historical_image_bytes = 16 * 1024 * 1024
     tearDown = host.RealHostLongHistoryV3Tests.tearDown
     _agent = host.RealHostLongHistoryV3Tests._agent
-    _prepare_index = host.RealHostLongHistoryV3Tests._prepare_index
     _continuity_status = host.RealHostLongHistoryV3Tests._continuity_status
     _diagnostics = host.RealHostLongHistoryV3Tests._diagnostics
     _acquire_without_relay = staticmethod(host.RealHostLongHistoryV3Tests._acquire_without_relay)
+
+    def _prepare_index(self):
+        host.RealHostLongHistoryV3Tests._prepare_index(self)
+        service = host.plugins.get_plugin_manager()._get_plugin_service("hermes-continuity:canonical-source.v2")
+        index = service.adapter.history_index
+        if not getattr(index, "_recall_diagnostic_installed", False):
+            original = index.read_recall
+            def observed(*args, **kwargs):
+                try:
+                    return original(*args, **kwargs)
+                except Exception as error:
+                    self.validation_errors.append("recall:"+type(error).__name__+":"+str(error)[:160])
+                    raise
+            index.read_recall = observed
+            index._recall_diagnostic_installed = True
 
     def setUp(self):
         host.RealHostLongHistoryV3Tests.setUp(self)
@@ -77,6 +91,22 @@ class RealHostRecallTests(unittest.TestCase):
                 if number == 0:
                     host.plugins._reset_plugin_managers_for_tests()
                     host.hermes_config._config_cache = None
+            for number in range(40):
+                self.session_db.append_message("long-mouth", "user", "ZK7 电池更换步骤")
+                self.session_db.append_message("long-mouth", "assistant", "先关闭电源。")
+            self.session_db.append_message("long-mouth", "user", "镜头保修期")
+            self.session_db.append_message("long-mouth", "assistant", "保修三年。")
+            self._prepare_index()
+            agent = self._agent()
+            self.agents.append(agent)
+            agent._interruptible_streaming_api_call = provider
+            result = agent.run_conversation("它的镜头保修期是多久？", conversation_history=[
+                {"role": "user", "content": "ZK7 电池更换步骤"},
+                {"role": "assistant", "content": "接着说。"}], task_id="current-question-priority")
+            self.assertEqual(result["final_response"], "long-history answer")
+            self.assertIn("保修三年", repr(bodies[-1]), self._diagnostics())
+            self.assertIn("an old assistant inference is not human confirmation", repr(bodies[-1]))
+            self.assertEqual(host._sqlite_count(ledger, "continuity_receipts"), 3)
             # Real discovery + run_conversation, including persisted user rows,
             # must consume the same page receipt after manager reload.
             for number in range(7):
@@ -102,7 +132,7 @@ class RealHostRecallTests(unittest.TestCase):
                 with sqlite3.connect(ledger) as connection:
                     rows = connection.execute(
                         "SELECT status,hashes_json,counts_json FROM continuity_receipts ORDER BY recorded_at").fetchall()
-                self.assertEqual(len(rows), number+3, self._diagnostics())
+                self.assertEqual(len(rows), number+4, self._diagnostics())
                 self.assertEqual(rows[-1][0], "delivered_recall", self._diagnostics())
                 self.assertEqual(json.loads(rows[-1][2])["timeline_more"], 1-number)
                 self.assertIn("timeline_context_sha256", json.loads(rows[-1][1]))
@@ -120,5 +150,5 @@ class RealHostRecallTests(unittest.TestCase):
             agent._interruptible_streaming_api_call = failing
             result = agent.run_conversation("樱桃项目预算", conversation_history=[], task_id="recall-error")
             self.assertFalse(result["completed"])
-            self.assertEqual(host._sqlite_count(ledger, "continuity_receipts"), 4)
+            self.assertEqual(host._sqlite_count(ledger, "continuity_receipts"), 5)
             self.assertEqual(self.llm.calls, [])

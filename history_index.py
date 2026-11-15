@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from itertools import zip_longest
 import json
 import threading
 import time
@@ -582,21 +583,23 @@ class ContinuityHistoryIndex:
                 ordinals.append(record["ordinal"])
                 rows, size = rows+count, size+used
             proof = {"host_token": target, "grouping_rule_version": self.grouping_rule, "groups": selected}
-            self.validate_recall(proof, session_id=session_id)
-            return {"status": "ready", "groups": groups, "source_proof": proof,
-                    "ordinals": ordinals,
-                    "timeline": {"timeline_snapshot_groups": prefix["group_count"],
-                        "timeline_after_ordinal": after,
-                        "timeline_start_us": round(start.timestamp()*1_000_000),
-                        "timeline_end_us": round(end.timestamp()*1_000_000),
-                        "timeline_group_root": prefix["group_root"],
-                        "timeline_prefix_hash": prefix["prefix_hash"],
-                        "timeline_more": int(len(records) > len(groups))},
-                    "stats": {"workset_rows": rows, "workset_bytes": size}}
+        # Fresh validation opens another reader. Release this snapshot first so
+        # a waiting rollback-journal writer cannot deadlock both readers.
+        self.validate_recall(proof, session_id=session_id)
+        return {"status": "ready", "groups": groups, "source_proof": proof,
+                "ordinals": ordinals,
+                "timeline": {"timeline_snapshot_groups": prefix["group_count"],
+                    "timeline_after_ordinal": after,
+                    "timeline_start_us": round(start.timestamp()*1_000_000),
+                    "timeline_end_us": round(end.timestamp()*1_000_000),
+                    "timeline_group_root": prefix["group_root"],
+                    "timeline_prefix_hash": prefix["prefix_hash"],
+                    "timeline_more": int(len(records) > len(groups))},
+                "stats": {"workset_rows": rows, "workset_bytes": size}}
 
     def read_recall(self, session_id, queries, *, max_groups=24, max_rows=2048,
                     max_bytes=4*1024*1024, start_at=None, end_at=None,
-                    allow_partial_queries=False):
+                    allow_partial_queries=False, primary_query_count=0):
         """Question-selected complete groups, never retirement eligibility."""
         from .hermes_adapter import _failed_source
         search = getattr(self.db, "search_history_matches", None)
@@ -604,6 +607,8 @@ class ContinuityHistoryIndex:
             return _failed_source("unavailable", "bounded_native_search_missing")
         if (not isinstance(queries, list) or not 1 <= len(queries) <= 3
                 or any(not isinstance(q, str) or not 1 <= len(q) <= 80 for q in queries)):
+            raise ValueError("recall_queries_invalid")
+        if type(primary_query_count) is not int or not 0 <= primary_query_count <= len(queries):
             raise ValueError("recall_queries_invalid")
         if any(type(value) is not int or not 1 <= value <= limit for value, limit in
                ((max_groups, 24), (max_rows, 2048), (max_bytes, 4*1024*1024))):
@@ -624,10 +629,10 @@ class ContinuityHistoryIndex:
             if validation.get("status") != "valid" or validation.get("invalidated_from_position"):
                 self.request(session_id)
                 return _failed_source("pending", "history_source_changed")
-            ranked = {}
+            ranked, primary_ranked = {}, {}
             records = {}
             query_failures = []
-            for query in queries:
+            for query_index, query in enumerate(queries):
                 hits = search(session_id, target=target, query=query, max_matches=64, deadline_ms=50)
                 if hits.get("status") != "ready":
                     # A query resource ceiling says nothing about other hits.
@@ -653,8 +658,14 @@ class ContinuityHistoryIndex:
                     seen.add(key)
                     records[key] = record
                     ranked[key] = ranked.get(key, 0) + 1/(60+rank)
+                    if query_index < primary_query_count:
+                        primary_ranked[key] = primary_ranked.get(key, 0) + 1/(60+rank)
+            ordered = sorted(ranked, key=lambda key: (ranked[key], records[key]["ordinal"]), reverse=True)
+            if primary_ranked:
+                primary_order = sorted(primary_ranked, key=lambda key: (primary_ranked[key], records[key]["ordinal"]), reverse=True)
+                ordered = list(dict.fromkeys(key for pair in zip_longest(primary_order, ordered) for key in pair if key))
             selected, groups, rows_used, bytes_used = [], [], 0, 0
-            for key in sorted(ranked, key=lambda key: (ranked[key], records[key]["ordinal"]), reverse=True):
+            for key in ordered:
                 record = records[key]
                 count = record["end_position"]-record["start_position"]+1
                 if count+rows_used > max_rows or record["stored_bytes"]+bytes_used > max_bytes:
@@ -673,12 +684,12 @@ class ContinuityHistoryIndex:
             if query_failures and not groups:
                 return _failed_source("unavailable", query_failures[0])
             proof = {"host_token": target, "grouping_rule_version": self.grouping_rule, "groups": selected}
-            self.validate_recall(proof, session_id=session_id)
-            return {"status": "ready", "groups": groups, "source_proof": proof,
-                    "source_snapshot": _sha256(proof),
-                    "stats": {"workset_rows": rows_used, "workset_bytes": bytes_used,
-                              "returned_groups": len(groups), "retirement_authority": False,
-                              "query_failure_count": len(query_failures)}}
+        self.validate_recall(proof, session_id=session_id)
+        return {"status": "ready", "groups": groups, "source_proof": proof,
+                "source_snapshot": _sha256(proof),
+                "stats": {"workset_rows": rows_used, "workset_bytes": bytes_used,
+                          "returned_groups": len(groups), "retirement_authority": False,
+                          "query_failure_count": len(query_failures)}}
 
     def validate_recall(self, proof, *, session_id):
         return self._validate_prepared(

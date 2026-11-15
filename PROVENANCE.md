@@ -1,5 +1,22 @@
 # Provenance
 
+## 2026-11-15 current-question and reference-boundary maintenance
+
+Read-only donor release: `5a5f77f1ef26c75fa85184ead5d7951c2e344b05`.
+`afdae16cf3c71a6569596e1de5c757f3a1f919e1` keeps the original-query route
+alongside contextual ranking; `15ad1b0016b8a72bc09838097d9cfb7c9ab56784`
+retains explicitly quoted names when filtering weak words. Hermes adapts this
+at native query packing, bounded group admission, ranking and excerpt anchors.
+Its existing quoted-name extraction remains; no extra weak-word filter or
+alias store is added. The three-query / 24-group / 4-MiB ceilings are unchanged.
+
+`89d3f70f8d0aebb3d0d4fa133bbed0003ed6cd4d` supplies the reference guidance:
+counts, objects, completion, time and speaker confirmation cannot be merged
+indiscriminately. Original passages and role labels remain unchanged. This
+guidance is not semantic verification or an instruction about personality.
+The donor's JSONL cache and Dreaming archive changes are not copied into the
+SQLite owner. Checkpoint formats, CAS, source proof and budgets are retained.
+
 ## 2026-10-23 recall-quality adaptation
 
 The owner authorized tracking and absorbing the private AsherieSystem mother's

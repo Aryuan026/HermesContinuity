@@ -2,8 +2,10 @@
 import asyncio
 import importlib
 import json
+import sqlite3
 import unittest
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import test_recall as existing
 from test_runtime import execute, post, project, request, runtime_module
@@ -33,6 +35,51 @@ class Index:
 
 
 class LexicalUnitTests(unittest.TestCase):
+    def test_recall_outside_checkpoint_does_not_change_checkpoint_receipt_sources(self):
+        runtime = runtime_module.ContinuityRuntime(SimpleNamespace(history_index=SimpleNamespace(
+            db=SimpleNamespace(search_history_matches=lambda: None))), None)
+        self.addCleanup(runtime.clear)
+        for field in ("checkpoint_candidate", "source_checkpoint"):
+            with self.subTest(field=field):
+                plan = runtime_module._TurnPlan("current", bridge_body="rolling bridge",
+                    source_ids=("bridge-source",), **{field: {"revision": 2}})
+                selected = {"body": "unrelated live reference", "source_ids": ["recall-source"],
+                    "source_proof": {"groups": [{"group_id": "recall-source"}]}, "workset_bytes": 100}
+                with patch.object(recall, "build_recall", new=AsyncMock(return_value=selected)):
+                    combined = runtime._add_recall(plan, session_id="session", query="保修",
+                        reference_at="2026-08-30T00:00:00+00:00")
+                self.assertEqual(combined.source_ids, ("bridge-source",))
+                self.assertIn("checkpoint_revision=2", combined.marker)
+                self.assertEqual(combined.recall_proof, selected["source_proof"])
+                self.assertIn("unrelated live reference", combined.bridge_body)
+
+    def test_reference_borrowing_retains_current_attribute_and_context_route(self):
+        index = Index([group("fact", "镜头保修多久", "保修三年。"),
+                       *[group(f"noise-{n}", "ZK7 相机的电池怎么换？", "更换电池步骤。") for n in range(6)]])
+        result = self.build(index, "它的镜头保修多久？", recent_query="ZK7 相机的电池怎么换？")
+        self.assertEqual(result["source_ids"][0], "fact")
+        self.assertTrue(any(key.startswith("noise-") for key in result["source_ids"]))
+        self.assertIn("保修三年", result["body"])
+        self.assertLessEqual(len(index.calls[0][1]), 3)
+        self.assertGreater(index.calls[0][2]["primary_query_count"], 0)
+
+    def test_long_original_question_reserves_search_slots_and_quoted_names(self):
+        query = "它的" + "、".join(f"当前问题{n}" for n in range(50)) + "《我们》"
+        queries, primary, context, count = recall._search_queries(query, "ZK7 相机电池")
+        self.assertEqual(len(queries), 3)
+        self.assertEqual(count, 2)
+        self.assertTrue(primary and context)
+        self.assertIn("我们", primary)
+        self.assertIn("zk7", queries[-1])
+        self.assertTrue(all(len(q) <= 80 for q in queries))
+
+    def test_history_header_keeps_object_time_and_speaker_confirmation_distinct(self):
+        result = self.build(Index([group("fact", "相机维修记录", "我猜已经全部修完。")]), "相机维修记录")
+        self.assertIn("object scope and completion belong to their own quoted statements", result["body"])
+        self.assertIn("an old assistant inference is not human confirmation", result["body"])
+        self.assertIn("old state is not necessarily current", result["body"])
+        self.assertIn("[assistant] 我猜已经全部修完。", result["body"])
+
     def test_latin_identifiers_do_not_match_inside_other_names(self):
         for term in ("ZK7", "ZK7-R1", "ZK7_R1", "ZK7.R1"):
             with self.subTest(term=term):
@@ -150,6 +197,42 @@ class LexicalNativeTests(unittest.TestCase):
     seed = existing.RecallTests.seed
     prepare = existing.RecallTests.prepare
     rows = existing.RecallTests.rows
+
+    def test_fresh_validation_releases_read_snapshot_before_another_writer(self):
+        index = self.adapter.history_index
+        original = index.validate_recall
+        validated = []
+        def validate(proof, **kwargs):
+            with sqlite3.connect(self.store.path, timeout=0.1) as writer:
+                writer.execute("UPDATE continuity_group_progress SET position=position")
+            validated.append(True)
+            return original(proof, **kwargs)
+        with patch.object(index, "validate_recall", side_effect=validate):
+            lexical = index.read_recall("session-1", ["樱桃项目"])
+            timeline = index.read_timeline("session-1", start_at="2026-08-29T00:00:00+00:00",
+                end_at="2026-08-30T00:00:00+00:00")
+        self.assertEqual([lexical["status"], timeline["status"]], ["ready", "ready"])
+        self.assertEqual(len(validated), 2)
+
+    def test_primary_fact_survives_native_candidate_pool_and_final_delivery(self):
+        self.runtime.recall_auxiliary_enabled = False
+        for n in range(40):
+            self.writer.append_message("session-1", "user", "ZK7 电池更换步骤", timestamp=1787965100+n*2)
+            self.writer.append_message("session-1", "assistant", "先关闭电源。", timestamp=1787965101+n*2)
+        self.writer.append_message("session-1", "user", "镜头保修期", timestamp=1787965004)
+        self.writer.append_message("session-1", "assistant", "保修三年。", timestamp=1787965005)
+        self.prepare()
+        wire = request("它的镜头保修期是多久？")
+        wire["messages"][:0] = [{"role": "user", "content": "ZK7 电池更换步骤"},
+                                {"role": "assistant", "content": "接着说。"}]
+        projected = project(self.runtime, wire, session="session-1")
+        self.assertIsNotNone(projected, self.runtime.status_command())
+        self.assertIn("保修三年", repr(projected["request"]))
+        execute(self.runtime, projected["request"], wire, session="session-1")
+        post(self.runtime, session="session-1")
+        self.assertEqual(self.rows()[0][0], "delivered_recall")
+        self.assertNotIn("保修三年", repr(self.rows()))
+        self.assertEqual(self.llm.calls, [])
 
     def test_native_fts_final_body_settlement_and_retry_with_zero_auxiliary_calls(self):
         self.runtime.recall_auxiliary_enabled = False

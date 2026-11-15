@@ -5,6 +5,82 @@ Primary repository: HermesContinuity. Mother AsherieSystem is read-only. No
 merge, deployment, production configuration, live corpus, provider/QQ traffic
 or GitHub Actions is part of this change.
 
+**2026-11-15 authority update:** the owner subsequently authorized absorption,
+merge of the original PR #10, Continuity-only Tencent deployment and Assembly
+synchronization. Earlier candidate-only restrictions below describe their
+dated stages. Hermes stays on the accepted 0.21.5 host; no Actions, model,
+budget, SOUL, canonical-history or other-plugin change is authorized here.
+
+## 2026-11-15 maintenance and deployment qualification
+
+Donor release `5a5f77f1ef26c75fa85184ead5d7951c2e344b05` adds original-query
+protection during contextual recall and object/time/completion/speaker-aware
+historical-reference guidance. The implementation keeps separate native search
+slots, original-first group admission and rank interleaving, with original
+question excerpt anchors. Quoted names and existing identifier/calendar rules
+remain. No extra auxiliary calls, Warm hints, JSONL cache or Dreaming code.
+
+Broader qualification identified two integration defects in the earlier
+candidate, rather than dismissing every old test failure as a fixture issue:
+
+- A combined rolling bridge and live recall unioned their source IDs, but the
+  unchanged checkpoint store correctly requires exactly the bridge IDs.
+  Preserve checkpoint receipt IDs; recall retains its own validated proof/hash
+  and body-free group count. Combined markers also retain checkpoint revision.
+  No store validation, CAS, checkpoint format or source proof is loosened.
+- Recall/timeline opened fresh validation readers while retaining the hydration
+  snapshot. A pending rollback-journal writer can then block both readers.
+  Close the hydrated snapshot before fresh validation, still validating before
+  return and again at execution/settlement. A deterministic real SQLite writer
+  reproduces `database is locked` before the correction and passes afterward.
+  No retry, WAL-mode change, larger timeout or source-budget increase is added.
+
+Initial runs are retained: 56/56 on 3.11; 3.12 first missed the warranty
+reference, then passed 56/56; after the checkpoint correction another 3.12
+failure captured `OperationalError: database is locked`. Intermediate broad
+runs were 350 tests / 7 failures / 1 skip and 351 / 5 / 1, not Green.
+The old paired harness had five failing nodes on both candidate and untouched
+`7945e296`; that did not prove production `75aecd6` failed. After repairing the
+actual receipt-ID defect, all six paired tests passed on both interpreters,
+including worker-only preparation, pending-publication recovery, reload,
+fallback and source rewrite/rewind rejection. They use the already accepted
+test-only .21.5 origin/shared-writer fixtures in disposable copies, not weakened
+product proofs.
+
+Final focused selection: **58/58, zero skips** on Python 3.11.15 (103.463 s)
+and Python 3.12.13 (106.389 s). It retains native search, four new question/
+reference checks, the receipt-ID positive for both new/reused checkpoints,
+the SQLite-lock regression, real Agent delivery/reload/calendar/error paths,
+opt-in auxiliary tests and H13 preservation. The real current-question probe
+competes with 40 context-only groups and reaches the final provider body with
+the warranty answer, unchanged current question and no recall model calls.
+Earlier failed runs are not counted as passes.
+
+Final .21.5 paired replay: **6/6** on 3.11 (5.133 s) and 3.12 (11.091 s).
+Final broad replay: **352 tests, 347 passed / 4 failed / 1 conditional skip**
+(168.259 s). The four remaining nodes are the middleware fixture's exact trace
+comparison: native .21.5 adds `plugin_id` to the expected source/reason entry.
+All four reproduce on untouched `7945e296` in 0.007 s with the same fixture
+patch; they are not hidden or counted Green:
+
+- `test_moa_prepared_request_is_unsettled_and_never_publishes`
+- `test_no_post_never_publishes`
+- `test_real_registry_delivers_once_and_only_post_publishes`
+- `test_stored_projection_detects_drift_and_post_cannot_publish`
+
+All are in `test_hermes_middleware_integration.HermesMiddlewareIntegrationTests`.
+No product trace field was removed to satisfy them. The independent paired
+replay above reaches actual post-settlement, reload, fallback and rejection
+assertions. Ruff and `git diff --check` pass; no Actions were run.
+
+Merge/deployment recovery axes: source **yes**, artifact **yes**, dependencies
+**no**, managed paths **no**, unit definitions **no**, secrets **no**, capability
+**yes**, rollback locator **yes**. Deploy only through the existing custody Git
+mirror and official exact-ref installer, preserving configuration/data/other
+plugins; retain `75aecd6` as source rollback without restoring old databases
+over new messages. Target identity and health belong in the dated private
+Assembly receipt, not an inference from this local synthetic-provider run.
+
 ## Exact comparison points
 
 - Plugin baseline: accepted H13-v3

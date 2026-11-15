@@ -905,14 +905,17 @@ class ContinuityRuntime:
             proof = recall["source_proof"]
             if "timeline" in proof:
                 proof["timeline"]["timeline_context_sha256"] = self._timeline_context(context_messages)[0]
-            marker = (f"{CONTINUITY_MARKER_NAMESPACE} "
+            checkpoint = plan.checkpoint_candidate or plan.source_checkpoint
+            revision = f"checkpoint_revision={checkpoint['revision']} " if checkpoint else ""
+            marker = (f"{CONTINUITY_MARKER_NAMESPACE} {revision}"
                            f"source_snapshot={plan.expected_source_snapshot or _sha256(proof)} "
                            f"recall_source={_sha256(proof)} "
                            f"bridge_sha256={hashlib.sha256(body.encode('utf-8')).hexdigest()}]")
             recall_only = plan.reason == "foreground_group_limit_exceeded"
             combined = replace(plan, recall_proof=proof, recall_status="selected",
                 bridge_body=body, marker=marker,
-                source_ids=tuple(dict.fromkeys((*plan.source_ids, *recall["source_ids"]))),
+                # Checkpoint receipts describe its bridge, not unrelated recall.
+                source_ids=plan.source_ids if checkpoint else tuple(recall["source_ids"]),
                 workset_bytes=plan.workset_bytes+recall["workset_bytes"],
                 reason="" if recall_only else plan.reason,
                 expected_source_snapshot=_sha256(proof) if recall_only else plan.expected_source_snapshot)
@@ -1570,6 +1573,7 @@ class ContinuityRuntime:
             hashes["recall_source_sha256"] = _sha256(plan.recall_proof)
         counts = {"represented_source_group_count": len(plan.source_ids)}
         if plan.recall_proof is not None:
+            counts["recall_source_group_count"] = len(plan.recall_proof.get("groups", []))
             for key, value in plan.recall_proof.get("timeline", {}).items():
                 (counts if type(value) is int else hashes)[key] = value
         return receipt_id, hashes, counts

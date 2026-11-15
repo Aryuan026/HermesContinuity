@@ -1,5 +1,10 @@
 # Hermes Continuity
 
+Verified maintenance lane: **Hermes 0.21.5 + the accepted 29-artifact host**
+(`06501c37567a50f8c3ee65bc359a1caae921d74f`). Plugin manifest: 0.4.2;
+installation identity is the full Git commit, not that version label alone.
+Hermes 0.22 / 0.23 are not qualified by this recall maintenance.
+
 Hermes Continuity gives a Hermes conversation a bounded rolling bridge across
 context compression. It reads Hermes's canonical session history, builds an
 exact-source checkpoint, and inserts only the recent bridge into the current
@@ -99,6 +104,11 @@ selected for the current question. It can cross an old live hole without
 retiring it. The recall-quality candidate defaults `recall_auxiliary_enabled`
 to `false`: source-text keywords and the preceding visible user carrier supply
 bounded lexical queries, and Hermes native FTS/LIKE returns body-free positions.
+For a follow-up that borrows the preceding topic, the current question keeps
+its own search and ranking route; contextual hints cannot replace its terms or
+consume all candidate positions. Quoted references keep object, time,
+completion and speaker relationships distinct: an old assistant inference is
+not human confirmation.
 Up to 24 complete verified groups are hydrated within 2,048 rows / 4 MiB.
 Bounded relevance ranking then delivers at most four role-labelled original-text
 passages, with visible ellipses, rather than a generated recall summary. The
@@ -112,8 +122,9 @@ still reject delivery.
 Set `recall_auxiliary_enabled: true` explicitly to retain the previous two-call
 lexical recall path: keyword/time planning, then candidate selection and summary. The
 switch concerns only question-driven recall; rolling continuity summaries are
-unchanged. This candidate is local-tested, not selected for production; see
-[the donor mapping and verification record](RECALL_QUALITY.md).
+unchanged. See [the donor mapping and verification record](RECALL_QUALITY.md).
+Selected installations and target readback are tracked separately in the
+private Assembly; loading this source alone is not deployment evidence.
 The recall shares the 2,048-token overlay output ceiling with any rolling
 bridge, and the existing final-provider budget guard remains authoritative.
 Auxiliary input is bounded by `source_token_limit`; each native query has a
